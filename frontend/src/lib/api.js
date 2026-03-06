@@ -1,5 +1,5 @@
-// Centralised API helper — proxied to FastAPI backend via Vite dev server
-const BASE = ''
+// Centralised API helper — calls FastAPI backend via VITE_API_BASE_URL env var
+const BASE = import.meta.env.VITE_API_BASE_URL || ''
 
 async function get(path, params = {}) {
   const url = new URL(BASE + path, window.location.origin)
