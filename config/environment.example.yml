@@ -1,0 +1,55 @@
+# BioResilient AI — Application Configuration
+# Copy this file to config/environment.yml and fill in real values.
+# Do NOT commit environment.yml — it contains secrets.
+
+# Toggle: "local" or "cloud"
+deployment: local
+
+database:
+  local:  postgresql://localhost/bioresillient
+  cloud:  postgresql://${RDS_HOST}/bioresillient
+
+storage:
+  local:  ./data/
+  cloud:  s3://bioresillient-data/
+
+gpu:
+  device: auto          # "cuda", "cpu", or "auto" (auto-detects at runtime)
+  esm_model: esm2_t36_3B_UR50D    # 3B: for 16GB VRAM (e.g. RTX 5000). Use esm2_t33_650M_UR50D if < 16GB
+  esm_chunk_size: 64    # Reduce if hitting OOM errors on long proteins
+
+ncbi:
+  api_key: 563ff93562a41ce1043db202e751a6e08808
+  email: sarat.vakkalanka@gmail.com
+  # Free key at https://www.ncbi.nlm.nih.gov/account/ — increases rate limits from 3 to 10 req/sec
+
+# AlphaGenome (DeepMind) — regulatory variant effect; optional for Track B
+# Register at https://deepmind.com/blog/alphagenome (non-commercial)
+alphagenome:
+  api_key: AIzaSyBFKH1QbJTyQjvsjLf6Pwejvi8F7mx4K7k
+
+tools:
+  orthofinder_threads: 8          # Search threads
+  orthofinder_align_threads: 4    # Alignment threads (tune to available cores / 2)
+  mafft_threads: 4
+  iqtree_threads: AUTO            # IQ-TREE auto-detects best thread count
+  iqtree_bootstrap: 1000
+  hyphy_threads: 4
+
+scoring_weights:
+  convergence:      0.25
+  selection:        0.20
+  disease:          0.20          # Phase 2 — zero-weighted in Phase 1
+  druggability:     0.15          # Phase 2 — zero-weighted in Phase 1
+  expression:       0.10
+  safety:           0.10          # Phase 2 — zero-weighted in Phase 1
+
+# Phase 1 thresholds
+thresholds:
+  divergence_identity_max: 0.85   # Keep motifs where seq identity < 85%
+  divergence_min_species: 2       # Motif must appear in ≥ 2 protective species
+  convergence_min_lineages: 3     # Convergence flag if ≥ 3 independent lineages
+  expression_log2fc_min: 1.0
+  expression_padj_max: 0.05
+  tier1_composite_min: 0.70
+  tier2_composite_min: 0.40

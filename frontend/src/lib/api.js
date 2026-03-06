@@ -1,0 +1,35 @@
+// Centralised API helper — proxied to FastAPI backend via Vite dev server
+const BASE = ''
+
+async function get(path, params = {}) {
+  const url = new URL(BASE + path, window.location.origin)
+  Object.entries(params).forEach(([k, v]) => v != null && url.searchParams.set(k, v))
+  const res = await fetch(url)
+  if (!res.ok) throw new Error(`${res.status} ${res.statusText}`)
+  return res.json()
+}
+
+async function post(path, body = {}) {
+  const res = await fetch(BASE + path, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(body),
+  })
+  if (!res.ok) throw new Error(`${res.status} ${res.statusText}`)
+  return res.json()
+}
+
+export const api = {
+  // Candidates
+  getCandidates: (params) => get('/candidates', params),
+  getCandidate: (id) => get(`/candidates/${id}`),
+  // Species
+  getSpecies: () => get('/species'),
+  getSpeciesById: (id) => get(`/species/${id}`),
+  // Scores
+  getScores: (geneId) => get(`/scores/${geneId}`),
+  // Pipeline
+  getPipelineStatus: () => get('/pipeline/status'),
+  startPipeline: (body) => post('/pipeline/run', body),
+  stopPipeline: () => post('/pipeline/stop'),
+}

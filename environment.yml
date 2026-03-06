@@ -1,0 +1,39 @@
+name: bioresillient
+channels:
+  - conda-forge
+  - bioconda
+  - defaults
+dependencies:
+  - python=3.11
+  - postgresql
+  - blast=2.15
+  - mafft=7.520
+  - orthofinder=2.5.5
+  - diamond=2.1.8
+  - iqtree=2.2.6
+  - hyphy=2.5.62
+  - fpocket=4.0
+  - r-base=4.3
+  - bioconductor-deseq2
+  - bioconductor-edger
+  - pip
+  - pip:
+    - sqlalchemy==2.0
+    - alembic==1.13
+    - fastapi==0.110
+    - uvicorn==0.29
+    - biopython==1.83
+    - geoparse==2.0
+    - rpy2==3.5
+    - torch==2.2
+    - fair-esm==2.0
+    - requests==2.31
+    - pydantic==2.6
+    - pandas==2.2
+    - numpy==1.26
+    - pytest==8.1
+    - psycopg2-binary==2.9
+    - python-dotenv==1.0
+    - pyyaml==6.0
+    - scipy==1.13
+    - tqdm==4.66

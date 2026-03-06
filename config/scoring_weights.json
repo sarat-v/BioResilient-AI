@@ -1,0 +1,25 @@
+{
+  "_comment": "Phase 1: only convergence, selection, expression are populated. Disease, druggability, safety, regulatory are zero-weighted until Phase 2.",
+  "phase1": {
+    "convergence":      0.40,
+    "selection":        0.35,
+    "expression":       0.25,
+    "disease":          0.00,
+    "druggability":     0.00,
+    "safety":           0.00,
+    "regulatory":       0.00
+  },
+  "phase2": {
+    "convergence":      0.22,
+    "selection":        0.18,
+    "disease":          0.20,
+    "druggability":     0.15,
+    "expression":       0.10,
+    "safety":           0.10,
+    "regulatory":       0.05
+  },
+  "tier_thresholds": {
+    "tier1": 0.70,
+    "tier2": 0.40
+  }
+}
