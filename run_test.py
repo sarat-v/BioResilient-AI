@@ -57,30 +57,31 @@ def main():
     
     # Run pipeline — auto-detect furthest completed step and resume from there
     try:
+        import json
         cache_file = Path('pipeline_cache.json')
         completed_steps = []
         if cache_file.exists():
-            import json
             completed_steps = json.loads(cache_file.read_text()).get('completed', [])
 
         step_order = ['step1','step2','step3','step3b','step4','step5','step6',
                       'step7','step8','step9','step10','step10b','step11',
                       'step12','step13','step14','step15','step16']
 
-        # Find first incomplete step — skip anything already in cache
-        resume_from = 'step5'  # default to step5 since step3/3b/4 are done
+        # Treat step1 and step2 as done if proteomes already exist on disk
+        proteomes_done = (Path('data/proteomes/human.reheadered.faa').exists() and
+                         Path('data/proteomes/nmr.reheadered.faa').exists() and
+                         Path('data/proteomes/elephant.reheadered.faa').exists())
+        if proteomes_done:
+            for s in ('step1', 'step2'):
+                if s not in completed_steps:
+                    completed_steps.append(s)
+
+        # Find first step not yet completed
+        resume_from = step_order[-1]
         for s in step_order:
             if s not in completed_steps:
                 resume_from = s
                 break
-
-        # Only fall back to step3 if proteomes exist but step3 not cached
-        if resume_from in ('step1', 'step2'):
-            proteomes_done = (Path('data/proteomes/human.reheadered.faa').exists() and
-                             Path('data/proteomes/nmr.reheadered.faa').exists() and
-                             Path('data/proteomes/elephant.reheadered.faa').exists())
-            if proteomes_done:
-                resume_from = 'step3'
 
         print(f"▶ Resuming from {resume_from} (completed: {completed_steps or 'none'})")
         run_pipeline(species_list=species_list, resume_from=resume_from)
