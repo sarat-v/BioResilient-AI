@@ -142,20 +142,21 @@ def _quick_pairwise_identity(seq_a: str, seq_b: str) -> float:
     """
     if not seq_a or not seq_b:
         return 0.0
+    # Truncate very long sequences to first 300 aa for speed
+    seq_a = seq_a[:300]
+    seq_b = seq_b[:300]
     aligner = PairwiseAligner()
     aligner.mode = "global"
-    aligner.open_gap_score = -10
-    aligner.extend_gap_score = -0.5
-    alignments = aligner.align(seq_a, seq_b)
-    if not alignments:
+    aligner.match_score = 1
+    aligner.mismatch_score = 0
+    aligner.open_gap_score = -1
+    aligner.extend_gap_score = -0.1
+    # Use score_only to avoid OverflowError from enumerating all optimal alignments
+    score = aligner.score(seq_a, seq_b)
+    max_len = max(len(seq_a), len(seq_b))
+    if max_len == 0:
         return 0.0
-    aln = alignments[0]
-    aln1, aln2 = str(aln[0]), str(aln[1])
-    matches = sum(1 for a, b in zip(aln1, aln2) if a == b and a != "-")
-    comparable = sum(1 for a, b in zip(aln1, aln2) if a != "-" or b != "-")
-    if comparable == 0:
-        return 0.0
-    return 100.0 * matches / comparable
+    return 100.0 * score / max_len
 
 
 def filter_orthogroups_by_global_identity(
