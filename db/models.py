@@ -22,7 +22,7 @@ from sqlalchemy import (
     Text,
     UniqueConstraint,
 )
-from sqlalchemy.dialects.postgresql import ARRAY, JSON, UUID
+from sqlalchemy.dialects.postgresql import ARRAY, JSON
 from sqlalchemy.orm import DeclarativeBase, relationship
 
 
@@ -60,7 +60,7 @@ class Species(Base):
 class Gene(Base):
     __tablename__ = "gene"
 
-    id = Column(UUID(as_uuid=False), primary_key=True, default=_uuid)
+    id = Column(String, primary_key=True, default=_uuid)
     human_gene_id = Column(String, nullable=False, unique=True)   # NCBI Gene ID
     gene_symbol = Column(String, nullable=False)
     human_protein = Column(String)                                # UniProt accession
@@ -84,8 +84,8 @@ class Ortholog(Base):
         UniqueConstraint("gene_id", "species_id", name="uq_ortholog_gene_species"),
     )
 
-    id = Column(UUID(as_uuid=False), primary_key=True, default=_uuid)
-    gene_id = Column(UUID(as_uuid=False), ForeignKey("gene.id", ondelete="CASCADE"), nullable=False)
+    id = Column(String, primary_key=True, default=_uuid)
+    gene_id = Column(String, ForeignKey("gene.id", ondelete="CASCADE"), nullable=False)
     species_id = Column(String, ForeignKey("species.id", ondelete="CASCADE"), nullable=False)
     protein_id = Column(String)                         # Source protein accession
     protein_seq = Column(Text)
@@ -103,8 +103,8 @@ class Ortholog(Base):
 class DivergentMotif(Base):
     __tablename__ = "divergent_motif"
 
-    id = Column(UUID(as_uuid=False), primary_key=True, default=_uuid)
-    ortholog_id = Column(UUID(as_uuid=False), ForeignKey("ortholog.id", ondelete="CASCADE"), nullable=False)
+    id = Column(String, primary_key=True, default=_uuid)
+    ortholog_id = Column(String, ForeignKey("ortholog.id", ondelete="CASCADE"), nullable=False)
     start_pos = Column(Integer, nullable=False)         # 0-indexed position in alignment
     end_pos = Column(Integer, nullable=False)
     animal_seq = Column(String, nullable=False)         # 10–20 aa window
@@ -132,7 +132,7 @@ class DivergentMotif(Base):
 class EvolutionScore(Base):
     __tablename__ = "evolution_score"
 
-    gene_id = Column(UUID(as_uuid=False), ForeignKey("gene.id", ondelete="CASCADE"), primary_key=True)
+    gene_id = Column(String, ForeignKey("gene.id", ondelete="CASCADE"), primary_key=True)
     dnds_ratio = Column(Float)
     dnds_pvalue = Column(Float)
     selection_model = Column(String)                    # e.g. "aBSREL", "BUSTED"
@@ -154,7 +154,7 @@ class EvolutionScore(Base):
 class DiseaseAnnotation(Base):
     __tablename__ = "disease_annotation"
 
-    gene_id = Column(UUID(as_uuid=False), ForeignKey("gene.id", ondelete="CASCADE"), primary_key=True)
+    gene_id = Column(String, ForeignKey("gene.id", ondelete="CASCADE"), primary_key=True)
     disease_id = Column(String)                         # EFO ID
     disease_name = Column(String)
     opentargets_score = Column(Float)
@@ -174,7 +174,7 @@ class DiseaseAnnotation(Base):
 class DrugTarget(Base):
     __tablename__ = "drug_target"
 
-    gene_id = Column(UUID(as_uuid=False), ForeignKey("gene.id", ondelete="CASCADE"), primary_key=True)
+    gene_id = Column(String, ForeignKey("gene.id", ondelete="CASCADE"), primary_key=True)
     pocket_count = Column(Integer)
     top_pocket_score = Column(Float)
     chembl_target_id = Column(String)
@@ -193,7 +193,7 @@ class DrugTarget(Base):
 class GeneTherapyScore(Base):
     __tablename__ = "gene_therapy_score"
 
-    gene_id = Column(UUID(as_uuid=False), ForeignKey("gene.id", ondelete="CASCADE"), primary_key=True)
+    gene_id = Column(String, ForeignKey("gene.id", ondelete="CASCADE"), primary_key=True)
     gene_size_bp = Column(Integer)
     aav_compatible = Column(Boolean)
     tissue_tropism = Column(ARRAY(String))              # matching AAV serotypes
@@ -211,7 +211,7 @@ class GeneTherapyScore(Base):
 class SafetyFlag(Base):
     __tablename__ = "safety_flag"
 
-    gene_id = Column(UUID(as_uuid=False), ForeignKey("gene.id", ondelete="CASCADE"), primary_key=True)
+    gene_id = Column(String, ForeignKey("gene.id", ondelete="CASCADE"), primary_key=True)
     is_essential = Column(Boolean)                      # pLI > 0.9
     phewas_hits = Column(JSON)                          # {trait: pvalue}
     network_degree = Column(Integer)                    # STRING interaction count
@@ -229,7 +229,7 @@ class SafetyFlag(Base):
 class CandidateScore(Base):
     __tablename__ = "candidate_score"
 
-    gene_id = Column(UUID(as_uuid=False), ForeignKey("gene.id", ondelete="CASCADE"), primary_key=True)
+    gene_id = Column(String, ForeignKey("gene.id", ondelete="CASCADE"), primary_key=True)
     convergence_score = Column(Float, default=0.0)
     selection_score = Column(Float, default=0.0)
     disease_score = Column(Float, default=0.0)          # 0.0 in Phase 1
@@ -258,8 +258,8 @@ class RegulatoryDivergence(Base):
         UniqueConstraint("gene_id", "species_id", name="uq_regulatory_divergence_gene_species"),
     )
 
-    id = Column(UUID(as_uuid=False), primary_key=True, default=_uuid)
-    gene_id = Column(UUID(as_uuid=False), ForeignKey("gene.id", ondelete="CASCADE"), nullable=False)
+    id = Column(String, primary_key=True, default=_uuid)
+    gene_id = Column(String, ForeignKey("gene.id", ondelete="CASCADE"), nullable=False)
     species_id = Column(String, ForeignKey("species.id", ondelete="CASCADE"), nullable=False)
     promoter_divergence = Column(Float)                 # AlphaGenome predicted effect magnitude
     expression_log2fc = Column(Float)                   # log2 fold-change from DESeq2
