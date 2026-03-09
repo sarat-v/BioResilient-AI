@@ -48,16 +48,20 @@ echo "✓ Migrations complete"
 
 # Step 5: Seed with 2-3 species
 echo "[5/6] Seeding database with test species..."
+export DATABASE_URL="postgresql://localhost/bioresillient_test"
 python3 << 'PYTHON_SEED'
 import sys
+import os
 sys.path.insert(0, '.')
 
-from db.session import get_session
-from db.models import Base, Species, Gene
-from sqlalchemy import create_engine
+# Set database URL before importing ORM
+os.environ['DATABASE_URL'] = 'postgresql://localhost/bioresillient_test'
 
-# Use test database
-engine = create_engine('postgresql://localhost/bioresillient_test')
+from db.session import get_session, get_engine
+from db.models import Base, Species
+
+# Ensure tables exist
+engine = get_engine()
 Base.metadata.create_all(engine)
 
 with get_session() as session:
