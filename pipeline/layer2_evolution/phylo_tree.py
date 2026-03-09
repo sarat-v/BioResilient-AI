@@ -118,8 +118,12 @@ def run_iqtree(concat_alignment: dict[str, str]) -> Path:
         log.info("Species tree already exists at %s — skipping IQ-TREE.", treefile)
         return treefile
 
+    # Support both 'iqtree2' (bioconda newer) and 'iqtree' (bioconda older/conda)
+    import shutil as _shutil
+    iqtree_bin = "iqtree2" if _shutil.which("iqtree2") else "iqtree"
+
     cmd = [
-        "iqtree2",
+        iqtree_bin,
         "-s", str(fasta_path),
         "-m", "TEST",
         "-bb", str(bootstrap),
