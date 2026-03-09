@@ -57,7 +57,6 @@ def main():
     
     # Run pipeline — resume from step3 if proteomes already downloaded
     try:
-        from pathlib import Path
         proteomes_done = (Path('data/proteomes/human.reheadered.faa').exists() and
                          Path('data/proteomes/nmr.reheadered.faa').exists() and
                          Path('data/proteomes/elephant.reheadered.faa').exists())
