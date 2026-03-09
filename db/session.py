@@ -10,12 +10,17 @@ from pipeline.config import get_db_url
 
 _engine = None
 _SessionLocal = None
+_engine_url = None
 
 
 def _get_engine():
-    global _engine
-    if _engine is None:
-        _engine = create_engine(get_db_url(), pool_pre_ping=True)
+    global _engine, _engine_url, _SessionLocal
+    current_url = get_db_url()
+    # Recreate engine if URL has changed (e.g. DATABASE_URL env var set after import)
+    if _engine is None or _engine_url != current_url:
+        _engine = create_engine(current_url, pool_pre_ping=True)
+        _engine_url = current_url
+        _SessionLocal = None  # reset session factory too
     return _engine
 
 

@@ -30,6 +30,9 @@ def get_deployment() -> str:
 
 
 def get_db_url() -> str:
+    # Allow full override via DATABASE_URL env var (used in tests and CI)
+    if os.environ.get("DATABASE_URL"):
+        return os.environ["DATABASE_URL"]
     cfg = get_config()
     deployment = get_deployment()
     url_template = cfg["database"][deployment]
