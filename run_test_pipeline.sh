@@ -73,16 +73,17 @@ with get_session() as session:
 
     # Seed 3 test species
     species_data = [
-        {'id': 'human', 'name': 'Homo sapiens', 'lineage': 'Primates', 'phenotypes': ['bipedal', 'large_brain', 'complex_language']},
-        {'id': 'nmr', 'name': 'Heterocephalus glaber', 'lineage': 'Rodentia', 'phenotypes': ['eusocial', 'extreme_longevity', 'cancer_resistance', 'pain_insensitivity']},
-        {'id': 'elephant', 'name': 'Loxodonta africana', 'lineage': 'Proboscidea', 'phenotypes': ['large_body', 'longevity', 'cancer_resistance', 'low_tumor_rate']},
+        {'id': 'human',    'taxid': 9606,   'scientific_name': 'Homo sapiens',            'lineage_group': 'Primates',    'phenotypes': ['bipedal', 'large_brain', 'complex_language']},
+        {'id': 'nmr',      'taxid': 10181,  'scientific_name': 'Heterocephalus glaber',   'lineage_group': 'Rodentia',    'phenotypes': ['eusocial', 'extreme_longevity', 'cancer_resistance', 'pain_insensitivity']},
+        {'id': 'elephant', 'taxid': 9783,   'scientific_name': 'Loxodonta africana',      'lineage_group': 'Proboscidea', 'phenotypes': ['large_body', 'longevity', 'cancer_resistance', 'low_tumor_rate']},
     ]
 
     for s in species_data:
         sp = Species(
             id=s['id'],
-            name=s['name'],
-            lineage=s['lineage'],
+            taxid=s['taxid'],
+            scientific_name=s['scientific_name'],
+            lineage_group=s['lineage_group'],
             phenotypes=s['phenotypes']
         )
         session.add(sp)
