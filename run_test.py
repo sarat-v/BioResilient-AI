@@ -40,7 +40,7 @@ def main():
         print("   bash run_test_pipeline.sh")
         sys.exit(1)
     
-    print(f"✓ Found {len(species)} species: {', '.join([s.name for s in species])}")
+    print(f"✓ Found {len(species)} species: {', '.join([s.scientific_name for s in species])}")
     print()
     
     # Run pipeline
