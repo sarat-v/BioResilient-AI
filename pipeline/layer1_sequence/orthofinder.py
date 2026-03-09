@@ -61,7 +61,7 @@ def run_orthofinder(proteomes_dir: Path) -> Path:
     if out_dir.exists():
         log.info("Removing stale OrthoFinder output dir: %s", out_dir)
         shutil.rmtree(out_dir)
-    out_dir.mkdir(parents=True, exist_ok=True)
+    # Do NOT mkdir here — OrthoFinder creates the output dir itself
 
     cmd = [
         "orthofinder",
