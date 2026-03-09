@@ -33,6 +33,7 @@ fi
 
 # Step 3: Create test database
 echo "[3/6] Setting up database..."
+export PATH="/opt/homebrew/opt/postgresql@15/bin:$PATH"
 dropdb bioresillient_test 2>/dev/null || true
 createdb bioresillient_test
 echo "✓ Database created: bioresillient_test"
@@ -40,6 +41,7 @@ echo "✓ Database created: bioresillient_test"
 # Step 4: Run migrations
 echo "[4/6] Running database migrations..."
 cd "$REPO_ROOT"
+export PATH="/opt/homebrew/opt/postgresql@15/bin:$PATH"
 export DATABASE_URL="postgresql://localhost/bioresillient_test"
 alembic upgrade head 2>/dev/null || echo "Note: Alembic may need manual setup"
 echo "✓ Migrations complete"
