@@ -28,13 +28,12 @@ def main():
     
     # Import after path setup
     from pipeline.orchestrator import run_pipeline
-    from db.session import SessionLocal
+    from db.session import get_session
     from db.models import Species
     
     # Verify species exist
-    session = SessionLocal()
-    species = session.query(Species).all()
-    session.close()
+    with get_session() as session:
+        species = session.query(Species).all()
     
     if not species:
         print("❌ No species in database. Run setup script first:")

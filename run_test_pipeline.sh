@@ -52,7 +52,7 @@ python3 << 'PYTHON_SEED'
 import sys
 sys.path.insert(0, '.')
 
-from db.session import SessionLocal
+from db.session import get_session
 from db.models import Base, Species, Gene
 from sqlalchemy import create_engine
 
@@ -60,34 +60,30 @@ from sqlalchemy import create_engine
 engine = create_engine('postgresql://localhost/bioresillient_test')
 Base.metadata.create_all(engine)
 
-session = SessionLocal()
+with get_session() as session:
+    # Check if already seeded
+    existing = session.query(Species).count()
+    if existing > 0:
+        print(f"✓ Database already has {existing} species")
+        sys.exit(0)
 
-# Check if already seeded
-existing = session.query(Species).count()
-if existing > 0:
-    print(f"✓ Database already has {existing} species")
-    session.close()
-    sys.exit(0)
+    # Seed 3 test species
+    species_data = [
+        {'id': 'human', 'name': 'Homo sapiens', 'lineage': 'Primates', 'phenotypes': ['bipedal', 'large_brain', 'complex_language']},
+        {'id': 'nmr', 'name': 'Heterocephalus glaber', 'lineage': 'Rodentia', 'phenotypes': ['eusocial', 'extreme_longevity', 'cancer_resistance', 'pain_insensitivity']},
+        {'id': 'elephant', 'name': 'Loxodonta africana', 'lineage': 'Proboscidea', 'phenotypes': ['large_body', 'longevity', 'cancer_resistance', 'low_tumor_rate']},
+    ]
 
-# Seed 3 test species
-species_data = [
-    {'id': 'human', 'name': 'Homo sapiens', 'lineage': 'Primates', 'phenotypes': ['bipedal', 'large_brain', 'complex_language']},
-    {'id': 'nmr', 'name': 'Heterocephalus glaber', 'lineage': 'Rodentia', 'phenotypes': ['eusocial', 'extreme_longevity', 'cancer_resistance', 'pain_insensitivity']},
-    {'id': 'elephant', 'name': 'Loxodonta africana', 'lineage': 'Proboscidea', 'phenotypes': ['large_body', 'longevity', 'cancer_resistance', 'low_tumor_rate']},
-]
+    for s in species_data:
+        sp = Species(
+            id=s['id'],
+            name=s['name'],
+            lineage=s['lineage'],
+            phenotypes=s['phenotypes']
+        )
+        session.add(sp)
 
-for s in species_data:
-    sp = Species(
-        id=s['id'],
-        name=s['name'],
-        lineage=s['lineage'],
-        phenotypes=s['phenotypes']
-    )
-    session.add(sp)
-
-session.commit()
-print(f"✓ Seeded {len(species_data)} species")
-session.close()
+    print(f"✓ Seeded {len(species_data)} species")
 PYTHON_SEED
 
 # Step 6: Display next steps
