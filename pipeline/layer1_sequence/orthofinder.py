@@ -206,7 +206,7 @@ def load_orthologs_to_db(
             gene_db_id, gene_symbol = human_gene_map[human_protein_id]
 
             # Ensure Gene row exists
-            gene = session.get(Gene, gene_db_id)
+            gene = session.query(Gene).filter(Gene.id == gene_db_id).first()
             if gene is None:
                 gene = Gene(
                     id=gene_db_id,
