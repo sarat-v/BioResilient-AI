@@ -9,6 +9,7 @@ frontend/node_modules/
 
 ## Pipeline runtime files (not source code)
 pipeline_state.json
+pipeline_cache.json
 pipeline.log
 
 ## Python

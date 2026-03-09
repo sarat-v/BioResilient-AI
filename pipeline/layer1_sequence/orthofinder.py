@@ -97,10 +97,14 @@ def parse_orthogroups(results_dir: Path, proteomes_dir: Path) -> pd.DataFrame:
         raise FileNotFoundError(f"Orthogroups.tsv not found at {og_path}")
 
     df = pd.read_csv(og_path, sep="\t", index_col=0)
-
-    # Each column is a species, values are comma-separated protein IDs
     df.index.name = "og_id"
     df = df.reset_index()
+
+    # OrthoFinder creates two columns per species: one for original FAA and one
+    # for reheadered FAA. Keep only the reheadered columns (they contain our
+    # species-prefixed IDs like "human|...", "nmr|...").
+    reheadered_cols = ["og_id"] + [c for c in df.columns if "reheadered" in c]
+    df = df[reheadered_cols]
 
     # Keep only groups where human has at least one protein
     human_col = _find_species_column(df, "human")
@@ -108,7 +112,6 @@ def parse_orthogroups(results_dir: Path, proteomes_dir: Path) -> pd.DataFrame:
         raise ValueError("Could not find 'human' column in OrthoGroups.tsv")
 
     df = df[df[human_col].notna() & (df[human_col] != "")]
-
     log.info("  %d orthogroups with human proteins", len(df))
 
     # Melt to long format
@@ -123,7 +126,6 @@ def parse_orthogroups(results_dir: Path, proteomes_dir: Path) -> pd.DataFrame:
             for protein_id in cell.split(", "):
                 protein_id = protein_id.strip()
                 if protein_id:
-                    # Column name is the species FASTA filename stem; map to species_id
                     species_id = _col_to_species_id(col, proteomes_dir)
                     long_rows.append({
                         "og_id": og_id,
@@ -135,7 +137,15 @@ def parse_orthogroups(results_dir: Path, proteomes_dir: Path) -> pd.DataFrame:
 
 
 def _find_species_column(df: pd.DataFrame, species_id: str) -> Optional[str]:
-    """Match a species_id to a DataFrame column (flexible matching on stem)."""
+    """Match a species_id to a DataFrame column (flexible matching on stem).
+    
+    Prefer the reheadered column since that's what we loaded into seq_map.
+    """
+    # Prefer exact reheadered match first
+    for col in df.columns:
+        if f"{species_id}.reheadered" in col.lower():
+            return col
+    # Fall back to any match
     for col in df.columns:
         if species_id in col.lower():
             return col

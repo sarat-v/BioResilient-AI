@@ -623,6 +623,18 @@ def run_pipeline(
             log.info("  %s complete (%.1fs)", step_name, elapsed)
             _mark_step(state, step_name, "complete", elapsed)
 
+            # Write step cache so reruns can skip completed steps
+            _cache_path = _REPO_ROOT / "pipeline_cache.json"
+            try:
+                existing_cache = json.loads(_cache_path.read_text()) if _cache_path.exists() else {}
+                completed_list = existing_cache.get("completed", [])
+                if step_name not in completed_list:
+                    completed_list.append(step_name)
+                existing_cache["completed"] = completed_list
+                _cache_path.write_text(json.dumps(existing_cache, indent=2))
+            except Exception:
+                pass
+
     except Exception as exc:
         log.error("Pipeline FAILED at %s: %s", step_name, exc, exc_info=True)
         _mark_step(state, step_name, "failed")

@@ -55,14 +55,34 @@ def main():
         for s in species
     ]
     
-    # Run pipeline — resume from step3 if proteomes already downloaded
+    # Run pipeline — auto-detect furthest completed step and resume from there
     try:
-        proteomes_done = (Path('data/proteomes/human.reheadered.faa').exists() and
-                         Path('data/proteomes/nmr.reheadered.faa').exists() and
-                         Path('data/proteomes/elephant.reheadered.faa').exists())
-        resume_from = 'step3' if proteomes_done else 'step1'
-        if proteomes_done:
-            print("✓ Proteomes already downloaded — resuming from step3 (OrthoFinder)")
+        cache_file = Path('pipeline_cache.json')
+        completed_steps = []
+        if cache_file.exists():
+            import json
+            completed_steps = json.loads(cache_file.read_text()).get('completed', [])
+
+        step_order = ['step1','step2','step3','step3b','step4','step5','step6',
+                      'step7','step8','step9','step10','step10b','step11',
+                      'step12','step13','step14','step15','step16']
+
+        # Find first incomplete step
+        resume_from = 'step1'
+        for s in step_order:
+            if s not in completed_steps:
+                resume_from = s
+                break
+
+        # Always resume from at least step3 if proteomes exist
+        if resume_from in ('step1', 'step2'):
+            proteomes_done = (Path('data/proteomes/human.reheadered.faa').exists() and
+                             Path('data/proteomes/nmr.reheadered.faa').exists() and
+                             Path('data/proteomes/elephant.reheadered.faa').exists())
+            if proteomes_done:
+                resume_from = 'step3'
+
+        print(f"▶ Resuming from {resume_from} (completed: {completed_steps or 'none'})")
         run_pipeline(species_list=species_list, resume_from=resume_from)
         print("\n" + "="*60)
         print("✅ Pipeline Complete!")
