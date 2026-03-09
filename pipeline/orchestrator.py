@@ -529,6 +529,38 @@ def run_pipeline(
     results_dir: Path | None = None
     treefile: Path | None = None
 
+    # If resuming past step3, recover results_dir from disk
+    from pipeline.layer1_sequence.orthofinder import _orthofinder_output_dir
+    from pipeline.config import get_storage_root
+    _proteomes_dir = Path(get_storage_root()) / "proteomes"
+    _existing = _orthofinder_output_dir(_proteomes_dir)
+    if _existing is not None:
+        results_dir = _existing
+
+    # If resuming past step4, recover aligned_orthogroups from DB
+    if resume_from not in ("step1","step2","step3","step3b","step4"):
+        try:
+            from db.models import Ortholog
+            from db.session import get_session as _gs
+            _aligned: dict = {}
+            with _gs() as _s:
+                for row in _s.query(Ortholog).all():
+                    og = row.orthofinder_og or row.gene_id
+                    if og not in _aligned:
+                        _aligned[og] = {}
+                    if row.protein_seq:
+                        _aligned[og][row.species_id] = row.protein_seq
+            aligned_orthogroups = _aligned
+            motifs_by_og = {og: [] for og in _aligned}
+            log.info("Recovered %d orthogroups from DB for resume", len(aligned_orthogroups))
+        except Exception as _e:
+            log.warning("Could not recover aligned_orthogroups from DB: %s", _e)
+
+    # If resuming past step5, recover treefile from disk
+    _tree_candidate = Path(get_storage_root()) / "phylo" / "species.treefile"
+    if _tree_candidate.exists():
+        treefile = _tree_candidate
+
     # Initialise pipeline state file
     state = {
         "status": "running",
