@@ -11,6 +11,7 @@ frontend/node_modules/
 pipeline_state.json
 pipeline_cache.json
 pipeline.log
+data/aligned_orthogroups.pkl
 
 ## Python
 __pycache__/

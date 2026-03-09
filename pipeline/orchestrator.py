@@ -265,6 +265,14 @@ def step4_alignment_and_divergence(
 
     aligned_for_hyphy = {og: aligned[og] for og in motifs_by_og}
     log.info("  After Gate 2: %d orthogroups for HyPhy.", len(aligned_for_hyphy))
+
+    # Save aligned orthogroups to disk for resume capability
+    import pickle
+    _cache_path = Path(get_storage_root()) / "aligned_orthogroups.pkl"
+    with open(_cache_path, "wb") as _f:
+        pickle.dump({"aligned": aligned, "motifs_by_og": motifs_by_og}, _f)
+    log.info("  Saved aligned orthogroups cache → %s", _cache_path)
+
     return aligned, motifs_by_og
 
 
@@ -537,24 +545,35 @@ def run_pipeline(
     if _existing is not None:
         results_dir = _existing
 
-    # If resuming past step4, recover aligned_orthogroups from DB
+    # If resuming past step4, recover aligned_orthogroups from disk cache
     if resume_from not in ("step1","step2","step3","step3b","step4"):
-        try:
-            from db.models import Ortholog
-            from db.session import get_session as _gs
-            _aligned: dict = {}
-            with _gs() as _s:
-                for row in _s.query(Ortholog).all():
-                    og = row.orthofinder_og or row.gene_id
-                    if og not in _aligned:
-                        _aligned[og] = {}
-                    if row.protein_seq:
-                        _aligned[og][row.species_id] = row.protein_seq
-            aligned_orthogroups = _aligned
-            motifs_by_og = {og: [] for og in _aligned}
-            log.info("Recovered %d orthogroups from DB for resume", len(aligned_orthogroups))
-        except Exception as _e:
-            log.warning("Could not recover aligned_orthogroups from DB: %s", _e)
+        _pkl_path = Path(get_storage_root()) / "aligned_orthogroups.pkl"
+        if _pkl_path.exists():
+            try:
+                import pickle
+                _data = pickle.load(open(_pkl_path, "rb"))
+                aligned_orthogroups = _data["aligned"]
+                motifs_by_og = _data["motifs_by_og"]
+                log.info("Recovered %d aligned orthogroups from disk cache", len(aligned_orthogroups))
+            except Exception as _e:
+                log.warning("Could not load aligned orthogroups cache: %s", _e)
+        else:
+            try:
+                from db.models import Ortholog
+                from db.session import get_session as _gs
+                _aligned: dict = {}
+                with _gs() as _s:
+                    for row in _s.query(Ortholog).all():
+                        og = row.orthofinder_og or row.gene_id
+                        if og not in _aligned:
+                            _aligned[og] = {}
+                        if row.protein_seq:
+                            _aligned[og][row.species_id] = row.protein_seq
+                aligned_orthogroups = _aligned
+                motifs_by_og = {og: [] for og in _aligned}
+                log.info("Recovered %d orthogroups from DB for resume", len(aligned_orthogroups))
+            except Exception as _e:
+                log.warning("Could not recover aligned_orthogroups from DB: %s", _e)
 
     # If resuming past step5, recover treefile from disk
     _tree_candidate = Path(get_storage_root()) / "phylo" / "species.treefile"
