@@ -162,12 +162,27 @@ def regulatory_score(gene_id: str, session) -> float:
 def composite_score(sub_scores: dict[str, float], weights: dict[str, float]) -> float:
     """Weighted sum of sub-scores normalised to [0, 1].
 
-    Only uses weights where both weight > 0 and sub-score is available.
+    Only includes a component in the denominator if:
+      - Its weight > 0, AND
+      - A score is actually available (> 0) OR it is a core evolutionary signal
+        (convergence, selection) that should always anchor the composite.
+
+    This prevents Phase 2 disease/druggability weights from diluting the score
+    to near-zero when those databases return no annotations (e.g. small test runs).
     """
-    total_weight = sum(w for k, w in weights.items() if w > 0)
+    # Core signals always counted even if zero (they reflect real absence of signal)
+    core_keys = {"convergence", "selection", "expression"}
+    total_weight = 0.0
+    weighted_sum = 0.0
+    for k, w in weights.items():
+        if w <= 0:
+            continue
+        score = sub_scores.get(k, 0.0)
+        if k in core_keys or score > 0:
+            total_weight += w
+            weighted_sum += score * w
     if total_weight == 0:
         return 0.0
-    weighted_sum = sum(sub_scores.get(k, 0.0) * w for k, w in weights.items())
     return round(weighted_sum / total_weight, 4)
 
 
