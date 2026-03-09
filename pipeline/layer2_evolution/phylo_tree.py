@@ -126,12 +126,14 @@ def run_iqtree(concat_alignment: dict[str, str]) -> Path:
         iqtree_bin,
         "-s", str(fasta_path),
         "-m", "TEST",
-        "-bb", str(bootstrap),
         "-T", str(threads),
         "-o", "human",
         "--prefix", str(tree_dir / "species"),
         "--redo",
     ]
+    # Bootstrap requires ≥4 sequences — skip for small test runs
+    if len(concat_alignment) >= 4:
+        cmd += ["-bb", str(bootstrap)]
 
     log.info("Running IQ-TREE2: %s", " ".join(cmd))
     result = subprocess.run(cmd, capture_output=False, check=False)

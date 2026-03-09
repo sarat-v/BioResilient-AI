@@ -67,14 +67,14 @@ def main():
                       'step7','step8','step9','step10','step10b','step11',
                       'step12','step13','step14','step15','step16']
 
-        # Find first incomplete step
-        resume_from = 'step1'
+        # Find first incomplete step — skip anything already in cache
+        resume_from = 'step5'  # default to step5 since step3/3b/4 are done
         for s in step_order:
             if s not in completed_steps:
                 resume_from = s
                 break
 
-        # Always resume from at least step3 if proteomes exist
+        # Only fall back to step3 if proteomes exist but step3 not cached
         if resume_from in ('step1', 'step2'):
             proteomes_done = (Path('data/proteomes/human.reheadered.faa').exists() and
                              Path('data/proteomes/nmr.reheadered.faa').exists() and
