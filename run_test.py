@@ -67,10 +67,12 @@ def main():
                       'step7','step8','step9','step10','step10b','step11',
                       'step12','step13','step14','step15','step16']
 
-        # Treat step1 and step2 as done if proteomes already exist on disk
-        proteomes_done = (Path('data/proteomes/human.reheadered.faa').exists() and
-                         Path('data/proteomes/nmr.reheadered.faa').exists() and
-                         Path('data/proteomes/elephant.reheadered.faa').exists())
+        # Treat step1 and step2 as done if proteomes already exist on disk for ALL seeded species
+        proteomes_dir = Path('data/proteomes')
+        proteomes_done = all(
+            (proteomes_dir / f"{s.id}.reheadered.faa").exists()
+            for s in species
+        )
         if proteomes_done:
             for s in ('step1', 'step2'):
                 if s not in completed_steps:

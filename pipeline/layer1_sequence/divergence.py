@@ -165,13 +165,12 @@ def compute_esm_distance(seq_a: str, seq_b: str, model=None) -> Optional[float]:
 
 def load_motifs_to_db(
     motifs: list[dict],
-    ortholog_map: dict[tuple[str, str], str],
+    ortholog_map: dict = None,  # unused, kept for backwards compatibility
 ) -> int:
     """Insert DivergentMotif rows into the database.
 
     Args:
         motifs: Output from extract_divergent_motifs().
-        ortholog_map: {(gene_id, species_id): ortholog.id}
 
     Returns:
         Number of rows inserted.

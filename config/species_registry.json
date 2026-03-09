@@ -68,7 +68,7 @@
     "name": "Loxodonta africana",
     "phenotype": ["cancer_resistance"],
     "genome_assembly": "GCF_000001905.1",
-    "lineage_group": "Primates",
+    "lineage_group": "Proboscideans",
     "geo_search_terms": ["Loxodonta africana", "African elephant", "cancer resistance", "TP53"]
   },
   {

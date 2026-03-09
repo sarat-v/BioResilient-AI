@@ -28,24 +28,25 @@ PHYLOP_TRACK = "phyloP100way"   # hg38 100-way vertebrate PhyloP
 PHYLOP_GENOME = "hg38"
 
 # Map species_id → lineage group.
-# Uses both the short DB IDs (nmr, elephant) and full names for portability.
+# Covers both short DB IDs (from test seeding) and full registry IDs from species_registry.json.
+# Add new species here when extending to 50-species runs.
 LINEAGE_MAP = {
-    # Short DB IDs (from run_test_pipeline.sh seeding)
-    "nmr":                "Rodents",
-    "elephant":           "Proboscideans",
-    "human":              "Primates",
-    # Full-name variants (for future full-scale runs)
-    "naked_mole_rat":     "Rodents",
+    # Production registry IDs (species_registry.json)
+    "naked_mole_rat":      "Rodents",
     "damaraland_mole_rat": "Rodents",
-    "ground_squirrel":    "Rodents",
-    "spiny_mouse":        "Rodents",
-    "bowhead_whale":      "Cetaceans",
-    "little_brown_bat":   "Bats",
-    "greenland_shark":    "Sharks",
-    "bowhead_rockfish":   "Sharks",
-    "african_elephant":   "Proboscideans",
-    "mouse_lemur":        "Primates",
-    "axolotl":            "Salamanders",
+    "ground_squirrel":     "Rodents",
+    "spiny_mouse":         "Rodents",
+    "bowhead_whale":       "Cetaceans",
+    "little_brown_bat":    "Bats",
+    "greenland_shark":     "Sharks",
+    "bowhead_rockfish":    "Sharks",
+    "african_elephant":    "Proboscideans",
+    "mouse_lemur":         "Primates",
+    "axolotl":             "Salamanders",
+    "human":               "Primates",
+    # Short test DB IDs (from run_test_pipeline.sh seeding)
+    "nmr":                 "Rodents",
+    "elephant":            "Proboscideans",
 }
 
 

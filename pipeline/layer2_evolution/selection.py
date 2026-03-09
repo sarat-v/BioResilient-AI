@@ -86,9 +86,13 @@ def run_absrel(aln_path: Path, tree_path: Path, og_id: str) -> Optional[dict]:
 
         # Compute mean pairwise divergence between human and other species
         divergences = []
+        non_human_species = []
         for label, seq in seqs.items():
             if "human" in label.lower():
                 continue
+            # Extract species ID from label format "species_id|species_id|protein_id"
+            species_id = label.split("|")[0]
+            non_human_species.append(species_id)
             length = min(len(human_seq), len(seq))
             if length == 0:
                 continue
@@ -113,6 +117,7 @@ def run_absrel(aln_path: Path, tree_path: Path, og_id: str) -> Optional[dict]:
             "proxy_pvalue": p_value,
             "branch_attributes": {},
             "tested": len(divergences),
+            "_species": non_human_species,
         }
     except Exception as exc:
         log.warning("  Selection proxy failed for %s: %s", og_id, exc)
@@ -132,7 +137,9 @@ def parse_absrel_results(hyphy_json: dict) -> dict:
             "dnds_ratio": dnds,
             "dnds_pvalue": pval,
             "selection_model": "protein_divergence_proxy",
-            "branches_under_selection": ["nmr", "elephant"] if dnds > 1.0 else [],
+            "branches_under_selection": [
+                sp for sp in hyphy_json.get("_species", []) if sp != "human"
+            ] if dnds > 1.0 else [],
         }
 
     branch_results = hyphy_json.get("branch attributes", {}).get("0", {})
