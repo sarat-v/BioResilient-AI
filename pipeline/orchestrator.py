@@ -222,6 +222,8 @@ def step4_alignment_and_divergence(
     if dry_run:
         return {}, {}
 
+    from pipeline.config import get_storage_root
+
     from pipeline.config import get_thresholds
     from pipeline.layer1_sequence.alignment import (
         align_all_orthogroups,
