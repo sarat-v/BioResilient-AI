@@ -36,6 +36,8 @@ def _orthofinder_output_dir(proteomes_dir: Path) -> Optional[Path]:
 def run_orthofinder(proteomes_dir: Path) -> Path:
     """Run OrthoFinder with DIAMOND on the proteomes directory.
 
+    If a completed results directory already exists, reuse it (cache).
+
     Args:
         proteomes_dir: Directory containing one .faa file per species (reheadered).
 
@@ -48,6 +50,17 @@ def run_orthofinder(proteomes_dir: Path) -> Path:
 
     root = Path(get_storage_root())
     out_dir = root / "orthofinder_out"
+
+    # Reuse cached results if they exist
+    existing = _orthofinder_output_dir(proteomes_dir)
+    if existing is not None and (existing / "Orthogroups" / "Orthogroups.tsv").exists():
+        log.info("OrthoFinder results already exist — reusing cache: %s", existing)
+        return existing
+
+    # Remove stale/incomplete output dir so OrthoFinder can create a fresh one
+    if out_dir.exists():
+        log.info("Removing stale OrthoFinder output dir: %s", out_dir)
+        shutil.rmtree(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
 
     cmd = [

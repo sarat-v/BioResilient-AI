@@ -55,9 +55,16 @@ def main():
         for s in species
     ]
     
-    # Run pipeline
+    # Run pipeline — resume from step3 if proteomes already downloaded
     try:
-        run_pipeline(species_list=species_list)
+        from pathlib import Path
+        proteomes_done = (Path('data/proteomes/human.reheadered.faa').exists() and
+                         Path('data/proteomes/nmr.reheadered.faa').exists() and
+                         Path('data/proteomes/elephant.reheadered.faa').exists())
+        resume_from = 'step3' if proteomes_done else 'step1'
+        if proteomes_done:
+            print("✓ Proteomes already downloaded — resuming from step3 (OrthoFinder)")
+        run_pipeline(species_list=species_list, resume_from=resume_from)
         print("\n" + "="*60)
         print("✅ Pipeline Complete!")
         print("="*60)
