@@ -42,10 +42,22 @@ def main():
     
     print(f"✓ Found {len(species)} species: {', '.join([s.scientific_name for s in species])}")
     print()
+
+    # Build species_list dict as expected by run_pipeline
+    species_list = [
+        {
+            "id": s.id,
+            "taxid": s.taxid,
+            "scientific_name": s.scientific_name,
+            "lineage_group": s.lineage_group,
+            "phenotypes": s.phenotypes or [],
+        }
+        for s in species
+    ]
     
     # Run pipeline
     try:
-        run_pipeline()
+        run_pipeline(species_list=species_list)
         print("\n" + "="*60)
         print("✅ Pipeline Complete!")
         print("="*60)
