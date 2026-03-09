@@ -19,14 +19,14 @@ gpu:
   esm_chunk_size: 64    # Reduce if hitting OOM errors on long proteins
 
 ncbi:
-  api_key: 563ff93562a41ce1043db202e751a6e08808
-  email: sarat.vakkalanka@gmail.com
+  api_key: YOUR_NCBI_API_KEY_HERE
+  email: your.email@example.com
   # Free key at https://www.ncbi.nlm.nih.gov/account/ — increases rate limits from 3 to 10 req/sec
 
 # AlphaGenome (DeepMind) — regulatory variant effect; optional for Track B
 # Register at https://deepmind.com/blog/alphagenome (non-commercial)
 alphagenome:
-  api_key: AIzaSyBFKH1QbJTyQjvsjLf6Pwejvi8F7mx4K7k
+  api_key: YOUR_ALPHAGENOME_API_KEY_HERE
 
 tools:
   orthofinder_threads: 8          # Search threads
