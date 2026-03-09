@@ -304,18 +304,20 @@ def step6_evolutionary_selection(
     treefile: Path,
     dry_run: bool = False,
 ) -> None:
-    """Run HyPhy aBSREL on candidate orthogroups."""
-    log.info("Step 6: Running HyPhy aBSREL selection analysis...")
+    """Run MEME episodic selection analysis on candidate orthogroups.
+
+    Tries codon-guided HyPhy MEME first (statistically rigorous episodic
+    selection). Falls back to protein divergence proxy for any orthogroup
+    where CDS fetching fails (e.g. UniProt accessions without NCBI CDS links).
+    """
+    log.info("Step 6: Running MEME episodic selection analysis...")
     if dry_run:
         return
 
-    from pipeline.layer2_evolution.selection import (
-        build_gene_og_map,
-        load_selection_scores,
-        run_selection_pipeline,
-    )
+    from pipeline.layer2_evolution.meme_selection import run_meme_pipeline
+    from pipeline.layer2_evolution.selection import build_gene_og_map, load_selection_scores
 
-    selection_results = run_selection_pipeline(aligned_orthogroups, motifs_by_og, treefile)
+    selection_results = run_meme_pipeline(aligned_orthogroups, motifs_by_og, treefile)
     gene_by_og = build_gene_og_map()
     load_selection_scores(selection_results, gene_by_og)
 

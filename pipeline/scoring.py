@@ -45,14 +45,25 @@ log = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 
 
-def convergence_score(convergence_count: int, max_lineages: int = 6) -> float:
-    """Score in [0, 1] based on number of independent lineages with the motif.
+def convergence_score(convergence_count: int, max_lineages: int = 8, phylo_weight: Optional[float] = None) -> float:
+    """Score in [0, 1] based on convergent evolution signal.
 
-    Sigmoid-shaped: 0 lineages → 0.0, 3 lineages → ~0.73, 6 lineages → ~0.98.
+    When phylo_weight is available (from phylogenetically-weighted convergence),
+    it is used directly after normalisation — this rewards convergence across
+    more phylogenetically distant lineages (e.g. Rodents + Birds scores higher
+    than Rodents + other Rodents).
+
+    When only convergence_count is available (test runs, legacy data), falls
+    back to a sigmoid on count alone.
+
+    Max expected phylo_weight:
+      - 8 lineages at 310 MY avg spacing ≈ 8 × 2.06 = 16.5
+      - Normalise by capping at 16.0 for a [0,1] range.
     """
+    if phylo_weight is not None and phylo_weight > 0:
+        return round(min(phylo_weight / 16.0, 1.0), 4)
     if convergence_count is None or convergence_count <= 0:
         return 0.0
-    # Logistic function centred at 3 lineages
     return round(1.0 / (1.0 + math.exp(-1.5 * (convergence_count - 2))), 4)
 
 
@@ -186,12 +197,53 @@ def composite_score(sub_scores: dict[str, float], weights: dict[str, float]) -> 
     return round(weighted_sum / total_weight, 4)
 
 
-def assign_tier(score: float, thresholds: dict[str, float]) -> str:
+def assign_tier(score: float, thresholds: dict[str, float], human_genetics_score: float = 0.0) -> str:
+    """Assign tier based on composite score.
+
+    'Validated' is a special designation for genes that have BOTH strong
+    evolutionary signal (Tier1/Tier2) AND human genetic evidence (GWAS,
+    OpenTargets genetic association). This is the highest confidence category
+    for clinical translation.
+    """
     if score >= thresholds.get("tier1", 0.70):
-        return "Tier1"
-    if score >= thresholds.get("tier2", 0.40):
-        return "Tier2"
-    return "Tier3"
+        tier = "Tier1"
+    elif score >= thresholds.get("tier2", 0.40):
+        tier = "Tier2"
+    else:
+        return "Tier3"
+    # Upgrade to Validated if human genetics evidence is present
+    if human_genetics_score >= 0.3:
+        return "Validated"
+    return tier
+
+
+def human_genetics_score_from_disease(ann: Optional[DiseaseAnnotation]) -> float:
+    """Compute a human genetics confidence score from disease annotation data.
+
+    This is NOT the same as disease_score() — it specifically captures whether
+    the gene has *genetic* (not just phenotypic) evidence in humans:
+    - GWAS association (gwas_pvalue): genetic variant in humans linked to disease
+    - gnomAD pLI (gnomad_pli): high pLI means loss of function is intolerant —
+      strong signal the gene is functionally critical in humans
+    - OpenTargets genetic_evidence (subset of opentargets_score): causal genetic link
+
+    Returns 0 if no human genetic support; >0.3 qualifies for 'Validated' tier.
+    """
+    if ann is None:
+        return 0.0
+    score = 0.0
+    # GWAS: direct human genetic evidence
+    if ann.gwas_pvalue is not None and ann.gwas_pvalue < 5e-8:
+        score += min(-math.log10(ann.gwas_pvalue) / 15.0, 0.5)
+    elif ann.gwas_pvalue is not None and ann.gwas_pvalue < 1e-5:
+        score += 0.1
+    # gnomAD pLI: functional constraint in human population
+    if ann.gnomad_pli is not None:
+        score += min(ann.gnomad_pli, 1.0) * 0.3
+    # OpenTargets: genetic association evidence
+    if ann.opentargets_score is not None and ann.opentargets_score > 0.3:
+        score += min(ann.opentargets_score, 1.0) * 0.3
+    return round(min(score, 1.0), 4)
 
 
 # ---------------------------------------------------------------------------
@@ -220,7 +272,10 @@ def run_scoring(phase: str = "phase1") -> None:
             dt = session.get(DrugTarget, gene.id)
             sf = session.get(SafetyFlag, gene.id)
 
-            conv_score = convergence_score(ev.convergence_count if ev else 0)
+            conv_score = convergence_score(
+                ev.convergence_count if ev else 0,
+                phylo_weight=ev.phylop_score if ev and ev.phylop_score else None,
+            )
             sel_score = selection_score(
                 ev.dnds_ratio if ev else None,
                 ev.dnds_pvalue if ev else None,
@@ -242,7 +297,8 @@ def run_scoring(phase: str = "phase1") -> None:
             }
 
             comp = composite_score(sub_scores, weights)
-            tier = assign_tier(comp, tier_thresholds)
+            hg_score = human_genetics_score_from_disease(ann)
+            tier = assign_tier(comp, tier_thresholds, human_genetics_score=hg_score)
 
             cs = session.get(CandidateScore, gene.id)
             if cs is None:
