@@ -103,15 +103,25 @@ def step1_validate_environment() -> None:
     import subprocess
 
     log.info("Step 1: Validating environment...")
-    tools = ["orthofinder", "mafft", "iqtree2", "hyphy", "diamond"]
+    # Each entry is (canonical_name, [accepted_binary_names])
+    tools = [
+        ("orthofinder", ["orthofinder"]),
+        ("mafft",       ["mafft"]),
+        ("iqtree2",     ["iqtree2", "iqtree"]),   # bioconda installs as either name
+        ("hyphy",       ["hyphy", "HYPHYMP"]),
+        ("diamond",     ["diamond"]),
+    ]
     missing = []
-    for tool in tools:
-        result = subprocess.run(["which", tool], capture_output=True)
-        if result.returncode != 0:
-            missing.append(tool)
-            log.error("  ✗ %s not found", tool)
+    for name, binaries in tools:
+        found = any(
+            subprocess.run(["which", b], capture_output=True).returncode == 0
+            for b in binaries
+        )
+        if not found:
+            missing.append(name)
+            log.error("  ✗ %s not found", name)
         else:
-            log.info("  ✓ %s", tool)
+            log.info("  ✓ %s", name)
 
     if missing:
         raise RuntimeError(f"Missing tools: {missing}. Run setup_local.sh first.")
