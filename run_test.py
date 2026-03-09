@@ -22,7 +22,8 @@ def main():
     
     print("\n" + "="*60)
     print("BioResilient Test Pipeline")
-    print("Species: Human, Naked Mole Rat, Axolotl")
+    print("Species: Human, Naked Mole Rat, African Elephant")
+    print("Theme: Converging Cancer Resistance")
     print("="*60 + "\n")
     
     # Import after path setup

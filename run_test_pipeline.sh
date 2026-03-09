@@ -1,6 +1,6 @@
 #!/bin/bash
-# BioResilient Test Pipeline — Local 2-Species Run
-# Tests: Human vs Naked Mole Rat vs Axolotl
+# BioResilient Test Pipeline — Local 3-Species Run
+# Tests: Human vs Naked Mole Rat vs African Elephant (Converging Cancer Resistance)
 
 set -e
 
@@ -9,7 +9,8 @@ cd "$REPO_ROOT"
 
 echo "================================"
 echo "BioResilient Test Pipeline"
-echo "Species: Human, Naked Mole Rat, Axolotl"
+echo "Species: Human, Naked Mole Rat, African Elephant"
+echo "Theme: Converging Cancer Resistance"
 echo "================================"
 echo ""
 
@@ -68,9 +69,9 @@ if existing > 0:
 
 # Seed 3 test species
 species_data = [
-    {'id': 'human', 'name': 'Homo sapiens', 'lineage': 'Mammals', 'phenotypes': ['bipedal', 'large_brain']},
-    {'id': 'nmr', 'name': 'Heterocephalus glaber', 'lineage': 'Mammals', 'phenotypes': ['eusocial', 'longevity', 'cancer_resistance']},
-    {'id': 'axolotl', 'name': 'Ambystoma mexicanum', 'lineage': 'Amphibians', 'phenotypes': ['regeneration', 'neoteny']},
+    {'id': 'human', 'name': 'Homo sapiens', 'lineage': 'Primates', 'phenotypes': ['bipedal', 'large_brain', 'complex_language']},
+    {'id': 'nmr', 'name': 'Heterocephalus glaber', 'lineage': 'Rodentia', 'phenotypes': ['eusocial', 'extreme_longevity', 'cancer_resistance', 'pain_insensitivity']},
+    {'id': 'elephant', 'name': 'Loxodonta africana', 'lineage': 'Proboscidea', 'phenotypes': ['large_body', 'longevity', 'cancer_resistance', 'low_tumor_rate']},
 ]
 
 for s in species_data:
