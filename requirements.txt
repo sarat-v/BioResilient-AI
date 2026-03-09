@@ -1,5 +1,6 @@
 # BioResilient AI — Core Dependencies
 # Generated from environment.yml for pip compatibility
+# Updated for Python 3.12 compatibility
 
 # Web Framework
 fastapi==0.109.0
@@ -12,8 +13,8 @@ psycopg2-binary==2.9.9
 alembic==1.13.1
 
 # Bioinformatics Core
-biopython==1.81
-numpy==1.24.3
+biopython==1.84
+numpy>=1.26.0
 
 # Configuration
 pyyaml==6.0.1
@@ -28,3 +29,4 @@ lxml==4.9.3
 # Testing (optional)
 pytest==7.4.3
 pytest-cov==4.1.0
+
