@@ -17,7 +17,7 @@ from typing import Optional
 
 import requests
 
-from db.models import EvolutionScore, Gene, Ortholog
+from db.models import EvolutionScore, Gene, Ortholog, Species
 from db.session import get_session
 from pipeline.config import get_ncbi_api_key, get_ncbi_email, get_thresholds
 
@@ -27,8 +27,14 @@ UCSC_API = "https://api.genome.ucsc.edu/getData/track"
 PHYLOP_TRACK = "phyloP100way"   # hg38 100-way vertebrate PhyloP
 PHYLOP_GENOME = "hg38"
 
-# Map species_id → lineage group
+# Map species_id → lineage group.
+# Uses both the short DB IDs (nmr, elephant) and full names for portability.
 LINEAGE_MAP = {
+    # Short DB IDs (from run_test_pipeline.sh seeding)
+    "nmr":                "Rodents",
+    "elephant":           "Proboscideans",
+    "human":              "Primates",
+    # Full-name variants (for future full-scale runs)
     "naked_mole_rat":     "Rodents",
     "damaraland_mole_rat": "Rodents",
     "ground_squirrel":    "Rodents",
@@ -40,7 +46,6 @@ LINEAGE_MAP = {
     "african_elephant":   "Proboscideans",
     "mouse_lemur":        "Primates",
     "axolotl":            "Salamanders",
-    "human":              "Primates",
 }
 
 
@@ -141,6 +146,26 @@ def run_convergence_pipeline() -> None:
     """Compute and store convergence scores for all genes in EvolutionScore."""
     thresholds = get_thresholds()
     min_lineages = thresholds.get("convergence_min_lineages", 3)
+
+    # Auto-adjust min_lineages if we have fewer distinct non-human lineages than the threshold.
+    # This happens in small test runs (e.g. Human + NMR + Elephant = 2 lineages).
+    with get_session() as session:
+        all_species_ids = [sp.id for sp in session.query(Species).all()]
+    available_lineages = {
+        LINEAGE_MAP.get(sid)
+        for sid in all_species_ids
+        if sid in LINEAGE_MAP and LINEAGE_MAP.get(sid) != "Primates"
+    } - {None}
+    if available_lineages and len(available_lineages) < min_lineages:
+        log.info(
+            "Adjusting convergence_min_lineages from %d to %d "
+            "(only %d non-human lineage groups present: %s)",
+            min_lineages,
+            len(available_lineages),
+            len(available_lineages),
+            ", ".join(sorted(available_lineages)),
+        )
+        min_lineages = max(1, len(available_lineages))
 
     with get_session() as session:
         gene_ids = [ev.gene_id for ev in session.query(EvolutionScore).all()]
