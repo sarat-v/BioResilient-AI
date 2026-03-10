@@ -4,7 +4,7 @@ import { motion } from 'framer-motion'
 import {
   RadarChart, Radar, PolarGrid, PolarAngleAxis, ResponsiveContainer, Tooltip,
 } from 'recharts'
-import { ArrowLeft, ExternalLink, Shield, Pill, Dna, Activity, Info } from 'lucide-react'
+import { ArrowLeft, ExternalLink, Shield, Pill, Dna, Activity, Info, FileText, Loader2 } from 'lucide-react'
 import { api } from '@/lib/api'
 import { TierBadge, ScoreBar, PageHeader, Spinner, EmptyState } from '@/components/ui'
 import { formatFloat, cn } from '@/lib/utils'
@@ -66,6 +66,42 @@ function Section({ title, icon: Icon, children }) {
   )
 }
 
+function MotifAlignment({ humanSeq, animalSeq }) {
+  const len = Math.max(humanSeq?.length ?? 0, animalSeq?.length ?? 0)
+  const h = (humanSeq ?? '').padEnd(len, ' ')
+  const a = (animalSeq ?? '').padEnd(len, ' ')
+  return (
+    <div className="space-y-2">
+      <div>
+        <p className="text-[10px] text-text-muted mb-0.5">Human</p>
+        <div className="font-mono text-xs tracking-widest flex flex-wrap gap-0.5">
+          {h.split('').map((ch, i) => (
+            <span
+              key={`h-${i}`}
+              className={ch !== a[i] && a[i] !== ' ' ? 'text-amber-400 bg-amber-500/20 rounded px-0.5' : 'text-text-primary'}
+            >
+              {ch}
+            </span>
+          ))}
+        </div>
+      </div>
+      <div>
+        <p className="text-[10px] text-accent mb-0.5">Resilient species</p>
+        <div className="font-mono text-xs tracking-widest flex flex-wrap gap-0.5">
+          {a.split('').map((ch, i) => (
+            <span
+              key={`a-${i}`}
+              className={ch !== h[i] && ch !== ' ' ? 'text-amber-400 bg-amber-500/20 rounded px-0.5' : 'text-text-muted'}
+            >
+              {ch}
+            </span>
+          ))}
+        </div>
+      </div>
+    </div>
+  )
+}
+
 function KV({ label, value, mono, tooltip }) {
   const val = value ?? '—'
   const content = <span className={cn('text-sm text-text-primary', mono && 'font-mono text-accent')}>{val}</span>
@@ -85,6 +121,8 @@ export default function GeneDetail() {
   const [scores, setScores] = useState(null)
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState(null)
+  const [narrativeLoading, setNarrativeLoading] = useState(false)
+  const [narrativeOverride, setNarrativeOverride] = useState(null)
 
   useEffect(() => {
     Promise.all([
@@ -100,11 +138,26 @@ export default function GeneDetail() {
     })
   }, [id])
 
+  const refreshGene = () => {
+    api.getCandidate(id).then(setGene).catch(() => {})
+  }
+
+  const onGenerateNarrative = () => {
+    setNarrativeLoading(true)
+    api.generateNarrative({ gene_id: id, force: false })
+      .then((res) => {
+        setNarrativeOverride(res.narrative)
+        refreshGene()
+      })
+      .finally(() => setNarrativeLoading(false))
+  }
+
   if (loading) return <div className="flex items-center justify-center py-40"><Spinner className="w-8 h-8" /></div>
   if (error || !gene) return <EmptyState title="Gene not found" subtitle={error ?? 'Check the gene ID'} />
 
   const ev = gene.evolution ?? {}
   const sub = scores?.sub_scores ?? {}
+  const narrative = narrativeOverride ?? gene.narrative ?? null
 
   return (
     <div className="px-8 py-8 space-y-6">
@@ -131,6 +184,32 @@ export default function GeneDetail() {
           </div>
         </div>
       </div>
+
+      {/* Research Summary */}
+      <div className="card">
+          <div className="flex items-center gap-2 pb-2 border-b border-white/5">
+            <FileText className="w-4 h-4 text-accent" />
+            <p className="font-semibold text-text-primary">Research Summary</p>
+          </div>
+          {narrativeLoading ? (
+            <div className="flex items-center gap-2 py-4 text-text-muted">
+              <Loader2 className="w-4 h-4 animate-spin" />
+              <span className="text-sm">Generating summary…</span>
+            </div>
+          ) : narrative ? (
+            <div className="prose prose-invert prose-sm max-w-none text-text-primary whitespace-pre-wrap pt-2">
+              {narrative}
+            </div>
+          ) : (
+            <button
+              type="button"
+              onClick={onGenerateNarrative}
+              className="mt-2 px-4 py-2 rounded-lg bg-accent/15 text-accent border border-accent/30 hover:bg-accent/25 text-sm font-medium transition-colors"
+            >
+              Generate Summary
+            </button>
+          )}
+        </div>
 
       <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
         {/* Score radar */}
@@ -222,18 +301,10 @@ export default function GeneDetail() {
                             </span>
                           )}
                         </div>
-                        <div className="grid grid-cols-2 gap-3">
-                          <div>
-                            <p className="text-[10px] text-text-muted mb-1">Human</p>
-                            <p className="font-mono text-xs text-text-primary tracking-widest bg-elevated rounded px-2 py-1.5">
-                              {m.human_seq}
-                            </p>
-                          </div>
-                          <div>
-                            <p className="text-[10px] text-accent mb-1">Resilient species</p>
-                            <p className="font-mono text-xs text-accent tracking-widest bg-accent/5 rounded px-2 py-1.5">
-                              {m.animal_seq}
-                            </p>
+                        <div>
+                          <p className="text-[10px] text-text-muted mb-1.5">Alignment (divergent positions in amber)</p>
+                          <div className="bg-elevated rounded px-3 py-2">
+                            <MotifAlignment humanSeq={m.human_seq} animalSeq={m.animal_seq} />
                           </div>
                         </div>
                       </div>

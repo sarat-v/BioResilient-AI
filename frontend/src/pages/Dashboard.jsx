@@ -36,18 +36,27 @@ function StatusPill({ status }) {
 export default function Dashboard() {
   const [candidates, setCandidates] = useState(null)
   const [pipelineStatus, setPipelineStatus] = useState(null)
+  const [traits, setTraits] = useState([])
+  const [traitId, setTraitId] = useState('')
   const [loading, setLoading] = useState(true)
 
   useEffect(() => {
+    api.getTraits().then(setTraits).catch(() => [])
+  }, [])
+
+  useEffect(() => {
+    setLoading(true)
+    const params = { limit: 20 }
+    if (traitId) params.trait_id = traitId
     Promise.all([
-      api.getCandidates({ limit: 20 }).catch(() => []),
+      api.getCandidates(params).catch(() => []),
       api.getPipelineStatus().catch(() => null),
     ]).then(([cands, status]) => {
       setCandidates(cands ?? [])
       setPipelineStatus(status)
       setLoading(false)
     })
-  }, [])
+  }, [traitId])
 
   const tier1 = candidates?.filter(c => c.tier === 'Tier1').length ?? 0
   const tier2 = candidates?.filter(c => c.tier === 'Tier2').length ?? 0
@@ -65,6 +74,18 @@ export default function Dashboard() {
         title="Dashboard"
         subtitle="Overview of your BioResilient analysis"
       >
+        {traits.length > 0 && (
+          <select
+            value={traitId}
+            onChange={e => setTraitId(e.target.value)}
+            className="px-3 py-2 bg-surface border border-white/8 rounded-lg text-sm text-text-primary focus:outline-none focus:border-accent/50"
+          >
+            <option value="">Default analysis</option>
+            {traits.map(t => (
+              <option key={t.id} value={t.id}>{t.label}</option>
+            ))}
+          </select>
+        )}
         <Link to="/pipeline" className="btn-secondary text-sm">
           <Activity className="w-4 h-4" /> Pipeline
         </Link>

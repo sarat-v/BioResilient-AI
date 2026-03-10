@@ -15,7 +15,7 @@ from typing import Optional
 
 import pandas as pd
 
-from db.models import CandidateScore, Gene, Ortholog
+from db.models import CandidateScore, ExpressionResult, Gene, Ortholog
 from db.session import get_session
 from pipeline.config import get_ncbi_api_key, get_ncbi_email, get_storage_root, get_thresholds
 
@@ -232,6 +232,41 @@ def compute_expression_score(
     return scores
 
 
+def save_expression_evidence(
+    results: pd.DataFrame,
+    geo_accession: str,
+    comparison: str,
+    gene_symbol_to_id: dict[str, str],
+) -> int:
+    """Write per-gene expression evidence to ExpressionResult for traceability."""
+    if results is None or results.empty:
+        return 0
+    n = 0
+    with get_session() as session:
+        for _, row in results.iterrows():
+            symbol = str(row.get("gene_id", "")).strip()
+            gene_id = gene_symbol_to_id.get(symbol)
+            if not gene_id:
+                continue
+            log2fc = row.get("log2FoldChange")
+            padj = row.get("padj")
+            if pd.isna(log2fc):
+                log2fc = None
+            if pd.isna(padj):
+                padj = None
+            session.add(ExpressionResult(
+                gene_id=gene_id,
+                geo_accession=geo_accession,
+                comparison=comparison,
+                log2fc=float(log2fc) if log2fc is not None else None,
+                padj=float(padj) if padj is not None else None,
+                n_samples=int(results.shape[1]) - 2 if results.shape[1] > 2 else None,
+            ))
+            n += 1
+        session.commit()
+    return n
+
+
 def save_expression_scores(scores_by_species: dict[str, dict[str, float]]) -> None:
     """Aggregate expression scores across species and update CandidateScore."""
     with get_session() as session:
@@ -250,9 +285,9 @@ def save_expression_scores(scores_by_species: dict[str, dict[str, float]]) -> No
             # Average expression score across all species with data
             expr_score = sum(species_scores) / len(species_scores)
 
-            cs = session.get(CandidateScore, gene_id)
+            cs = session.query(CandidateScore).filter_by(gene_id=gene_id, trait_id="").first()
             if cs is None:
-                cs = CandidateScore(gene_id=gene_id)
+                cs = CandidateScore(gene_id=gene_id, trait_id="")
                 session.add(cs)
             cs.expression_score = round(expr_score, 4)
 
@@ -300,11 +335,14 @@ def run_expression_pipeline(species_list: list[dict]) -> dict[str, dict[str, flo
                 continue
 
             with get_session() as session:
-                gene_symbols = {g.gene_symbol for g in session.query(Gene).all()}
+                genes = session.query(Gene).all()
+                gene_symbols = {g.gene_symbol for g in genes}
+                gene_symbol_to_id = {g.gene_symbol: g.id for g in genes}
 
             species_scores = compute_expression_score(results, gene_symbols)
             scores_by_species[sid] = species_scores
-            log.info("  %s/%s: scored %d genes", sid, gse_acc, len(species_scores))
+            n_ev = save_expression_evidence(results, gse_acc, sid, gene_symbol_to_id)
+            log.info("  %s/%s: scored %d genes, saved %d evidence rows", sid, gse_acc, len(species_scores), n_ev)
 
     return scores_by_species
 

@@ -2,6 +2,8 @@
 
 import asyncio
 import json
+import os
+import signal
 import subprocess
 import sys
 from datetime import datetime, timezone
@@ -12,6 +14,9 @@ from fastapi import APIRouter, BackgroundTasks, HTTPException
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 
+from db.models import PipelineRun
+from db.session import get_session
+
 router = APIRouter()
 
 _REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -19,7 +24,7 @@ _STATE_FILE = _REPO_ROOT / "pipeline_state.json"
 _LOG_FILE = _REPO_ROOT / "pipeline.log"
 _ORCHESTRATOR = _REPO_ROOT / "pipeline" / "orchestrator.py"
 
-# In-memory handle for the running subprocess (one at a time)
+# In-memory handle for the running subprocess (used for log draining and terminate)
 _current_process: Optional[subprocess.Popen] = None
 
 
@@ -37,14 +42,33 @@ def _read_state() -> dict:
 
 
 def _is_running() -> bool:
+    """Check if a pipeline is running: prefer DB (PipelineRun with live pid), else in-memory process."""
     global _current_process
-    if _current_process is None:
+    if _current_process is not None:
+        poll = _current_process.poll()
+        if poll is not None:
+            _current_process = None
+            return False
+        return True
+    try:
+        with get_session() as session:
+            run = (
+                session.query(PipelineRun)
+                .filter(PipelineRun.status == "running")
+                .order_by(PipelineRun.started_at.desc())
+                .first()
+            )
+            if run is None or run.pid is None:
+                return False
+            try:
+                os.kill(run.pid, 0)
+                return True
+            except (ProcessLookupError, PermissionError):
+                run.status = "failed"
+                session.commit()
+                return False
+    except Exception:
         return False
-    poll = _current_process.poll()
-    if poll is not None:
-        _current_process = None
-        return False
-    return True
 
 
 # ---------------------------------------------------------------------------
@@ -95,6 +119,25 @@ def start_pipeline(req: RunRequest, background_tasks: BackgroundTasks):
         except Exception:
             pass
 
+    import uuid
+    run_id = str(uuid.uuid4())
+    try:
+        with get_session() as session:
+            run = PipelineRun(
+                id=run_id,
+                status="running",
+                started_at=datetime.now(timezone.utc),
+                step_statuses={},
+            )
+            session.add(run)
+            session.commit()
+    except Exception:
+        run_id = None
+
+    env = os.environ.copy()
+    if run_id:
+        env["PIPELINE_RUN_ID"] = run_id
+
     cmd = [sys.executable, str(_ORCHESTRATOR), f"--resume-from={req.resume_from}"]
     if req.dry_run:
         cmd.append("--dry-run")
@@ -104,7 +147,18 @@ def start_pipeline(req: RunRequest, background_tasks: BackgroundTasks):
         cwd=str(_REPO_ROOT),
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
+        env=env,
     )
+
+    if run_id:
+        try:
+            with get_session() as session:
+                run = session.get(PipelineRun, run_id)
+                if run:
+                    run.pid = _current_process.pid
+                    session.commit()
+        except Exception:
+            pass
 
     # Stream stdout to log file in background thread
     def _drain():
@@ -118,10 +172,10 @@ def start_pipeline(req: RunRequest, background_tasks: BackgroundTasks):
     threading.Thread(target=_drain, daemon=True).start()
 
     started_at = datetime.now(timezone.utc).isoformat()
-    run_id = started_at.replace(":", "-").replace(".", "-")
+    response_run_id = run_id if run_id else started_at.replace(":", "-").replace(".", "-")
 
     return RunResponse(
-        run_id=run_id,
+        run_id=response_run_id,
         started_at=started_at,
         resume_from=req.resume_from,
         dry_run=req.dry_run,
@@ -139,11 +193,32 @@ def stop_pipeline():
     global _current_process
     if not _is_running():
         return {"message": "No pipeline is running."}
-    _current_process.terminate()
-    _current_process = None
+    run_id = _read_state().get("run_id")
+    if _current_process is not None:
+        _current_process.terminate()
+        _current_process = None
+    try:
+        with get_session() as session:
+            run = session.get(PipelineRun, run_id) if run_id else None
+            if run is None and run_id is None:
+                run = (
+                    session.query(PipelineRun)
+                    .filter(PipelineRun.status == "running")
+                    .order_by(PipelineRun.started_at.desc())
+                    .first()
+                )
+            if run:
+                run.status = "stopped"
+                run.finished_at = datetime.now(timezone.utc)
+                session.commit()
+    except Exception:
+        pass
     state = _read_state()
     state["status"] = "stopped"
-    _STATE_FILE.write_text(json.dumps(state, indent=2))
+    try:
+        _STATE_FILE.write_text(json.dumps(state, indent=2))
+    except Exception:
+        pass
     return {"message": "Pipeline stopped."}
 
 

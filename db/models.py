@@ -64,6 +64,9 @@ class Gene(Base):
     human_gene_id = Column(String, nullable=False, unique=True)   # NCBI Gene ID
     gene_symbol = Column(String, nullable=False)
     human_protein = Column(String)                                # UniProt accession
+    narrative = Column(Text, nullable=True)                        # LLM-generated research summary (cached)
+    go_terms = Column(ARRAY(String), default=list)                # GO biological process/function terms
+    pathway_ids = Column(ARRAY(String), default=list)              # Reactome/pathway identifiers
 
     orthologs = relationship("Ortholog", back_populates="gene")
     evolution_score = relationship("EvolutionScore", back_populates="gene", uselist=False)
@@ -127,6 +130,20 @@ class DivergentMotif(Base):
 # ---------------------------------------------------------------------------
 # Layer 2: Evolution
 # ---------------------------------------------------------------------------
+
+
+class ExpressionResult(Base):
+    """Per-GEO-dataset expression evidence for traceability."""
+
+    __tablename__ = "expression_result"
+
+    id = Column(String, primary_key=True, default=_uuid)
+    gene_id = Column(String, ForeignKey("gene.id", ondelete="CASCADE"), nullable=False, index=True)
+    geo_accession = Column(String, nullable=False)
+    comparison = Column(String, nullable=True)  # e.g. species_id or condition
+    log2fc = Column(Float, nullable=True)
+    padj = Column(Float, nullable=True)
+    n_samples = Column(Integer, nullable=True)
 
 
 class EvolutionScore(Base):
@@ -230,6 +247,7 @@ class CandidateScore(Base):
     __tablename__ = "candidate_score"
 
     gene_id = Column(String, ForeignKey("gene.id", ondelete="CASCADE"), primary_key=True)
+    trait_id = Column(String, primary_key=True, default="", nullable=False)  # "" = default/legacy; e.g. "cancer_resistance"
     convergence_score = Column(Float, default=0.0)
     selection_score = Column(Float, default=0.0)
     disease_score = Column(Float, default=0.0)          # 0.0 in Phase 1
@@ -245,6 +263,28 @@ class CandidateScore(Base):
 
     def __repr__(self) -> str:
         return f"<CandidateScore gene={self.gene_id} composite={self.composite_score:.3f} {self.tier}>"
+
+
+# ---------------------------------------------------------------------------
+# Pipeline run history
+# ---------------------------------------------------------------------------
+
+
+class PipelineRun(Base):
+    __tablename__ = "pipeline_run"
+
+    id = Column(String, primary_key=True, default=_uuid)
+    started_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+    finished_at = Column(DateTime, nullable=True)
+    status = Column(String, nullable=False, default="running")  # running, completed, failed, stopped
+    species_ids = Column(ARRAY(String), default=list)
+    step_statuses = Column(JSON, default=dict)  # {step_name: {status, label, updated_at, elapsed_s?}}
+    phase = Column(String, nullable=True)
+    notes = Column(Text, nullable=True)
+    pid = Column(Integer, nullable=True)  # process id of the pipeline subprocess
+
+    def __repr__(self) -> str:
+        return f"<PipelineRun {self.id} status={self.status} pid={self.pid}>"
 
 
 # ---------------------------------------------------------------------------

@@ -1,11 +1,11 @@
 import { useEffect, useMemo, useState } from 'react'
-import { Link } from 'react-router-dom'
+import { Link, useSearchParams } from 'react-router-dom'
 import { motion } from 'framer-motion'
 import {
   useReactTable, getCoreRowModel, getSortedRowModel, getFilteredRowModel,
   flexRender,
 } from '@tanstack/react-table'
-import { ChevronUp, ChevronDown, ChevronsUpDown, Search, FlaskConical } from 'lucide-react'
+import { ChevronUp, ChevronDown, ChevronsUpDown, Search, FlaskConical, Download } from 'lucide-react'
 import { api } from '@/lib/api'
 import { TierBadge, ScoreBar, PageHeader, Spinner, EmptyState } from '@/components/ui'
 import { formatFloat, cn } from '@/lib/utils'
@@ -94,18 +94,30 @@ const COLUMNS = [
 const TIER_OPTIONS = ['All', 'Tier1', 'Tier2', 'Tier3']
 
 export default function CandidatesPage() {
+  const [searchParams] = useSearchParams()
+  const speciesIdFromUrl = searchParams.get('species') || undefined
   const [allData, setAllData] = useState([])
   const [loading, setLoading] = useState(true)
   const [tierFilter, setTierFilter] = useState('All')
   const [minScore, setMinScore] = useState(0)
   const [search, setSearch] = useState('')
+  const [pathwayFilter, setPathwayFilter] = useState('')
+  const [pathwayOptions, setPathwayOptions] = useState({ go_terms: [], pathway_ids: [] })
   const [sorting, setSorting] = useState([{ id: 'composite_score', desc: true }])
 
   useEffect(() => {
-    api.getCandidates({ limit: 1000 })
+    api.getPathways().then(d => setPathwayOptions(d || { go_terms: [], pathway_ids: [] })).catch(() => {})
+  }, [])
+
+  useEffect(() => {
+    setLoading(true)
+    const params = { limit: 1000 }
+    if (speciesIdFromUrl) params.species_id = speciesIdFromUrl
+    if (pathwayFilter) params.pathway = pathwayFilter
+    api.getCandidates(params)
       .then(d => { setAllData(d ?? []); setLoading(false) })
       .catch(() => setLoading(false))
-  }, [])
+  }, [speciesIdFromUrl, pathwayFilter])
 
   const filtered = useMemo(() => {
     return allData.filter(c => {
@@ -147,6 +159,21 @@ export default function CandidatesPage() {
           />
         </div>
 
+        {/* Pathway / biological process */}
+        <select
+          value={pathwayFilter}
+          onChange={e => setPathwayFilter(e.target.value)}
+          className="px-3 py-2 bg-surface border border-white/8 rounded-lg text-sm text-text-primary focus:outline-none focus:border-accent/50 min-w-[180px]"
+        >
+          <option value="">All pathways</option>
+          {pathwayOptions.go_terms?.slice(0, 50).map(go => (
+            <option key={go} value={go}>{go}</option>
+          ))}
+          {pathwayOptions.pathway_ids?.slice(0, 30).map(pid => (
+            <option key={pid} value={pid}>{pid}</option>
+          ))}
+        </select>
+
         {/* Tier filter */}
         <div className="flex rounded-lg border border-white/8 overflow-hidden">
           {TIER_OPTIONS.map(t => (
@@ -173,6 +200,15 @@ export default function CandidatesPage() {
           />
           <span className="font-mono text-xs text-accent w-8">{(minScore * 100).toFixed(0)}</span>
         </div>
+
+        {/* Export CSV */}
+        <a
+          href={api.getCandidatesExportUrl({ tier: tierFilter !== 'All' ? tierFilter : undefined })}
+          download="candidates.csv"
+          className="inline-flex items-center gap-1.5 px-3 py-2 rounded-lg border border-white/8 text-xs text-text-muted hover:text-accent hover:border-accent/30 transition-colors"
+        >
+          <Download className="w-3.5 h-3.5" /> Export CSV
+        </a>
       </div>
 
       {loading ? (

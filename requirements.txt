@@ -23,6 +23,9 @@ pyyaml==6.0.1
 requests==2.31.0
 aiohttp==3.9.1
 
+# LLM (research assistant narrative)
+anthropic>=0.18.0
+
 # Parsing
 lxml==4.9.3
 

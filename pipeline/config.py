@@ -56,6 +56,12 @@ def get_ncbi_email() -> str:
     return os.environ.get("NCBI_EMAIL", (cfg.get("ncbi") or {}).get("email", ""))
 
 
+def get_anthropic_api_key() -> str:
+    """API key for Anthropic Claude (research assistant narrative generation)."""
+    cfg = get_config()
+    return os.environ.get("ANTHROPIC_API_KEY", (cfg.get("anthropic") or {}).get("api_key", ""))
+
+
 def get_tool_config() -> dict[str, Any]:
     return get_config().get("tools", {})
 
@@ -86,6 +92,11 @@ def get_thresholds() -> dict[str, Any]:
         "tier1_composite_min": 0.70,
         "tier2_composite_min": 0.40,
     })
+
+
+def get_api_key() -> str:
+    """Expected X-API-Key header value. Empty string = auth disabled."""
+    return os.environ.get("API_KEY", (get_config().get("api") or {}).get("key", ""))
 
 
 def cfg_get(dotpath: str, default: Any = None) -> Any:

@@ -1,0 +1,16 @@
+[
+  {
+    "id": "cancer_resistance",
+    "label": "Cancer Resistance",
+    "description": "Genes convergently evolved in species with extremely low cancer rates",
+    "species_ids": ["naked_mole_rat", "blind_mole_rat", "bowhead_whale", "african_elephant", "greenland_shark"],
+    "scoring_weight_overrides": { "convergence": 0.45, "selection": 0.35, "expression": 0.20 }
+  },
+  {
+    "id": "longevity",
+    "label": "Longevity / Aging",
+    "description": "Genes associated with extended lifespan in long-lived species",
+    "species_ids": ["bowhead_whale", "greenland_shark", "naked_mole_rat", "axolotl"],
+    "scoring_weight_overrides": {}
+  }
+]

@@ -306,7 +306,7 @@ def run_alphagenome_track(
         # Candidate pool: expression-positive genes
         expression_candidates = (
             session.query(CandidateScore.gene_id)
-            .filter(CandidateScore.expression_score >= expression_score_min)
+            .filter(CandidateScore.trait_id == "", CandidateScore.expression_score >= expression_score_min)
             .all()
         )
         candidate_ids = {r[0] for r in expression_candidates}
@@ -359,7 +359,7 @@ def run_alphagenome_track(
 
             log2fc = None
             with get_session() as session:
-                cs = session.get(CandidateScore, gene.id)
+                cs = session.query(CandidateScore).filter_by(gene_id=gene.id, trait_id="").first()
                 if cs:
                     log2fc = cs.expression_score
 

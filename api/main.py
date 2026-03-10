@@ -17,13 +17,18 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from fastapi import FastAPI, Request
+from starlette.middleware.base import BaseHTTPMiddleware
+from starlette.requests import Request
+from starlette.responses import JSONResponse
+
+from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 
-from api.routes import candidates, scores, species
+from api.routes import candidates, research, scores, species
 from api.routes import pipeline as pipeline_routes
+from pipeline.config import get_api_key
 
 _REPO_ROOT = Path(__file__).resolve().parents[1]
 _STATIC_DIR = _REPO_ROOT / "api" / "static" / "dist"
@@ -40,6 +45,25 @@ app = FastAPI(
     redoc_url="/api/redoc",
 )
 
+# API key auth: when api.key is set in config, require X-API-Key header on all non-exempt paths
+_API_KEY_EXEMPT_PREFIXES = ("/api/health", "/api/docs", "/api/redoc", "/openapi.json", "/assets")
+
+
+class APIKeyMiddleware(BaseHTTPMiddleware):
+    async def dispatch(self, request: Request, call_next):
+        expected = get_api_key()
+        if not expected:
+            return await call_next(request)
+        path = request.url.path
+        if path == "/" or any(path.startswith(p) for p in _API_KEY_EXEMPT_PREFIXES):
+            return await call_next(request)
+        key = request.headers.get("X-API-Key", "")
+        if key != expected:
+            return JSONResponse(status_code=401, content={"detail": "Invalid or missing X-API-Key"})
+        return await call_next(request)
+
+
+app.add_middleware(APIKeyMiddleware)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],   # Restrict before external deployment
@@ -51,6 +75,7 @@ app.add_middleware(
 app.include_router(candidates.router, prefix="/candidates", tags=["candidates"])
 app.include_router(species.router, prefix="/species", tags=["species"])
 app.include_router(scores.router, prefix="/scores", tags=["scores"])
+app.include_router(research.router, prefix="/research", tags=["research"])
 app.include_router(pipeline_routes.router, prefix="/pipeline", tags=["pipeline"])
 
 

@@ -87,6 +87,19 @@ def _mark_step(state: dict, step_name: str, status: str, elapsed: float | None =
     state["current_step"] = step_name
     state["updated_at"] = _now_iso()
     _write_state(state)
+    run_id = state.get("run_id")
+    if run_id:
+        try:
+            from db.models import PipelineRun
+            from db.session import get_session
+            with get_session() as session:
+                run = session.get(PipelineRun, run_id)
+                if run:
+                    run.step_statuses = state.get("steps", {})
+                    run.status = "running"
+                    session.commit()
+        except Exception:
+            pass
 
 # Add repo root to sys.path so imports work from any working directory
 sys.path.insert(0, str(_REPO_ROOT))
@@ -260,7 +273,7 @@ def step4_alignment_and_divergence(
     motifs_by_og = filter_by_independent_lineages(
         motifs_by_og_raw,
         species_to_lineage,
-        min_lineages=2,
+        min_lineages=min_lineages,
     )
     for og_id, motifs in motifs_by_og.items():
         load_motifs_to_db(motifs, {})
@@ -390,15 +403,14 @@ def step10b_alphagenome(dry_run: bool = False) -> None:
         log.info("  Track B: %d regulatory divergence rows written.", n)
 
 
-def _get_tier12_gene_ids() -> list[str]:
+def _get_tier12_gene_ids(trait_id: str = "") -> list[str]:
     """Return gene IDs for Tier1 and Tier2 candidates (for funnel gating of Phase 2 layers)."""
-    from pipeline.scoring import get_top_candidates
     from db.models import CandidateScore
     from db.session import get_session
     with get_session() as session:
         rows = (
             session.query(CandidateScore.gene_id)
-            .filter(CandidateScore.tier.in_(["Tier1", "Tier2"]))
+            .filter(CandidateScore.trait_id == trait_id, CandidateScore.tier.in_(["Tier1", "Tier2"]))
             .all()
         )
     return [r[0] for r in rows]
@@ -413,12 +425,14 @@ def step11_disease_annotation(dry_run: bool = False) -> None:
     if not gene_ids:
         log.warning("  No Tier1/Tier2 candidates; skipping disease annotation.")
         return
-    from pipeline.layer3_disease import opentargets, gwas, gnomad, impc, protein_atlas
+    from pipeline.layer3_disease import opentargets, gwas, gnomad, impc, protein_atlas, pathways
     opentargets.annotate_genes_opentargets(gene_ids)
     gwas.annotate_genes_gwas(gene_ids)
     gnomad.annotate_genes_gnomad(gene_ids)
     impc.annotate_genes_impc(gene_ids)
     protein_atlas.annotate_genes_protein_atlas(gene_ids)
+    n_pathways = pathways.annotate_genes_pathways(gene_ids)
+    log.info("  Pathways/GO annotated for %d genes.", n_pathways)
 
 
 def step12_druggability(dry_run: bool = False) -> None:
@@ -448,7 +462,7 @@ def step13_gene_therapy(dry_run: bool = False) -> None:
     with get_session() as session:
         tier1 = (
             session.query(CandidateScore.gene_id)
-            .filter(CandidateScore.tier == "Tier1")
+            .filter(CandidateScore.trait_id == "", CandidateScore.tier == "Tier1")
             .all()
         )
     gene_ids = [r[0] for r in tier1]
@@ -584,7 +598,7 @@ def run_pipeline(
     if _tree_candidate.exists():
         treefile = _tree_candidate
 
-    # Initialise pipeline state file
+    # Initialise pipeline state file and PipelineRun row for API/DB tracking
     state = {
         "status": "running",
         "started_at": _now_iso(),
@@ -595,6 +609,33 @@ def run_pipeline(
             for s in step_order
         },
     }
+    import os
+    run_id = os.environ.get("PIPELINE_RUN_ID")
+    try:
+        from db.models import PipelineRun
+        from db.session import get_session
+        with get_session() as session:
+            if run_id:
+                run = session.get(PipelineRun, run_id)
+                if run:
+                    run.species_ids = [s.get("id") for s in species_list] if species_list else []
+                    run.step_statuses = state["steps"]
+                    run.status = "running"
+                    session.commit()
+            else:
+                run = PipelineRun(
+                    status="running",
+                    species_ids=[s.get("id") for s in species_list] if species_list else [],
+                    step_statuses=state["steps"],
+                    phase="phase1",
+                    pid=os.getpid(),
+                )
+                session.add(run)
+                session.commit()
+                run_id = run.id
+            state["run_id"] = run_id
+    except Exception:
+        pass
     _write_state(state)
 
     # Also add a file handler so the log streams to pipeline.log for SSE tailing
@@ -697,6 +738,20 @@ def run_pipeline(
         state["failed_at"] = _now_iso()
         state["error"] = str(exc)
         _write_state(state)
+        run_id = state.get("run_id")
+        if run_id:
+            try:
+                from db.models import PipelineRun
+                from db.session import get_session
+                with get_session() as session:
+                    run = session.get(PipelineRun, run_id)
+                    if run:
+                        run.status = "failed"
+                        run.finished_at = datetime.now(timezone.utc)
+                        run.step_statuses = state.get("steps", {})
+                        session.commit()
+            except Exception:
+                pass
         sys.exit(1)
 
     total = time.time() - start_time
@@ -708,6 +763,20 @@ def run_pipeline(
     state["completed_at"] = _now_iso()
     state["elapsed_total_s"] = round(total, 1)
     _write_state(state)
+    run_id = state.get("run_id")
+    if run_id:
+        try:
+            from db.models import PipelineRun
+            from db.session import get_session
+            with get_session() as session:
+                run = session.get(PipelineRun, run_id)
+                if run:
+                    run.status = "completed"
+                    run.finished_at = datetime.now(timezone.utc)
+                    run.step_statuses = state.get("steps", {})
+                    session.commit()
+        except Exception:
+            pass
 
 
 def main() -> None:

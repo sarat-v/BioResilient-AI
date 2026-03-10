@@ -5,6 +5,10 @@
 # Toggle: "local" or "cloud"
 deployment: local
 
+# Optional. If set, all requests (except /api/health, /api/docs, /api/redoc, /assets) require X-API-Key header.
+api:
+  key: ''
+
 database:
   local:  postgresql://localhost/bioresillient
   cloud:  postgresql://${RDS_HOST}/bioresillient
@@ -28,6 +32,10 @@ ncbi:
 alphagenome:
   api_key: YOUR_ALPHAGENOME_API_KEY_HERE
 
+# Anthropic Claude — research assistant narrative generation (optional)
+anthropic:
+  api_key: ''
+
 tools:
   orthofinder_threads: 8          # Search threads
   orthofinder_align_threads: 4    # Alignment threads (tune to available cores / 2)
@@ -36,15 +44,8 @@ tools:
   iqtree_bootstrap: 1000
   hyphy_threads: 4
 
-scoring_weights:
-  convergence:      0.25
-  selection:        0.20
-  disease:          0.20          # Phase 2 — zero-weighted in Phase 1
-  druggability:     0.15          # Phase 2 — zero-weighted in Phase 1
-  expression:       0.10
-  safety:           0.10          # Phase 2 — zero-weighted in Phase 1
+# Weights and tier thresholds: edit config/scoring_weights.json (not this file).
 
-# Phase 1 thresholds
 thresholds:
   divergence_identity_max: 0.85   # Keep motifs where seq identity < 85%
   divergence_min_species: 2       # Motif must appear in ≥ 2 protective species

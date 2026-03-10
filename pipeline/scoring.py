@@ -92,7 +92,7 @@ def selection_score(dnds_ratio: Optional[float], dnds_pvalue: Optional[float]) -
 
 def expression_score_from_db(gene_id: str, session) -> float:
     """Retrieve expression_score already stored in CandidateScore (from Step 8)."""
-    cs = session.get(CandidateScore, gene_id)
+    cs = session.query(CandidateScore).filter_by(gene_id=gene_id, trait_id="").first()
     if cs is None:
         return 0.0
     return cs.expression_score or 0.0
@@ -251,16 +251,18 @@ def human_genetics_score_from_disease(ann: Optional[DiseaseAnnotation]) -> float
 # ---------------------------------------------------------------------------
 
 
-def run_scoring(phase: str = "phase1") -> None:
+def run_scoring(phase: str = "phase1", trait_id: Optional[str] = None) -> None:
     """Compute and persist CandidateScore for all genes with Layer 1/2 data.
 
     Args:
         phase: "phase1" or "phase2" — determines which weights to apply.
+        trait_id: Optional trait identifier (e.g. "cancer_resistance"). Use "" for default/legacy.
     """
     weights = get_scoring_weights(phase)
     tier_thresholds = get_tier_thresholds()
+    tid = trait_id if trait_id is not None else ""
 
-    log.info("Assembling composite scores (phase=%s, weights=%s)", phase, weights)
+    log.info("Assembling composite scores (phase=%s, trait_id=%r, weights=%s)", phase, tid, weights)
 
     with get_session() as session:
         genes = session.query(Gene).all()
@@ -300,9 +302,9 @@ def run_scoring(phase: str = "phase1") -> None:
             hg_score = human_genetics_score_from_disease(ann)
             tier = assign_tier(comp, tier_thresholds, human_genetics_score=hg_score)
 
-            cs = session.get(CandidateScore, gene.id)
+            cs = session.query(CandidateScore).filter_by(gene_id=gene.id, trait_id=tid).first()
             if cs is None:
-                cs = CandidateScore(gene_id=gene.id)
+                cs = CandidateScore(gene_id=gene.id, trait_id=tid)
                 session.add(cs)
 
             cs.convergence_score = conv_score
@@ -319,16 +321,17 @@ def run_scoring(phase: str = "phase1") -> None:
     # Summary
     with get_session() as session:
         for tier_name in ["Tier1", "Tier2", "Tier3"]:
-            count = session.query(CandidateScore).filter_by(tier=tier_name).count()
+            count = session.query(CandidateScore).filter_by(tier=tier_name, trait_id=tid).count()
             log.info("  %s: %d genes", tier_name, count)
 
     log.info("Scoring complete.")
 
 
-def get_top_candidates(n: int = 20, tier: Optional[str] = None) -> list[dict]:
+def get_top_candidates(n: int = 20, tier: Optional[str] = None, trait_id: Optional[str] = None) -> list[dict]:
     """Return top N candidates sorted by composite_score descending."""
+    tid = trait_id if trait_id is not None else ""
     with get_session() as session:
-        q = session.query(CandidateScore, Gene).join(Gene, CandidateScore.gene_id == Gene.id)
+        q = session.query(CandidateScore, Gene).join(Gene, CandidateScore.gene_id == Gene.id).filter(CandidateScore.trait_id == tid)
         if tier:
             q = q.filter(CandidateScore.tier == tier)
         q = q.order_by(CandidateScore.composite_score.desc()).limit(n)
