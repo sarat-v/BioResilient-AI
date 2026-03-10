@@ -67,27 +67,53 @@ def convergence_score(convergence_count: int, max_lineages: int = 8, phylo_weigh
     return round(1.0 / (1.0 + math.exp(-1.5 * (convergence_count - 2))), 4)
 
 
-def selection_score(dnds_ratio: Optional[float], dnds_pvalue: Optional[float]) -> float:
-    """Score in [0, 1] combining dN/dS ratio and statistical significance.
+def selection_score(
+    dnds_ratio: Optional[float],
+    dnds_pvalue: Optional[float],
+    fel_sites: Optional[int] = None,
+    busted_pvalue: Optional[float] = None,
+) -> float:
+    """Score in [0, 1] combining MEME dN/dS, FEL pervasive sites, and BUSTED gene-level test.
 
-    High score = strong positive selection (dN/dS >> 1) with low p-value.
-    Genes under strong purifying selection (dN/dS << 1) score near 0.
+    Combined formula:
+        selection_score = 0.5 × meme_score + 0.3 × fel_score + 0.2 × busted_score
+
+    When FEL/BUSTED are unavailable (legacy data or codon alignment failed),
+    falls back to MEME-only score (original behaviour preserved).
+
+    High score = strong positive selection signal across multiple independent tests.
     """
+    # --- MEME component (dN/dS + p-value) ---
     if dnds_ratio is None or dnds_pvalue is None:
-        return 0.0
-
-    # Normalise dN/dS: cap at 5, score = min(dnds/5, 1.0)
-    dnds_norm = min(dnds_ratio / 5.0, 1.0)
-
-    # p-value weight: -log10(p) normalised to [0, 1], capped at -log10(1e-10)
-    if dnds_pvalue <= 0:
-        pval_weight = 1.0
-    elif dnds_pvalue >= 1:
-        pval_weight = 0.0
+        meme_score = 0.0
     else:
-        pval_weight = min(-math.log10(dnds_pvalue) / 10.0, 1.0)
+        dnds_norm = min(dnds_ratio / 5.0, 1.0)
+        if dnds_pvalue <= 0:
+            pval_weight = 1.0
+        elif dnds_pvalue >= 1:
+            pval_weight = 0.0
+        else:
+            pval_weight = min(-math.log10(dnds_pvalue) / 10.0, 1.0)
+        meme_score = round(0.5 * dnds_norm + 0.5 * pval_weight, 4)
 
-    return round(0.5 * dnds_norm + 0.5 * pval_weight, 4)
+    # If no supplementary tests available, return MEME score alone
+    if fel_sites is None and busted_pvalue is None:
+        return meme_score
+
+    # --- FEL component (pervasive selection site count) ---
+    # Normalise: 10+ FEL sites = score of 1.0
+    if fel_sites is not None and fel_sites > 0:
+        fel_score = round(min(fel_sites / 10.0, 1.0), 4)
+    else:
+        fel_score = 0.0
+
+    # --- BUSTED component (gene-wide p-value) ---
+    if busted_pvalue is not None and 0 < busted_pvalue <= 1:
+        busted_score = round(min(-math.log10(busted_pvalue) / 10.0, 1.0), 4)
+    else:
+        busted_score = 0.0
+
+    return round(0.5 * meme_score + 0.3 * fel_score + 0.2 * busted_score, 4)
 
 
 def expression_score_from_db(gene_id: str, session) -> float:
@@ -202,8 +228,10 @@ def assign_tier(score: float, thresholds: dict[str, float], human_genetics_score
 
     'Validated' is a special designation for genes that have BOTH strong
     evolutionary signal (Tier1/Tier2) AND human genetic evidence (GWAS,
-    OpenTargets genetic association). This is the highest confidence category
-    for clinical translation.
+    OpenTargets genetic association, or a rare protective variant matching
+    the animal divergence direction in gnomAD).
+
+    This is the highest confidence category for clinical translation.
     """
     if score >= thresholds.get("tier1", 0.70):
         tier = "Tier1"
@@ -226,6 +254,10 @@ def human_genetics_score_from_disease(ann: Optional[DiseaseAnnotation]) -> float
     - gnomAD pLI (gnomad_pli): high pLI means loss of function is intolerant —
       strong signal the gene is functionally critical in humans
     - OpenTargets genetic_evidence (subset of opentargets_score): causal genetic link
+    - Rare protective variant matching animal divergence direction (U6):
+      the PCSK9 paradigm — a naturally occurring human variant pointing the same
+      biochemical direction as the animal adaptation. Immediate 'Validated' upgrade
+      if pvalue < 5e-8.
 
     Returns 0 if no human genetic support; >0.3 qualifies for 'Validated' tier.
     """
@@ -243,6 +275,17 @@ def human_genetics_score_from_disease(ann: Optional[DiseaseAnnotation]) -> float
     # OpenTargets: genetic association evidence
     if ann.opentargets_score is not None and ann.opentargets_score > 0.3:
         score += min(ann.opentargets_score, 1.0) * 0.3
+    # U6: Rare protective variant — PCSK9 paradigm
+    # A genome-wide significant protective variant in the same region as the animal
+    # divergence is the strongest possible human validation signal.
+    prot_pvalue = getattr(ann, "protective_variant_pvalue", None)
+    prot_count = getattr(ann, "protective_variant_count", None)
+    if prot_pvalue is not None and prot_pvalue < 5e-8 and prot_count and prot_count >= 1:
+        score += 0.5  # Immediate Validated qualification
+    elif prot_pvalue is not None and prot_pvalue < 1e-5 and prot_count and prot_count >= 1:
+        score += 0.2
+    elif prot_count and prot_count >= 1:
+        score += 0.1  # Rare variant present, no GWAS signal yet — still informative
     return round(min(score, 1.0), 4)
 
 
@@ -281,6 +324,8 @@ def run_scoring(phase: str = "phase1", trait_id: Optional[str] = None) -> None:
             sel_score = selection_score(
                 ev.dnds_ratio if ev else None,
                 ev.dnds_pvalue if ev else None,
+                fel_sites=ev.fel_sites if ev else None,
+                busted_pvalue=ev.busted_pvalue if ev else None,
             )
             expr_score = expression_score_from_db(gene.id, session)
             dis_score = disease_score(ann) if weights.get("disease", 0) > 0 else 0.0

@@ -4,7 +4,7 @@ from fastapi import APIRouter, HTTPException, Query
 from pydantic import BaseModel
 from typing import Optional
 
-from db.models import CandidateScore, EvolutionScore, ExpressionResult, Gene
+from db.models import CandidateScore, DiseaseAnnotation, EvolutionScore, ExpressionResult, Gene
 from db.session import get_session
 
 router = APIRouter()
@@ -26,6 +26,13 @@ class ScoreBreakdown(BaseModel):
     sub_scores: dict[str, float]
     evolution: dict
     expression_evidence: list[ExpressionEvidenceOut] = []
+    # U4: FEL + BUSTED supplementary selection
+    fel_sites: Optional[int] = None
+    busted_pvalue: Optional[float] = None
+    # U6: Rare protective variants
+    protective_variant_count: Optional[int] = None
+    best_protective_trait: Optional[str] = None
+    protective_variant_pvalue: Optional[float] = None
 
 
 @router.get("/{gene_id}", response_model=ScoreBreakdown)
@@ -51,7 +58,11 @@ def get_scores(gene_id: str, trait_id: Optional[str] = Query(None, description="
                 "branches_under_selection": ev.branches_under_selection or [],
                 "convergence_count": ev.convergence_count,
                 "phylop_score": ev.phylop_score,
+                "fel_sites": getattr(ev, "fel_sites", None),
+                "busted_pvalue": getattr(ev, "busted_pvalue", None),
             }
+
+        da = session.get(DiseaseAnnotation, gene_id)
 
         expr_evidence = []
         for er in session.query(ExpressionResult).filter_by(gene_id=gene_id).limit(50).all():
@@ -79,4 +90,9 @@ def get_scores(gene_id: str, trait_id: Optional[str] = Query(None, description="
             },
             evolution=evolution_data,
             expression_evidence=expr_evidence,
+            fel_sites=getattr(ev, "fel_sites", None) if ev else None,
+            busted_pvalue=getattr(ev, "busted_pvalue", None) if ev else None,
+            protective_variant_count=getattr(da, "protective_variant_count", None) if da else None,
+            best_protective_trait=getattr(da, "best_protective_trait", None) if da else None,
+            protective_variant_pvalue=getattr(da, "protective_variant_pvalue", None) if da else None,
         )

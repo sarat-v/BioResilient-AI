@@ -37,6 +37,9 @@ class MotifOut(BaseModel):
     human_seq: str
     divergence_score: Optional[float]
     esm_distance: Optional[float]
+    domain_name: Optional[str] = None
+    in_functional_domain: bool = False
+    consequence_score: Optional[float] = None
 
 
 class OrthologOut(BaseModel):
@@ -55,6 +58,8 @@ class EvolutionOut(BaseModel):
     branches_under_selection: Optional[list[str]]
     convergence_count: Optional[int]
     phylop_score: Optional[float]
+    fel_sites: Optional[int] = None
+    busted_pvalue: Optional[float] = None
 
 
 class DiseaseOut(BaseModel):
@@ -64,6 +69,9 @@ class DiseaseOut(BaseModel):
     gwas_pvalue: Optional[float]
     gnomad_pli: Optional[float]
     mouse_ko_phenotype: Optional[str]
+    protective_variant_count: Optional[int] = None
+    best_protective_trait: Optional[str] = None
+    protective_variant_pvalue: Optional[float] = None
 
 
 class DrugTargetOut(BaseModel):
@@ -115,6 +123,7 @@ def list_candidates(
     species_id: Optional[str] = Query(None, description="Filter by species (genes with ortholog in this species)"),
     trait_id: Optional[str] = Query(None, description="Trait preset id (e.g. cancer_resistance). Omit for default."),
     pathway: Optional[str] = Query(None, description="Filter by GO term or pathway ID (gene must have this in go_terms or pathway_ids)"),
+    in_functional_domain: Optional[bool] = Query(None, description="If true, only return genes with at least one motif in a Pfam/InterPro domain"),
     limit: int = Query(100, ge=1, le=1000),
     offset: int = Query(0, ge=0),
     min_score: Optional[float] = Query(None, description="Minimum composite score"),
@@ -139,6 +148,16 @@ def list_candidates(
                 or_(
                     Gene.go_terms.contains([pathway]),
                     Gene.pathway_ids.contains([pathway]),
+                )
+            )
+        if in_functional_domain is True:
+            # Only genes with at least one motif in a Pfam/InterPro domain
+            q = q.filter(
+                Gene.id.in_(
+                    session.query(Ortholog.gene_id)
+                    .join(DivergentMotif, DivergentMotif.ortholog_id == Ortholog.id)
+                    .filter(DivergentMotif.in_functional_domain.is_(True))
+                    .distinct()
                 )
             )
         if tier:
@@ -250,6 +269,8 @@ def get_candidate(gene_id: str, trait_id: Optional[str] = Query(None, descriptio
                 branches_under_selection=ev.branches_under_selection,
                 convergence_count=ev.convergence_count,
                 phylop_score=ev.phylop_score,
+                fel_sites=getattr(ev, "fel_sites", None),
+                busted_pvalue=getattr(ev, "busted_pvalue", None),
             )
 
         orthologs_out = []
@@ -263,6 +284,9 @@ def get_candidate(gene_id: str, trait_id: Optional[str] = Query(None, descriptio
                     human_seq=m.human_seq,
                     divergence_score=m.divergence_score,
                     esm_distance=m.esm_distance,
+                    domain_name=getattr(m, "domain_name", None),
+                    in_functional_domain=getattr(m, "in_functional_domain", False) or False,
+                    consequence_score=getattr(m, "consequence_score", None),
                 )
                 for m in orth.motifs
             ]
@@ -285,6 +309,9 @@ def get_candidate(gene_id: str, trait_id: Optional[str] = Query(None, descriptio
                 gwas_pvalue=da.gwas_pvalue,
                 gnomad_pli=da.gnomad_pli,
                 mouse_ko_phenotype=da.mouse_ko_phenotype,
+                protective_variant_count=getattr(da, "protective_variant_count", None),
+                best_protective_trait=getattr(da, "best_protective_trait", None),
+                protective_variant_pvalue=getattr(da, "protective_variant_pvalue", None),
             )
 
         dt = session.get(DrugTarget, gene_id)

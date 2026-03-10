@@ -242,6 +242,14 @@ export default function GeneDetail() {
               <KV label="Selection model" value={ev.selection_model} />
               <KV label="Branches selected"
                 value={ev.branches_under_selection?.length ? ev.branches_under_selection.join(', ') : '—'} />
+              {scores?.fel_sites != null && (
+                <KV label="FEL sites (pervasive)" value={scores.fel_sites} mono
+                  tooltip="Sites under pervasive positive selection (FEL p<0.05). Complements MEME episodic detection." />
+              )}
+              {scores?.busted_pvalue != null && (
+                <KV label="BUSTED p-value" value={scores.busted_pvalue.toExponential(2)} mono
+                  tooltip="Gene-wide episodic selection test p-value (BUSTED). <0.05 = gene has experienced positive selection." />
+              )}
             </div>
           </Section>
 
@@ -292,9 +300,30 @@ export default function GeneDetail() {
                   {gene.orthologs.flatMap(o =>
                     (o.motifs ?? []).map(m => (
                       <div key={m.id} className="bg-base rounded-lg px-4 py-3 space-y-2 border border-white/5">
-                        <div className="flex items-center gap-3">
+                        <div className="flex items-center gap-3 flex-wrap">
                           <span className="text-xs text-text-muted">Position {m.start_pos}–{m.end_pos}</span>
                           <span className="text-xs text-text-muted capitalize">{o.species_id?.replace(/_/g, ' ')}</span>
+                          {m.in_functional_domain && (
+                            <span className="px-1.5 py-0.5 rounded text-[10px] font-medium bg-emerald-500/15 text-emerald-400 border border-emerald-500/25"
+                              title={`Pfam/InterPro domain: ${m.domain_name || 'domain'}`}>
+                              {m.domain_name ? m.domain_name.slice(0, 20) : 'Functional domain'}
+                            </span>
+                          )}
+                          {m.consequence_score != null && (
+                            <span
+                              className={cn(
+                                'px-1.5 py-0.5 rounded text-[10px] font-mono font-medium border',
+                                m.consequence_score >= 0.7
+                                  ? 'bg-red-500/15 text-red-400 border-red-500/25'
+                                  : m.consequence_score >= 0.4
+                                  ? 'bg-amber-500/15 text-amber-400 border-amber-500/25'
+                                  : 'bg-white/5 text-text-muted border-white/10',
+                              )}
+                              title="AlphaMissense pathogenicity score for this divergence position"
+                            >
+                              AM {m.consequence_score.toFixed(2)}
+                            </span>
+                          )}
                           {m.divergence_score != null && (
                             <span className="text-xs font-mono text-accent ml-auto">
                               Δ {(m.divergence_score * 100).toFixed(1)}%
@@ -325,6 +354,18 @@ export default function GeneDetail() {
                 <KV label="gnomAD pLI" value={formatFloat(gene.disease.gnomad_pli)} mono
                   tooltip="Loss-of-function intolerance score. >0.9 = essential gene." />
                 <KV label="Mouse KO phenotype" value={gene.disease.mouse_ko_phenotype} />
+                {gene.disease.protective_variant_count != null && gene.disease.protective_variant_count > 0 && (
+                  <>
+                    <KV label="Protective variants" value={gene.disease.protective_variant_count} mono
+                      tooltip="Rare human variants (MAF<1%) at positions matching animal divergence direction — the PCSK9 paradigm." />
+                    <KV label="Best protective trait" value={gene.disease.best_protective_trait} />
+                    {gene.disease.protective_variant_pvalue != null && (
+                      <KV label="Protective GWAS p-value"
+                        value={gene.disease.protective_variant_pvalue.toExponential(2)} mono
+                        tooltip="GWAS p-value for the most significant protective phenotype association." />
+                    )}
+                  </>
+                )}
               </div>
             </Section>
           )}

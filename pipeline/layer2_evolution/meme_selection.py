@@ -313,6 +313,233 @@ def _meme_null_result(og_id: str) -> dict:
 
 
 # ---------------------------------------------------------------------------
+# FEL — Fixed Effects Likelihood (pervasive selection)
+# ---------------------------------------------------------------------------
+
+def run_fel(
+    codon_aln: dict[str, str],
+    tree_newick: str,
+    og_id: str,
+) -> Optional[dict]:
+    """Run HyPhy FEL on a codon alignment.
+
+    FEL (Fixed Effects Likelihood) detects sites under *pervasive* (constant)
+    positive or purifying selection — complementary to MEME's episodic detection.
+
+    Returns the parsed FEL JSON output, or None on failure.
+    """
+    tools = get_tool_config()
+    hyphy_bin = tools.get("hyphy_bin", "hyphy")
+
+    root = Path(get_storage_root())
+    fel_dir = root / "fel" / og_id
+    fel_dir.mkdir(parents=True, exist_ok=True)
+
+    aln_path = fel_dir / "codon_aln.fna"
+    tree_path = fel_dir / "species.treefile"
+    out_path = fel_dir / "fel.json"
+
+    with open(aln_path, "w") as f:
+        for label, seq in codon_aln.items():
+            f.write(f">{label}\n{seq}\n")
+    tree_path.write_text(tree_newick)
+
+    try:
+        cmd = [
+            hyphy_bin, "fel",
+            "--alignment", str(aln_path),
+            "--tree", str(tree_path),
+            "--output", str(out_path),
+        ]
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
+        if result.returncode != 0:
+            log.debug("FEL failed for %s: %s", og_id, result.stderr[:300])
+            return None
+        if not out_path.exists():
+            return None
+        return json.loads(out_path.read_text())
+    except subprocess.TimeoutExpired:
+        log.debug("FEL timed out for %s", og_id)
+        return None
+    except Exception as exc:
+        log.debug("FEL error for %s: %s", og_id, exc)
+        return None
+
+
+def parse_fel_results(fel_json: dict) -> dict:
+    """Count sites under pervasive positive selection from HyPhy FEL output.
+
+    Returns {"fel_sites": int} — count of sites with dN > dS at p < 0.05.
+    """
+    try:
+        mle_content = fel_json.get("MLE", {}).get("content", {}).get("0", [])
+        if not mle_content:
+            return {"fel_sites": 0}
+
+        pos_sites = 0
+        for site_data in mle_content:
+            # FEL MLE columns: [alpha (dS), beta (dN), LRT, p-value, ...]
+            if len(site_data) < 4:
+                continue
+            alpha = site_data[0]  # synonymous rate
+            beta = site_data[1]   # non-synonymous rate
+            pvalue = site_data[3]
+            if pvalue is not None and pvalue < 0.05 and beta is not None and alpha is not None:
+                if beta > alpha:  # dN > dS = positive selection
+                    pos_sites += 1
+
+        return {"fel_sites": pos_sites}
+
+    except Exception as exc:
+        log.debug("FEL parse error: %s", exc)
+        return {"fel_sites": 0}
+
+
+# ---------------------------------------------------------------------------
+# BUSTED — Branch-Site Unrestricted Test for Episodic Diversification
+# ---------------------------------------------------------------------------
+
+def run_busted(
+    codon_aln: dict[str, str],
+    tree_newick: str,
+    og_id: str,
+) -> Optional[dict]:
+    """Run HyPhy BUSTED on a codon alignment.
+
+    BUSTED tests whether the gene *as a whole* has experienced episodic positive
+    selection anywhere in the tree, providing a single gene-level p-value.
+    Complementary to MEME (which is site-level).
+
+    Returns the parsed BUSTED JSON output, or None on failure.
+    """
+    tools = get_tool_config()
+    hyphy_bin = tools.get("hyphy_bin", "hyphy")
+
+    root = Path(get_storage_root())
+    busted_dir = root / "busted" / og_id
+    busted_dir.mkdir(parents=True, exist_ok=True)
+
+    aln_path = busted_dir / "codon_aln.fna"
+    tree_path = busted_dir / "species.treefile"
+    out_path = busted_dir / "busted.json"
+
+    with open(aln_path, "w") as f:
+        for label, seq in codon_aln.items():
+            f.write(f">{label}\n{seq}\n")
+    tree_path.write_text(tree_newick)
+
+    try:
+        cmd = [
+            hyphy_bin, "busted",
+            "--alignment", str(aln_path),
+            "--tree", str(tree_path),
+            "--output", str(out_path),
+        ]
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
+        if result.returncode != 0:
+            log.debug("BUSTED failed for %s: %s", og_id, result.stderr[:300])
+            return None
+        if not out_path.exists():
+            return None
+        return json.loads(out_path.read_text())
+    except subprocess.TimeoutExpired:
+        log.debug("BUSTED timed out for %s", og_id)
+        return None
+    except Exception as exc:
+        log.debug("BUSTED error for %s: %s", og_id, exc)
+        return None
+
+
+def parse_busted_results(busted_json: dict) -> dict:
+    """Extract gene-level p-value from HyPhy BUSTED output.
+
+    Returns {"busted_pvalue": float} — p-value for gene-wide episodic selection.
+    """
+    try:
+        # BUSTED stores test p-value at json["test results"]["p-value"]
+        pvalue = (
+            busted_json
+            .get("test results", {})
+            .get("p-value")
+        )
+        if pvalue is None:
+            return {"busted_pvalue": 1.0}
+        return {"busted_pvalue": round(float(pvalue), 6)}
+    except Exception as exc:
+        log.debug("BUSTED parse error: %s", exc)
+        return {"busted_pvalue": 1.0}
+
+
+# ---------------------------------------------------------------------------
+# FEL + BUSTED pipeline entry point
+# ---------------------------------------------------------------------------
+
+def run_fel_busted_pipeline(
+    aligned_orthogroups: dict[str, dict[str, str]],
+    motifs_by_og: dict[str, list],
+    species_treefile: Path,
+) -> dict[str, dict]:
+    """Run FEL and BUSTED for all candidate orthogroups that have codon alignments.
+
+    Reads existing codon alignments from disk (written by run_meme_pipeline).
+    Falls back gracefully if codon alignment files are missing.
+
+    Returns {og_id: {"fel_sites": int, "busted_pvalue": float}}.
+    """
+    from pipeline.layer2_evolution.phylo_tree import prune_tree_to_species
+    from pipeline.layer2_evolution.selection import _should_run_hyphy
+
+    all_results: dict[str, dict] = {}
+    candidates = [og for og in aligned_orthogroups if _should_run_hyphy(og, motifs_by_og)]
+    log.info("Running FEL + BUSTED on %d candidate orthogroups...", len(candidates))
+
+    root = Path(get_storage_root())
+    success = 0
+
+    for og_id in candidates:
+        aligned_seqs = aligned_orthogroups[og_id]
+        species_ids = [label.split("|")[0] for label in aligned_seqs]
+        pruned_tree = prune_tree_to_species(species_treefile, species_ids)
+
+        # Reuse codon alignment from MEME step if it exists
+        codon_aln_path = root / "meme" / og_id / "codon_aln.fna"
+        codon_aln: Optional[dict[str, str]] = None
+        if codon_aln_path.exists():
+            try:
+                from Bio import SeqIO
+                codon_aln = {r.id: str(r.seq) for r in SeqIO.parse(str(codon_aln_path), "fasta")}
+            except Exception:
+                codon_aln = None
+
+        if codon_aln is None:
+            # No codon alignment available — try to build it
+            cds_seqs: dict[str, str] = {}
+            for label in aligned_seqs:
+                parts = label.split("|")
+                accession = parts[-1] if parts else label
+                cds = fetch_cds_for_protein(accession)
+                if cds:
+                    cds_seqs[label] = cds
+            if len(cds_seqs) == len(aligned_seqs):
+                codon_aln = protein_to_codon_alignment(aligned_seqs, cds_seqs)
+
+        if codon_aln is None:
+            continue
+
+        fel_json = run_fel(codon_aln, pruned_tree, og_id)
+        busted_json = run_busted(codon_aln, pruned_tree, og_id)
+
+        fel_result = parse_fel_results(fel_json) if fel_json else {"fel_sites": 0}
+        busted_result = parse_busted_results(busted_json) if busted_json else {"busted_pvalue": 1.0}
+
+        all_results[og_id] = {**fel_result, **busted_result}
+        success += 1
+
+    log.info("FEL + BUSTED complete: %d / %d orthogroups processed.", success, len(candidates))
+    return all_results
+
+
+# ---------------------------------------------------------------------------
 # Pipeline entry point
 # ---------------------------------------------------------------------------
 

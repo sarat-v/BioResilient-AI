@@ -193,8 +193,13 @@ def filter_orthogroups_by_global_identity(
     return filtered
 
 
-def load_orthogroup_sequences_from_db() -> dict[str, dict[str, str]]:
+def load_orthogroup_sequences_from_db(one_to_one_only: bool = True) -> dict[str, dict[str, str]]:
     """Load orthogroup sequences from the database.
+
+    Args:
+        one_to_one_only: When True (default), only load orthogroups flagged as 1:1
+            (no paralogs). This prevents false convergence signals from paralog
+            confusion. Set False only for exploratory analysis.
 
     Returns {og_id: {"{species_id}|{protein_id}": sequence}}.
     Only includes orthogroups with at least one human + one non-human protein.
@@ -202,7 +207,10 @@ def load_orthogroup_sequences_from_db() -> dict[str, dict[str, str]]:
     orthogroups: dict[str, dict[str, str]] = {}
 
     with get_session() as session:
-        orthologs = session.query(Ortholog).filter(Ortholog.protein_seq.isnot(None)).all()
+        q = session.query(Ortholog).filter(Ortholog.protein_seq.isnot(None))
+        if one_to_one_only:
+            q = q.filter(Ortholog.is_one_to_one.is_(True))
+        orthologs = q.all()
         for o in orthologs:
             og = o.orthofinder_og
             if og not in orthogroups:
@@ -217,5 +225,8 @@ def load_orthogroup_sequences_from_db() -> dict[str, dict[str, str]]:
         if any("human" in k for k in seqs)
         and sum(1 for k in seqs if "human" not in k) >= 1
     }
-    log.info("  %d orthogroups loaded with human + ≥1 other species.", len(filtered))
+    if one_to_one_only:
+        log.info("  %d 1:1 orthogroups loaded (paralogs excluded).", len(filtered))
+    else:
+        log.info("  %d orthogroups loaded with human + ≥1 other species.", len(filtered))
     return filtered

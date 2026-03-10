@@ -214,6 +214,40 @@ def load_selection_scores(
     return saved
 
 
+def load_fel_busted_scores(
+    fel_busted_results: dict[str, dict],
+    gene_by_og: dict[str, str],
+) -> int:
+    """Update EvolutionScore rows with FEL and BUSTED supplementary results.
+
+    Args:
+        fel_busted_results: {og_id: {"fel_sites": int, "busted_pvalue": float}}
+        gene_by_og: {og_id: gene_id}
+
+    Returns:
+        Number of rows updated.
+    """
+    updated = 0
+    with get_session() as session:
+        for og_id, result in fel_busted_results.items():
+            gene_id = gene_by_og.get(og_id)
+            if not gene_id:
+                continue
+
+            ev = session.get(EvolutionScore, gene_id)
+            if ev is None:
+                # Create a bare row if MEME somehow didn't run yet
+                ev = EvolutionScore(gene_id=gene_id)
+                session.add(ev)
+
+            ev.fel_sites = result.get("fel_sites")
+            ev.busted_pvalue = result.get("busted_pvalue")
+            updated += 1
+
+    log.info("Updated FEL/BUSTED scores for %d genes.", updated)
+    return updated
+
+
 def build_gene_og_map() -> dict[str, str]:
     """Build {og_id: gene_id} from the Ortholog table."""
     og_map: dict[str, str] = {}

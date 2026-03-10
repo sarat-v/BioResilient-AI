@@ -34,24 +34,28 @@ _STATE_FILE = _REPO_ROOT / "pipeline_state.json"
 _LOG_FILE = _REPO_ROOT / "pipeline.log"
 
 STEP_LABELS = {
-    "step1":  "Validate environment",
-    "step2":  "Download proteomes",
-    "step3":  "Run OrthoFinder",
-    "step3b": "Load orthologs into DB",
-    "step4":  "Align sequences & find divergent motifs",
-    "step5":  "Build phylogenetic tree",
-    "step6":  "Evolutionary selection (HyPhy)",
-    "step7":  "Convergence & conservation scoring",
-    "step8":  "Expression analysis (GEO/DESeq2)",
-    "step9":  "Compute composite scores",
-    "step10": "API ready",
-    "step10b":"Regulatory divergence (AlphaGenome)",
-    "step11": "Disease annotation",
-    "step12": "Druggability assessment",
-    "step13": "Gene therapy feasibility",
-    "step14": "Safety pre-screen",
-    "step15": "Final rescore",
-    "step16": "Pipeline complete",
+    "step1":   "Validate environment",
+    "step2":   "Download proteomes",
+    "step3":   "Run OrthoFinder",
+    "step3b":  "Load orthologs into DB",
+    "step4":   "Align sequences & find divergent motifs",
+    "step4b":  "Domain annotation (Pfam) + functional consequence (AlphaMissense)",
+    "step5":   "Build phylogenetic tree",
+    "step6":   "Evolutionary selection (HyPhy MEME)",
+    "step6b":  "FEL + BUSTED supplementary selection tests",
+    "step7":   "Convergence & conservation scoring",
+    "step8":   "Expression analysis (GEO/DESeq2)",
+    "step8b":  "Bgee cross-species expression supplement",
+    "step9":   "Compute composite scores",
+    "step10":  "API ready",
+    "step10b": "Regulatory divergence (AlphaGenome)",
+    "step11":  "Disease annotation",
+    "step11b": "Rare protective variant mapping (gnomAD)",
+    "step12":  "Druggability assessment",
+    "step13":  "Gene therapy feasibility",
+    "step14":  "Safety pre-screen",
+    "step15":  "Final rescore",
+    "step16":  "Pipeline complete",
 }
 
 
@@ -193,6 +197,7 @@ def step3b_load_orthologs(results_dir: Path, dry_run: bool = False) -> None:
 
     from pipeline.config import get_storage_root
     from pipeline.layer1_sequence.orthofinder import (
+        flag_one_to_one_orthogroups,
         load_orthologs_to_db,
         load_sequence_map,
         parse_orthogroups,
@@ -207,6 +212,8 @@ def step3b_load_orthologs(results_dir: Path, dry_run: bool = False) -> None:
 
     inserted = load_orthologs_to_db(long_df, seq_map, human_gene_map)
     log.info("  Loaded %d ortholog rows.", inserted)
+    flagged = flag_one_to_one_orthogroups()
+    log.info("  1:1 filter: %d many-to-many orthogroups excluded from downstream analysis.", flagged)
 
 
 def _build_human_gene_map(human_sequences: dict[str, str]) -> dict[str, tuple[str, str]]:
@@ -291,6 +298,22 @@ def step4_alignment_and_divergence(
     return aligned, motifs_by_og
 
 
+def step4b_domain_and_consequence(dry_run: bool = False) -> None:
+    """Annotate divergent motifs with Pfam domain context and AlphaMissense functional scores."""
+    log.info("Step 4b: Domain annotation (Pfam/InterPro) + functional consequence (AlphaMissense)...")
+    if dry_run:
+        return
+
+    from pipeline.layer1_sequence.pfam import run_pfam_pipeline
+    from pipeline.layer1_sequence.alphamissense import run_alphamissense_pipeline
+
+    n_domains = run_pfam_pipeline()
+    log.info("  Pfam: %d motifs in functional domains.", n_domains)
+
+    n_scored = run_alphamissense_pipeline()
+    log.info("  AlphaMissense: %d motifs received consequence scores.", n_scored)
+
+
 def step5_phylogenetic_tree(
     aligned_orthogroups: dict,
     dry_run: bool = False,
@@ -335,8 +358,44 @@ def step6_evolutionary_selection(
     load_selection_scores(selection_results, gene_by_og)
 
 
+def step6b_fel_busted(dry_run: bool = False) -> None:
+    """Run FEL (pervasive selection) and BUSTED (gene-level episodic) supplementary tests.
+
+    Reuses codon alignments from step6. Skips gracefully if alignments are missing.
+    Updates EvolutionScore.fel_sites and EvolutionScore.busted_pvalue.
+    """
+    log.info("Step 6b: FEL + BUSTED supplementary selection tests...")
+    if dry_run:
+        return
+
+    from pipeline.config import get_storage_root
+    from pipeline.layer2_evolution.meme_selection import run_fel_busted_pipeline
+    from pipeline.layer2_evolution.selection import build_gene_og_map, load_fel_busted_scores
+
+    import pickle
+    _cache_path = Path(get_storage_root()) / "aligned_orthogroups.pkl"
+    if not _cache_path.exists():
+        log.warning("  Aligned orthogroups cache not found; skipping step 6b.")
+        return
+
+    with open(_cache_path, "rb") as _f:
+        cached = pickle.load(_f)
+
+    aligned = cached.get("aligned", {})
+    motifs_by_og = cached.get("motifs_by_og", {})
+
+    treefile = Path(get_storage_root()) / "phylo" / "species.treefile"
+    if not treefile.exists():
+        log.warning("  Species treefile not found; skipping step 6b.")
+        return
+
+    results = run_fel_busted_pipeline(aligned, motifs_by_og, treefile)
+    gene_by_og = build_gene_og_map()
+    updated = load_fel_busted_scores(results, gene_by_og)
+    log.info("  FEL/BUSTED: updated %d genes.", updated)
+
+
 def step7_convergence(dry_run: bool = False) -> None:
-    """Compute convergence scores and enrich PhyloP from UCSC."""
     log.info("Step 7: Computing convergence detection + PhyloP enrichment...")
     if dry_run:
         return
@@ -362,6 +421,17 @@ def step8_expression(species_list: list[dict], dry_run: bool = False) -> None:
     from pipeline.layer1_sequence.expression import run_expression_pipeline, save_expression_scores
     scores_by_species = run_expression_pipeline(species_list)
     save_expression_scores(scores_by_species)
+
+
+def step8b_bgee(dry_run: bool = False) -> None:
+    """Supplement expression data with Bgee curated cross-species calls."""
+    log.info("Step 8b: Bgee cross-species expression supplement...")
+    if dry_run:
+        return
+
+    from pipeline.layer1_sequence.bgee import run_bgee_pipeline
+    n = run_bgee_pipeline()
+    log.info("  Bgee: %d expression rows added.", n)
 
 
 def step9_composite_score(dry_run: bool = False) -> None:
@@ -433,6 +503,20 @@ def step11_disease_annotation(dry_run: bool = False) -> None:
     protein_atlas.annotate_genes_protein_atlas(gene_ids)
     n_pathways = pathways.annotate_genes_pathways(gene_ids)
     log.info("  Pathways/GO annotated for %d genes.", n_pathways)
+
+
+def step11b_rare_variants(dry_run: bool = False) -> None:
+    """Map divergent motif positions to rare protective variants in gnomAD (PCSK9 paradigm)."""
+    log.info("Step 11b: Rare protective variant mapping (gnomAD + GWAS Catalog)...")
+    if dry_run:
+        return
+    gene_ids = _get_tier12_gene_ids()
+    if not gene_ids:
+        log.warning("  No Tier1/Tier2 candidates; skipping rare variant mapping.")
+        return
+    from pipeline.layer3_disease.rare_variants import run_rare_variants_pipeline
+    n = run_rare_variants_pipeline(gene_ids)
+    log.info("  Rare variants: %d genes with protective variant matches.", n)
 
 
 def step12_druggability(dry_run: bool = False) -> None:
@@ -508,24 +592,28 @@ def step16_start_api(dry_run: bool = False) -> None:
 
 
 STEPS = {
-    "step1": step1_validate_environment,
-    "step2": step2_download_proteomes,
-    "step3": step3_run_orthofinder,
-    "step3b": step3b_load_orthologs,
-    "step4": step4_alignment_and_divergence,
-    "step5": step5_phylogenetic_tree,
-    "step6": step6_evolutionary_selection,
-    "step7": step7_convergence,
-    "step8": step8_expression,
-    "step9": step9_composite_score,
-    "step10": step10_start_api,
+    "step1":   step1_validate_environment,
+    "step2":   step2_download_proteomes,
+    "step3":   step3_run_orthofinder,
+    "step3b":  step3b_load_orthologs,
+    "step4":   step4_alignment_and_divergence,
+    "step4b":  step4b_domain_and_consequence,
+    "step5":   step5_phylogenetic_tree,
+    "step6":   step6_evolutionary_selection,
+    "step6b":  step6b_fel_busted,
+    "step7":   step7_convergence,
+    "step8":   step8_expression,
+    "step8b":  step8b_bgee,
+    "step9":   step9_composite_score,
+    "step10":  step10_start_api,
     "step10b": step10b_alphagenome,
-    "step11": step11_disease_annotation,
-    "step12": step12_druggability,
-    "step13": step13_gene_therapy,
-    "step14": step14_safety,
-    "step15": step15_rescore,
-    "step16": step16_start_api,
+    "step11":  step11_disease_annotation,
+    "step11b": step11b_rare_variants,
+    "step12":  step12_druggability,
+    "step13":  step13_gene_therapy,
+    "step14":  step14_safety,
+    "step15":  step15_rescore,
+    "step16":  step16_start_api,
 }
 
 

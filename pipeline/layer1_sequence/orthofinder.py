@@ -243,3 +243,52 @@ def load_orthologs_to_db(
 
     log.info("Inserted %d ortholog rows.", inserted)
     return inserted
+
+
+def flag_one_to_one_orthogroups() -> int:
+    """Mark orthogroups as 1:1 or not based on paralog presence.
+
+    A 1:1 orthogroup has exactly one sequence per species that contributes.
+    Any orthogroup where a species contributes >1 sequence is flagged
+    is_one_to_one=False so downstream convergence/selection steps can
+    filter it out with a simple WHERE clause.
+
+    Returns number of orthogroups flagged as many-to-many.
+    """
+    many_to_many = 0
+    with get_session() as session:
+        # Group all orthologs by og_id and count per species
+        from sqlalchemy import func as sqlfunc
+        rows = (
+            session.query(
+                Ortholog.orthofinder_og,
+                Ortholog.species_id,
+                sqlfunc.count(Ortholog.id).label("n"),
+            )
+            .filter(Ortholog.orthofinder_og.isnot(None))
+            .group_by(Ortholog.orthofinder_og, Ortholog.species_id)
+            .all()
+        )
+
+        # Identify og_ids where any species has >1 sequence
+        paralog_ogs: set[str] = set()
+        for og_id, species_id, n in rows:
+            if n > 1:
+                paralog_ogs.add(og_id)
+
+        if paralog_ogs:
+            updated = (
+                session.query(Ortholog)
+                .filter(Ortholog.orthofinder_og.in_(paralog_ogs))
+                .update({"is_one_to_one": False}, synchronize_session=False)
+            )
+            session.commit()
+            many_to_many = len(paralog_ogs)
+            log.info(
+                "  1:1 ortholog filter: %d many-to-many orthogroups flagged (%d rows updated).",
+                many_to_many, updated,
+            )
+        else:
+            log.info("  1:1 ortholog filter: all orthogroups are 1:1.")
+
+    return many_to_many

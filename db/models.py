@@ -94,6 +94,7 @@ class Ortholog(Base):
     protein_seq = Column(Text)
     sequence_identity_pct = Column(Float)               # vs. human ortholog (0–100)
     orthofinder_og = Column(String)                     # OrthoGroup ID, e.g. "OG0000042"
+    is_one_to_one = Column(Boolean, default=True, nullable=False)  # False if orthogroup has paralogs
 
     gene = relationship("Gene", back_populates="orthologs")
     species = relationship("Species", back_populates="orthologs")
@@ -120,6 +121,13 @@ class DivergentMotif(Base):
     logp = Column(Float)
     immunogenic = Column(Boolean)
     synthesisable = Column(Boolean)
+
+    # U2: Pfam domain annotation (populated in Step 4b)
+    domain_name = Column(String, nullable=True)         # Pfam/InterPro domain name overlapping this motif
+    in_functional_domain = Column(Boolean, default=False, nullable=False)
+
+    # U3: AlphaMissense functional consequence (populated in Step 4b)
+    consequence_score = Column(Float, nullable=True)    # Mean AlphaMissense pathogenicity [0–1]
 
     ortholog = relationship("Ortholog", back_populates="motifs")
 
@@ -157,6 +165,10 @@ class EvolutionScore(Base):
     convergence_count = Column(Integer, default=0)      # independent lineages with same motif change
     phylop_score = Column(Float)                        # mean PhyloP across divergent positions
 
+    # U4: FEL + BUSTED supplementary selection tests (populated in Step 6b)
+    fel_sites = Column(Integer, nullable=True)          # sites under pervasive selection (FEL p<0.05)
+    busted_pvalue = Column(Float, nullable=True)        # gene-wide episodic selection p-value (BUSTED)
+
     gene = relationship("Gene", back_populates="evolution_score")
 
     def __repr__(self) -> str:
@@ -179,6 +191,11 @@ class DiseaseAnnotation(Base):
     gnomad_pli = Column(Float)                          # loss-of-function constraint score
     mouse_ko_phenotype = Column(String)
     tissue_expression = Column(JSON)                    # {tissue: tpm_value}
+
+    # U6: Rare protective variant mapping (populated in Step 11b)
+    protective_variant_count = Column(Integer, nullable=True)   # rare variants matching animal divergence direction
+    best_protective_trait = Column(String, nullable=True)       # most significant protective phenotype from PheWAS
+    protective_variant_pvalue = Column(Float, nullable=True)    # best GWAS p-value for protective association
 
     gene = relationship("Gene", back_populates="disease_annotation")
 
