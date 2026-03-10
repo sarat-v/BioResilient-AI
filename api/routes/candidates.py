@@ -42,6 +42,7 @@ class MotifOut(BaseModel):
     consequence_score: Optional[float] = None
     convergent_aa_count: int = 0
     esm1v_score: Optional[float] = None
+    motif_direction: Optional[str] = None
 
 
 class OrthologOut(BaseModel):
@@ -62,6 +63,9 @@ class EvolutionOut(BaseModel):
     phylop_score: Optional[float]
     fel_sites: Optional[int] = None
     busted_pvalue: Optional[float] = None
+    meme_qvalue: Optional[float] = None
+    relax_k: Optional[float] = None
+    relax_pvalue: Optional[float] = None
 
 
 class DiseaseOut(BaseModel):
@@ -277,6 +281,9 @@ def get_candidate(gene_id: str, trait_id: Optional[str] = Query(None, descriptio
                 phylop_score=ev.phylop_score,
                 fel_sites=getattr(ev, "fel_sites", None),
                 busted_pvalue=getattr(ev, "busted_pvalue", None),
+                meme_qvalue=getattr(ev, "meme_qvalue", None),
+                relax_k=getattr(ev, "relax_k", None),
+                relax_pvalue=getattr(ev, "relax_pvalue", None),
             )
 
         orthologs_out = []
@@ -295,6 +302,7 @@ def get_candidate(gene_id: str, trait_id: Optional[str] = Query(None, descriptio
                     consequence_score=getattr(m, "consequence_score", None),
                     convergent_aa_count=getattr(m, "convergent_aa_count", 0) or 0,
                     esm1v_score=getattr(m, "esm1v_score", None),
+                    motif_direction=getattr(m, "motif_direction", None),
                 )
                 for m in orth.motifs
             ]

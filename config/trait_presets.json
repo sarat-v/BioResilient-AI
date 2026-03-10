@@ -10,7 +10,28 @@
     "id": "longevity",
     "label": "Longevity / Aging",
     "description": "Genes associated with extended lifespan in long-lived species",
-    "species_ids": ["bowhead_whale", "greenland_shark", "naked_mole_rat", "axolotl"],
-    "scoring_weight_overrides": {}
+    "species_ids": ["bowhead_whale", "greenland_shark", "naked_mole_rat", "brandts_bat", "amazon_parrot", "budgerigar"],
+    "scoring_weight_overrides": { "convergence": 0.40, "selection": 0.30, "expression": 0.30 }
+  },
+  {
+    "id": "viral_immunity",
+    "label": "Viral Immunity / Tolerance",
+    "description": "Genes evolved in bat species that host high viral loads without disease — innate immune tolerance and interferon regulation",
+    "species_ids": ["little_brown_bat", "brandts_bat"],
+    "scoring_weight_overrides": { "convergence": 0.35, "selection": 0.40, "expression": 0.25 }
+  },
+  {
+    "id": "hypoxia_tolerance",
+    "label": "Hypoxia Tolerance",
+    "description": "Genes evolved in species that tolerate extreme low-oxygen environments",
+    "species_ids": ["blind_mole_rat", "bowhead_whale", "greenland_shark"],
+    "scoring_weight_overrides": { "convergence": 0.40, "selection": 0.35, "expression": 0.25 }
+  },
+  {
+    "id": "dna_repair",
+    "label": "DNA Repair / Genome Stability",
+    "description": "Genes involved in convergent improvements to DNA damage detection and repair",
+    "species_ids": ["naked_mole_rat", "bowhead_whale", "african_elephant", "greenland_shark"],
+    "scoring_weight_overrides": { "convergence": 0.45, "selection": 0.30, "expression": 0.25 }
   }
 ]

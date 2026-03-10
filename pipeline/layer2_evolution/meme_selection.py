@@ -539,6 +539,149 @@ def run_fel_busted_pipeline(
     return all_results
 
 
+
+# ---------------------------------------------------------------------------
+# RELAX — Branch-specific rate acceleration / relaxation
+# ---------------------------------------------------------------------------
+
+def run_relax(
+    codon_aln: dict[str, str],
+    tree_newick: str,
+    og_id: str,
+    test_branches: Optional[list[str]] = None,
+) -> Optional[dict]:
+    """Run HyPhy RELAX on a codon alignment to detect branch-specific rate shifts.
+
+    RELAX compares the *intensity* of selection (the k parameter) between
+    test branches (resilient species) and reference branches (human + outgroups).
+    k > 1 → selection intensified (acceleration); k < 1 → relaxation.
+
+    Args:
+        codon_aln: {label: codon_sequence}
+        tree_newick: newick tree string
+        og_id: orthogroup ID (for output directory)
+        test_branches: species labels to mark as 'test'; defaults to all non-human
+
+    Returns:
+        Raw RELAX JSON dict or None on failure.
+    """
+    tools = get_tool_config()
+    hyphy_bin = tools.get("hyphy_bin", "hyphy")
+
+    root = Path(get_storage_root())
+    relax_dir = root / "relax" / og_id
+    relax_dir.mkdir(parents=True, exist_ok=True)
+
+    aln_path = relax_dir / "codon_aln.fna"
+    tree_path = relax_dir / "species.treefile"
+    out_path = relax_dir / "relax.json"
+
+    if out_path.exists() and out_path.stat().st_size > 0:
+        try:
+            with open(out_path) as f:
+                return json.load(f)
+        except Exception:
+            pass
+
+    # Annotate test branches in tree: append {Test} to resilient species labels
+    if test_branches is None:
+        test_branches = [lbl for lbl in codon_aln if not lbl.startswith("human")]
+
+    labeled_tree = tree_newick
+    for branch in test_branches:
+        labeled_tree = labeled_tree.replace(branch, f"{branch}{{Test}}")
+
+    with open(aln_path, "w") as f:
+        for label, seq in codon_aln.items():
+            f.write(f">{label}\n{seq}\n")
+    tree_path.write_text(labeled_tree)
+
+    cmd = [
+        hyphy_bin, "relax",
+        "--alignment", str(aln_path),
+        "--tree", str(tree_path),
+        "--output", str(out_path),
+        "--test", "Test",
+        "--quiet",
+    ]
+    try:
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=600, check=False)
+        if result.returncode != 0 or not out_path.exists():
+            log.debug("RELAX failed for %s: %s", og_id, result.stderr[:200])
+            return None
+        with open(out_path) as f:
+            return json.load(f)
+    except Exception as exc:
+        log.debug("RELAX error for %s: %s", og_id, exc)
+        return None
+
+
+def parse_relax_results(relax_json: dict) -> dict:
+    """Extract k (rate intensity) and p-value from RELAX output.
+
+    Returns {"relax_k": float, "relax_pvalue": float}.
+    k > 1 means test branches have intensified selection (acceleration).
+    """
+    try:
+        test_results = relax_json.get("test results", {})
+        pvalue = test_results.get("p-value")
+        k = test_results.get("relaxation or intensification parameter")
+        return {
+            "relax_k": round(float(k), 4) if k is not None else None,
+            "relax_pvalue": round(float(pvalue), 6) if pvalue is not None else None,
+        }
+    except Exception as exc:
+        log.debug("RELAX parse error: %s", exc)
+        return {"relax_k": None, "relax_pvalue": None}
+
+
+def run_relax_pipeline(
+    aligned_orthogroups: dict[str, dict[str, str]],
+    motifs_by_og: dict[str, list],
+    species_treefile: Path,
+) -> dict[str, dict]:
+    """Run RELAX for all candidate orthogroups that have codon alignments.
+
+    Returns {og_id: {"relax_k": float, "relax_pvalue": float}}.
+    """
+    from pipeline.layer2_evolution.phylo_tree import prune_tree_to_species
+    from pipeline.layer2_evolution.selection import _should_run_hyphy
+
+    all_results: dict[str, dict] = {}
+    candidates = [og for og in aligned_orthogroups if _should_run_hyphy(og, motifs_by_og)]
+    log.info("Running RELAX on %d candidate orthogroups...", len(candidates))
+
+    root = Path(get_storage_root())
+    success = 0
+
+    for og_id in candidates:
+        aligned_seqs = aligned_orthogroups[og_id]
+        species_ids = [label.split("|")[0] for label in aligned_seqs]
+        pruned_tree = prune_tree_to_species(species_treefile, species_ids)
+
+        codon_aln_path = root / "meme" / og_id / "codon_aln.fna"
+        if not codon_aln_path.exists():
+            continue
+
+        try:
+            from Bio import SeqIO as _SeqIO
+            codon_aln = {rec.id: str(rec.seq) for rec in _SeqIO.parse(str(codon_aln_path), "fasta")}
+        except Exception:
+            continue
+
+        if not codon_aln:
+            continue
+
+        relax_json = run_relax(codon_aln, pruned_tree, og_id)
+        if relax_json is not None:
+            parsed = parse_relax_results(relax_json)
+            all_results[og_id] = parsed
+            success += 1
+
+    log.info("RELAX complete: %d / %d orthogroups", success, len(candidates))
+    return all_results
+
+
 # ---------------------------------------------------------------------------
 # Pipeline entry point
 # ---------------------------------------------------------------------------
@@ -609,4 +752,9 @@ def run_meme_pipeline(
 
     log.info("MEME complete: %d MEME + %d proxy = %d / %d orthogroups",
              meme_success, proxy_fallback, len(all_results), len(candidates))
+
+    # Apply Benjamini-Hochberg FDR correction across all site-level p-values
+    from pipeline.stats import apply_bh_to_meme_results
+    all_results = apply_bh_to_meme_results(all_results)
+
     return all_results

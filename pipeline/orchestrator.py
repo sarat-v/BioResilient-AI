@@ -41,9 +41,11 @@ STEP_LABELS = {
     "step4":   "Align sequences & find divergent motifs",
     "step4b":  "Domain annotation (Pfam) + functional consequence (AlphaMissense)",
     "step4c":  "ESM-1v structural variant effect scoring",
+    "step4d":  "Variant direction inference (GoF / LoF / neutral)",
     "step5":   "Build phylogenetic tree",
     "step6":   "Evolutionary selection (HyPhy MEME)",
     "step6b":  "FEL + BUSTED supplementary selection tests",
+    "step6c":  "RELAX branch-specific rate acceleration",
     "step7":   "Convergence & conservation scoring",
     "step7b":  "True convergent amino acid substitution detection",
     "step8":   "Expression analysis (GEO/DESeq2)",
@@ -54,6 +56,7 @@ STEP_LABELS = {
     "step11":  "Disease annotation",
     "step11b": "Rare protective variant mapping (gnomAD)",
     "step11c": "Literature validation sanity check (PubMed)",
+    "step11d": "Pathway-level convergence enrichment",
     "step12":  "Druggability assessment",
     "step12b": "P2Rank ML pocket prediction",
     "step13":  "Gene therapy feasibility",
@@ -330,6 +333,17 @@ def step4c_esm1v(dry_run: bool = False) -> None:
     log.info("  ESM-1v: %d motifs scored.", n)
 
 
+def step4d_variant_direction(dry_run: bool = False) -> None:
+    """Classify each divergent motif as GoF / LoF / neutral using AM + ESM-1v + LOEUF."""
+    log.info("Step 4d: Variant direction inference (GoF / LoF)...")
+    if dry_run:
+        return
+
+    from pipeline.layer1_sequence.variant_direction import run_variant_direction_pipeline
+    n = run_variant_direction_pipeline()
+    log.info("  Variant direction: %d motifs classified.", n)
+
+
 def step5_phylogenetic_tree(
     aligned_orthogroups: dict,
     dry_run: bool = False,
@@ -409,6 +423,46 @@ def step6b_fel_busted(dry_run: bool = False) -> None:
     gene_by_og = build_gene_og_map()
     updated = load_fel_busted_scores(results, gene_by_og)
     log.info("  FEL/BUSTED: updated %d genes.", updated)
+
+
+def step6c_relax(dry_run: bool = False) -> None:
+    """Run RELAX to detect branch-specific rate acceleration in resilient species.
+
+    Reuses codon alignments from step6. Skips gracefully if alignments are missing.
+    Updates EvolutionScore.relax_k and EvolutionScore.relax_pvalue.
+    """
+    log.info("Step 6c: RELAX branch acceleration tests...")
+    if dry_run:
+        return
+
+    from pipeline.config import get_storage_root
+    from pipeline.layer2_evolution.meme_selection import run_relax_pipeline
+    from pipeline.layer2_evolution.selection import build_gene_og_map, load_relax_scores
+
+    import pickle
+    _cache_path = Path(get_storage_root()) / "aligned_orthogroups.pkl"
+    if not _cache_path.exists():
+        log.warning("  Aligned orthogroups cache not found; skipping step 6c.")
+        return
+
+    with open(_cache_path, "rb") as f:
+        aligned = pickle.load(f)
+
+    motifs_pkl = Path(get_storage_root()) / "motifs_by_og.pkl"
+    motifs_by_og: dict = {}
+    if motifs_pkl.exists():
+        with open(motifs_pkl, "rb") as f:
+            motifs_by_og = pickle.load(f)
+
+    treefile = Path(get_storage_root()) / "species.treefile"
+    if not treefile.exists():
+        log.warning("  Species treefile not found; skipping step 6c.")
+        return
+
+    results = run_relax_pipeline(aligned, motifs_by_og, treefile)
+    gene_by_og = build_gene_og_map()
+    updated = load_relax_scores(results, gene_by_og)
+    log.info("  RELAX: updated %d genes.", updated)
 
 
 def step7_convergence(dry_run: bool = False) -> None:
@@ -565,6 +619,15 @@ def step11c_literature(dry_run: bool = False) -> None:
     log.info("  Literature: %d genes with citations in resilience literature.", n)
 
 
+def step11d_pathway_convergence(dry_run: bool = False) -> None:
+    """Compute pathway-level convergence enrichment across all candidate genes."""
+    log.info("Step 11d: Pathway-level convergence scoring...")
+    if dry_run:
+        return
+    from pipeline.layer3_disease.pathway_convergence import run_pathway_convergence_pipeline
+    run_pathway_convergence_pipeline()
+
+
 def step12_druggability(dry_run: bool = False) -> None:
     """Layer 4: AlphaFold structures, fpocket, ChEMBL, CanSAR, peptide (Tier1+Tier2 only)."""
     log.info("Step 12: Druggability (Layer 4)...")
@@ -649,12 +712,21 @@ def step14b_depmap_gtex(dry_run: bool = False) -> None:
 
 
 def step15_rescore(dry_run: bool = False) -> None:
-    """Re-run composite scoring with Phase 2 weights."""
-    log.info("Step 15: Rescore (phase2 weights)...")
+    """Re-run composite scoring with Phase 2 weights, then apply control species penalty."""
+    log.info("Step 15: Rescore (phase2 weights) + control divergence penalty...")
     if dry_run:
         return
     from pipeline.scoring import get_top_candidates, run_scoring
     run_scoring(phase="phase2")
+
+    from pipeline.layer2_evolution.convergence import (
+        apply_control_divergence_penalty,
+        compute_control_divergence_fractions,
+    )
+    fractions = compute_control_divergence_fractions()
+    if fractions:
+        apply_control_divergence_penalty(fractions)
+
     top = get_top_candidates(n=10)
     for i, c in enumerate(top, 1):
         log.info("    %2d. %-12s  composite=%.3f  %s",
@@ -676,9 +748,11 @@ STEPS = {
     "step4":   step4_alignment_and_divergence,
     "step4b":  step4b_domain_and_consequence,
     "step4c":  step4c_esm1v,
+    "step4d":  step4d_variant_direction,
     "step5":   step5_phylogenetic_tree,
     "step6":   step6_evolutionary_selection,
     "step6b":  step6b_fel_busted,
+    "step6c":  step6c_relax,
     "step7":   step7_convergence,
     "step7b":  step7b_convergent_aa,
     "step8":   step8_expression,
@@ -689,6 +763,7 @@ STEPS = {
     "step11":  step11_disease_annotation,
     "step11b": step11b_rare_variants,
     "step11c": step11c_literature,
+    "step11d": step11d_pathway_convergence,
     "step12":  step12_druggability,
     "step12b": step12b_p2rank,
     "step13":  step13_gene_therapy,

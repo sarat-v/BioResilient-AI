@@ -23,6 +23,8 @@ from pipeline.config import get_storage_root, get_tool_config
 
 log = logging.getLogger(__name__)
 
+log = logging.getLogger(__name__)
+
 
 def _alignments_dir() -> Path:
     root = Path(get_storage_root())
@@ -32,7 +34,7 @@ def _alignments_dir() -> Path:
 
 
 def align_orthogroup(og_id: str, sequences: dict[str, str], threads: int = 4) -> Optional[dict[str, str]]:
-    """Run MAFFT on a set of sequences for one orthogroup.
+    """Run MAFFT then trimAl-mask on a set of sequences for one orthogroup.
 
     Args:
         og_id: OrthoGroup identifier (used for output file naming).
@@ -40,7 +42,7 @@ def align_orthogroup(og_id: str, sequences: dict[str, str], threads: int = 4) ->
         threads: CPU threads for MAFFT.
 
     Returns:
-        {label: aligned_sequence} or None on failure.
+        {label: aligned_sequence} (trimAl-masked when available) or None on failure.
     """
     if len(sequences) < 2:
         log.debug("  Skipping %s — only %d sequence(s)", og_id, len(sequences))
@@ -52,37 +54,93 @@ def align_orthogroup(og_id: str, sequences: dict[str, str], threads: int = 4) ->
     aln_dir = _alignments_dir()
     out_path = aln_dir / f"{og_id}.afa"
 
-    if out_path.exists() and out_path.stat().st_size > 0:
-        return _parse_aligned_fasta(out_path)
+    if not (out_path.exists() and out_path.stat().st_size > 0):
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".faa", delete=False) as tmp:
+            for label, seq in sequences.items():
+                tmp.write(f">{label}\n{seq}\n")
+            tmp_path = tmp.name
 
-    with tempfile.NamedTemporaryFile(mode="w", suffix=".faa", delete=False) as tmp:
-        for label, seq in sequences.items():
-            tmp.write(f">{label}\n{seq}\n")
-        tmp_path = tmp.name
+        cmd = [
+            "mafft",
+            "--auto",
+            "--thread", str(threads),
+            "--quiet",
+            tmp_path,
+        ]
+
+        try:
+            with open(out_path, "w") as out_f:
+                result = subprocess.run(cmd, stdout=out_f, stderr=subprocess.PIPE, check=False)
+
+            if result.returncode != 0:
+                log.warning("  MAFFT failed for %s: %s", og_id, result.stderr.decode())
+                return None
+        except Exception as exc:
+            log.error("  MAFFT error for %s: %s", og_id, exc)
+            return None
+        finally:
+            Path(tmp_path).unlink(missing_ok=True)
+
+    masked_path = mask_alignment_trimal(og_id, out_path)
+    if masked_path:
+        return _parse_aligned_fasta(masked_path)
+    return _parse_aligned_fasta(out_path)
+
+
+def mask_alignment_trimal(og_id: str, aln_path: Path) -> Optional[Path]:
+    """Run trimAl to remove poorly-aligned or gap-heavy columns.
+
+    Uses --gt 0.1 (≥90 % of sequences must have a residue) and --cons 60
+    (column conservation threshold 60 %) which together remove the majority
+    of misaligned/gapped columns while keeping informative positions.
+
+    Writes the masked alignment alongside the original as <og_id>.masked.afa.
+    Returns the masked path on success, or None if trimAl is not available
+    or the masked file would be empty.
+    """
+    masked_path = aln_path.parent / f"{og_id}.masked.afa"
+    if masked_path.exists() and masked_path.stat().st_size > 0:
+        return masked_path
 
     cmd = [
-        "mafft",
-        "--auto",
-        "--thread", str(threads),
-        "--quiet",
-        tmp_path,
+        "trimal",
+        "-in", str(aln_path),
+        "-out", str(masked_path),
+        "-gt", "0.1",
+        "-cons", "60",
+        "-fasta",
     ]
-
     try:
-        with open(out_path, "w") as out_f:
-            result = subprocess.run(cmd, stdout=out_f, stderr=subprocess.PIPE, check=False)
-
-        if result.returncode != 0:
-            log.warning("  MAFFT failed for %s: %s", og_id, result.stderr.decode())
+        result = subprocess.run(cmd, capture_output=True, text=True, check=False)
+        if result.returncode != 0 or not masked_path.exists() or masked_path.stat().st_size == 0:
+            log.debug("  trimAl unavailable or empty result for %s; using raw MAFFT output", og_id)
+            masked_path.unlink(missing_ok=True)
             return None
 
-        return _parse_aligned_fasta(out_path)
+        raw = _parse_aligned_fasta(aln_path)
+        masked = _parse_aligned_fasta(masked_path)
+        if not masked:
+            masked_path.unlink(missing_ok=True)
+            return None
 
-    except Exception as exc:
-        log.error("  MAFFT error for %s: %s", og_id, exc)
+        raw_len = len(next(iter(raw.values()), ""))
+        masked_len = len(next(iter(masked.values()), ""))
+        if raw_len > 0:
+            frac_removed = (raw_len - masked_len) / raw_len
+            log.debug("  trimAl %s: %d → %d cols (%.1f %% removed)", og_id, raw_len, masked_len, frac_removed * 100)
+            if frac_removed > 0.80:
+                log.warning("  trimAl removed >80%% of columns for %s — falling back to raw alignment", og_id)
+                masked_path.unlink(missing_ok=True)
+                return None
+
+        return masked_path
+    except FileNotFoundError:
+        log.debug("  trimAl not found on PATH; skipping alignment masking")
         return None
-    finally:
-        Path(tmp_path).unlink(missing_ok=True)
+    except Exception as exc:
+        log.warning("  trimAl error for %s: %s", og_id, exc)
+        masked_path.unlink(missing_ok=True)
+        return None
 
 
 def _parse_aligned_fasta(path: Path) -> dict[str, str]:

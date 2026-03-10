@@ -50,6 +50,7 @@ class Species(Base):
     proteome_path = Column(String)                      # local path or S3 URI
     lineage_group = Column(String)                      # Rodents, Cetaceans, Bats, etc.
     geo_search_terms = Column(ARRAY(String), default=list)
+    is_control = Column(Boolean, default=False)         # True = negative control species
 
     orthologs = relationship("Ortholog", back_populates="species")
 
@@ -135,6 +136,9 @@ class DivergentMotif(Base):
     # Item 5: ESM-1v variant effect score (populated in Step 4c)
     esm1v_score = Column(Float, nullable=True)          # Mean ESM-1v log-likelihood ratio [negative = destabilising]
 
+    # A6: Variant direction inference (populated in Step 4d)
+    motif_direction = Column(String, nullable=True)     # 'gain_of_function', 'loss_of_function', 'likely_pathogenic', 'neutral'
+
     ortholog = relationship("Ortholog", back_populates="motifs")
 
     def __repr__(self) -> str:
@@ -174,6 +178,13 @@ class EvolutionScore(Base):
     # U4: FEL + BUSTED supplementary selection tests (populated in Step 6b)
     fel_sites = Column(Integer, nullable=True)          # sites under pervasive selection (FEL p<0.05)
     busted_pvalue = Column(Float, nullable=True)        # gene-wide episodic selection p-value (BUSTED)
+
+    # A2: BH-corrected q-value for global FDR control (populated post-scoring)
+    meme_qvalue = Column(Float, nullable=True)          # BH-adjusted q-value across all genes
+
+    # A5: RELAX branch-specific rate acceleration (populated in Step 6c)
+    relax_k = Column(Float, nullable=True)              # RELAX k parameter (>1 = acceleration)
+    relax_pvalue = Column(Float, nullable=True)         # RELAX p-value for rate shift
 
     gene = relationship("Gene", back_populates="evolution_score")
 
@@ -293,6 +304,7 @@ class CandidateScore(Base):
     composite_score = Column(Float, default=0.0)
     tier = Column(String)                               # "Tier1", "Tier2", "Tier3"
     regulatory_score = Column(Float, default=0.0)       # Track B: AlphaGenome regulatory divergence
+    control_divergence_fraction = Column(Float, nullable=True)  # A3: fraction of control species also divergent
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
 
     gene = relationship("Gene", back_populates="candidate_score")
@@ -347,3 +359,24 @@ class RegulatoryDivergence(Base):
 
     def __repr__(self) -> str:
         return f"<RegulatoryDivergence gene={self.gene_id} species={self.species_id} score={self.regulatory_score}>"
+
+
+# ---------------------------------------------------------------------------
+# A4: Pathway-level convergence
+# ---------------------------------------------------------------------------
+
+
+class PathwayConvergence(Base):
+    __tablename__ = "pathway_convergence"
+
+    pathway_id = Column(String, primary_key=True)
+    pathway_name = Column(String)
+    gene_count = Column(Integer)                            # background gene count in pathway
+    candidate_count = Column(Integer)                       # convergent candidates in pathway
+    log_pvalue = Column(Float)                              # log10 hypergeometric p-value (negative = enriched)
+    evolutionary_weight = Column(Float)                     # sum of convergence_scores
+    pathway_score = Column(Float)                           # combined ranking score
+    gene_symbols = Column(ARRAY(String), default=list)      # gene symbols in this pathway
+
+    def __repr__(self) -> str:
+        return f"<PathwayConvergence {self.pathway_id} score={self.pathway_score}>"

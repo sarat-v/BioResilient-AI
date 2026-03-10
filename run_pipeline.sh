@@ -110,31 +110,32 @@ from pathlib import Path
 sys.path.insert(0, ".")
 
 # ── Load species from registry ────────────────────────────────────────────────
-from pipeline.orchestrator import _load_species_registry, run_pipeline
+from pipeline.orchestrator import STEPS, _load_species_registry, run_pipeline
 
 species_list = _load_species_registry()
 print(f"Running pipeline with {len(species_list)} species:")
 for s in species_list:
-    print(f"  {s['id']:25s} {s['name']} ({s['lineage_group']})")
+    is_ctrl = " [control]" if s.get("is_control") else ""
+    print(f"  {s['id']:25s} {s['name']} ({s['lineage_group']}){is_ctrl}")
 print()
 
-# ── Determine resume point ────────────────────────────────────────────────────
-step_order = [
-    'step1','step2','step3','step3b','step4','step5','step6',
-    'step7','step8','step9','step10','step10b','step11',
-    'step12','step13','step14','step15','step16'
-]
+# ── Determine resume point (derives step order from orchestrator — never stale)
+step_order = list(STEPS.keys())
 
 cache_file = Path('pipeline_cache.json')
 completed_steps = []
 if cache_file.exists():
-    completed_steps = json.loads(cache_file.read_text()).get('completed', [])
+    try:
+        completed_steps = json.loads(cache_file.read_text()).get('completed', [])
+    except Exception:
+        completed_steps = []
 
-# Treat step1 and step2 as done if proteomes exist for ALL species
+# Treat step1 and step2 as done if proteomes exist for ALL non-control species
 proteomes_dir = Path('data/proteomes')
+primary_species = [s for s in species_list if not s.get("is_control")]
 proteomes_done = proteomes_dir.exists() and all(
     (proteomes_dir / f"{s['id']}.reheadered.faa").exists()
-    for s in species_list
+    for s in primary_species
 )
 if proteomes_done:
     for step in ('step1', 'step2'):
@@ -151,8 +152,9 @@ for step in step_order:
 if completed_steps:
     print(f"Resuming from: {resume_from}")
     print(f"Already done:  {completed_steps}")
+    print(f"Total steps:   {len(step_order)} (includes {len(step_order) - len([s for s in step_order if len(s) <= 6])} sub-steps)")
 else:
-    print("Starting fresh from step1")
+    print(f"Starting fresh from step1 ({len(step_order)} total steps)")
 print()
 
 run_pipeline(species_list=species_list, resume_from=resume_from)
@@ -162,6 +164,7 @@ print("============================================================")
 print("Pipeline complete!")
 print("To view results:")
 print("  uvicorn api.main:app --host 0.0.0.0 --port 8000")
+print("  cd frontend && npx vite preview --port 5173")
 print("============================================================")
 PYEOF
 

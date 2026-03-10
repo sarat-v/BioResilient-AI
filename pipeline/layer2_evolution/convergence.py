@@ -444,3 +444,74 @@ def enrich_phylop_scores(chrom_map: dict[str, tuple[str, int]]) -> None:
             time.sleep(0.1)   # Respect UCSC rate limits
 
     log.info("PhyloP scores enriched for %d genes.", len(chrom_map))
+
+
+# ---------------------------------------------------------------------------
+# A3: Control species divergence — specificity filter
+# ---------------------------------------------------------------------------
+
+def _get_control_species_ids() -> set[str]:
+    """Return set of species_ids flagged as negative controls."""
+    with get_session() as session:
+        rows = session.query(Species.id).filter_by(is_control=True).all()
+    return {r.id for r in rows}
+
+
+def compute_control_divergence_fractions() -> dict[str, float]:
+    """For each gene, compute the fraction of control species that are also divergent.
+
+    A high fraction (e.g. > 0.5) means the gene diverges in non-resilient species too,
+    suggesting the signal is general mammalian evolution rather than trait-specific.
+
+    Returns:
+        {gene_id: fraction_of_controls_divergent}
+    """
+    control_ids = _get_control_species_ids()
+    if not control_ids:
+        log.info("No control species registered; skipping control divergence computation.")
+        return {}
+
+    fractions: dict[str, float] = {}
+    with get_session() as session:
+        genes = session.query(Gene).all()
+        for gene in genes:
+            orthologs = session.query(Ortholog).filter_by(gene_id=gene.id).all()
+            if not orthologs:
+                continue
+
+            control_with_motifs = set()
+            for orth in orthologs:
+                if orth.species_id in control_ids and orth.motifs:
+                    control_with_motifs.add(orth.species_id)
+
+            fractions[gene.id] = round(len(control_with_motifs) / len(control_ids), 4)
+
+    log.info("Control divergence fractions computed for %d genes.", len(fractions))
+    return fractions
+
+
+def apply_control_divergence_penalty(fractions: dict[str, float]) -> None:
+    """Store control_divergence_fraction in CandidateScore and apply a convergence penalty.
+
+    Genes that diverge in >50% of control species have their convergence_score
+    penalised: score × (1 - 0.6 × fraction). At 100% control divergence the
+    convergence score is reduced by 60%.
+    """
+    from db.models import CandidateScore
+
+    with get_session() as session:
+        updated = 0
+        for gene_id, fraction in fractions.items():
+            for cs in session.query(CandidateScore).filter_by(gene_id=gene_id).all():
+                cs.control_divergence_fraction = fraction
+                if fraction > 0.5 and cs.convergence_score is not None:
+                    penalty = 1.0 - 0.6 * fraction
+                    cs.convergence_score = round(max(0.0, cs.convergence_score * penalty), 4)
+                    # Recompute composite score with the updated convergence
+                    # (weights already applied; rebalancing done in rescore step)
+                updated += 1
+        session.commit()
+
+    penalised = sum(1 for f in fractions.values() if f > 0.5)
+    log.info("Control divergence applied: %d genes stored, %d penalised.", updated, penalised)
+

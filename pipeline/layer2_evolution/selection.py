@@ -248,6 +248,39 @@ def load_fel_busted_scores(
     return updated
 
 
+def load_relax_scores(
+    relax_results: dict[str, dict],
+    gene_by_og: dict[str, str],
+) -> int:
+    """Update EvolutionScore rows with RELAX branch acceleration results.
+
+    Args:
+        relax_results: {og_id: {"relax_k": float, "relax_pvalue": float}}
+        gene_by_og: {og_id: gene_id}
+
+    Returns:
+        Number of rows updated.
+    """
+    updated = 0
+    with get_session() as session:
+        for og_id, result in relax_results.items():
+            gene_id = gene_by_og.get(og_id)
+            if not gene_id:
+                continue
+
+            ev = session.get(EvolutionScore, gene_id)
+            if ev is None:
+                ev = EvolutionScore(gene_id=gene_id)
+                session.add(ev)
+
+            ev.relax_k = result.get("relax_k")
+            ev.relax_pvalue = result.get("relax_pvalue")
+            updated += 1
+
+    log.info("Updated RELAX scores for %d genes.", updated)
+    return updated
+
+
 def build_gene_og_map() -> dict[str, str]:
     """Build {og_id: gene_id} from the Ortholog table."""
     og_map: dict[str, str] = {}

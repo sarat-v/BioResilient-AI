@@ -36,6 +36,17 @@ class SearchHit(BaseModel):
     human_protein: Optional[str]
 
 
+class PathwayConvergenceOut(BaseModel):
+    pathway_id: str
+    pathway_name: Optional[str]
+    gene_count: Optional[int]
+    candidate_count: Optional[int]
+    log_pvalue: Optional[float]
+    evolutionary_weight: Optional[float]
+    pathway_score: Optional[float]
+    gene_symbols: Optional[list[str]]
+
+
 @router.get("/search", response_model=list[SearchHit])
 def search_genes(q: str = Query(..., min_length=1, description="Search by symbol, NCBI Gene ID, or UniProt accession")):
     """Full-text search across gene symbol, human_gene_id, and human_protein."""
@@ -103,3 +114,39 @@ def post_narrative(body: NarrativeRequest):
         raise HTTPException(status_code=404, detail=str(e))
     except RuntimeError as e:
         raise HTTPException(status_code=502, detail=str(e))
+
+
+@router.get("/pathway-convergence", response_model=list[PathwayConvergenceOut])
+def get_pathway_convergence(
+    top: int = Query(50, ge=1, le=500, description="Maximum number of pathways to return"),
+    min_candidates: int = Query(2, ge=1, description="Minimum candidate genes per pathway"),
+):
+    """Return pathway-level convergence enrichment scores.
+
+    Shows which biological pathways are over-represented in convergent
+    candidate genes, helping identify the biological *systems* rather than
+    just individual genes that are under selection.
+    """
+    from db.models import PathwayConvergence
+
+    with get_session() as session:
+        rows = (
+            session.query(PathwayConvergence)
+            .filter(PathwayConvergence.candidate_count >= min_candidates)
+            .order_by(PathwayConvergence.pathway_score.desc())
+            .limit(top)
+            .all()
+        )
+        return [
+            PathwayConvergenceOut(
+                pathway_id=r.pathway_id,
+                pathway_name=r.pathway_name,
+                gene_count=r.gene_count,
+                candidate_count=r.candidate_count,
+                log_pvalue=r.log_pvalue,
+                evolutionary_weight=r.evolutionary_weight,
+                pathway_score=r.pathway_score,
+                gene_symbols=r.gene_symbols,
+            )
+            for r in rows
+        ]

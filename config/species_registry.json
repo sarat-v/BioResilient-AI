@@ -133,5 +133,45 @@
     "genome_assembly": "GCF_000001405.40",
     "lineage_group": "Primates",
     "geo_search_terms": []
+  },
+  {
+    "id": "rat",
+    "taxid": 10116,
+    "name": "Rattus norvegicus",
+    "phenotype": ["baseline"],
+    "genome_assembly": "GCF_015227675.2",
+    "lineage_group": "Rodents",
+    "is_control": true,
+    "geo_search_terms": []
+  },
+  {
+    "id": "pig",
+    "taxid": 9823,
+    "name": "Sus scrofa",
+    "phenotype": ["baseline"],
+    "genome_assembly": "GCF_000003025.6",
+    "lineage_group": "Artiodactyls",
+    "is_control": true,
+    "geo_search_terms": []
+  },
+  {
+    "id": "cow",
+    "taxid": 9913,
+    "name": "Bos taurus",
+    "phenotype": ["baseline"],
+    "genome_assembly": "GCF_002263795.3",
+    "lineage_group": "Artiodactyls",
+    "is_control": true,
+    "geo_search_terms": []
+  },
+  {
+    "id": "macaque",
+    "taxid": 9544,
+    "name": "Macaca mulatta",
+    "phenotype": ["baseline"],
+    "genome_assembly": "GCF_003339765.1",
+    "lineage_group": "Primates",
+    "is_control": true,
+    "geo_search_terms": []
   }
 ]

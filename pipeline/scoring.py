@@ -72,18 +72,18 @@ def selection_score(
     dnds_pvalue: Optional[float],
     fel_sites: Optional[int] = None,
     busted_pvalue: Optional[float] = None,
+    relax_k: Optional[float] = None,
+    relax_pvalue: Optional[float] = None,
 ) -> float:
-    """Score in [0, 1] combining MEME dN/dS, FEL pervasive sites, and BUSTED gene-level test.
+    """Score in [0, 1] combining MEME dN/dS, FEL, BUSTED, and RELAX signals.
 
-    Combined formula:
-        selection_score = 0.5 × meme_score + 0.3 × fel_score + 0.2 × busted_score
+    Combined formula (when all tests present):
+        selection_score = 0.40 × meme + 0.25 × fel + 0.20 × busted + 0.15 × relax
 
-    When FEL/BUSTED are unavailable (legacy data or codon alignment failed),
-    falls back to MEME-only score (original behaviour preserved).
-
-    High score = strong positive selection signal across multiple independent tests.
+    RELAX component rewards significant branch-specific acceleration (k > 1):
+        relax_score = min(-log10(p) / 10, 1.0) × min((k - 1) / 2.0, 1.0)  if k > 1
     """
-    # --- MEME component (dN/dS + p-value) ---
+    # --- MEME component ---
     if dnds_ratio is None or dnds_pvalue is None:
         meme_score = 0.0
     else:
@@ -97,23 +97,27 @@ def selection_score(
         meme_score = round(0.5 * dnds_norm + 0.5 * pval_weight, 4)
 
     # If no supplementary tests available, return MEME score alone
-    if fel_sites is None and busted_pvalue is None:
+    if fel_sites is None and busted_pvalue is None and relax_k is None:
         return meme_score
 
-    # --- FEL component (pervasive selection site count) ---
-    # Normalise: 10+ FEL sites = score of 1.0
-    if fel_sites is not None and fel_sites > 0:
-        fel_score = round(min(fel_sites / 10.0, 1.0), 4)
-    else:
-        fel_score = 0.0
+    # --- FEL component ---
+    fel_score = round(min(fel_sites / 10.0, 1.0), 4) if fel_sites and fel_sites > 0 else 0.0
 
-    # --- BUSTED component (gene-wide p-value) ---
+    # --- BUSTED component ---
     if busted_pvalue is not None and 0 < busted_pvalue <= 1:
         busted_score = round(min(-math.log10(busted_pvalue) / 10.0, 1.0), 4)
     else:
         busted_score = 0.0
 
-    return round(0.5 * meme_score + 0.3 * fel_score + 0.2 * busted_score, 4)
+    # --- RELAX component: intensification (k>1) with p-value significance ---
+    if relax_k is not None and relax_k > 1.0 and relax_pvalue is not None and 0 < relax_pvalue <= 1:
+        k_component = min((relax_k - 1.0) / 2.0, 1.0)
+        p_component = min(-math.log10(relax_pvalue) / 10.0, 1.0)
+        relax_score = round(k_component * p_component, 4)
+    else:
+        relax_score = 0.0
+
+    return round(0.40 * meme_score + 0.25 * fel_score + 0.20 * busted_score + 0.15 * relax_score, 4)
 
 
 def expression_score_from_db(gene_id: str, session) -> float:
@@ -354,6 +358,8 @@ def run_scoring(phase: str = "phase1", trait_id: Optional[str] = None) -> None:
                 ev.dnds_pvalue if ev else None,
                 fel_sites=ev.fel_sites if ev else None,
                 busted_pvalue=ev.busted_pvalue if ev else None,
+                relax_k=ev.relax_k if ev else None,
+                relax_pvalue=ev.relax_pvalue if ev else None,
             )
             expr_score = expression_score_from_db(gene.id, session)
             dis_score = disease_score(ann) if weights.get("disease", 0) > 0 else 0.0
@@ -396,6 +402,10 @@ def run_scoring(phase: str = "phase1", trait_id: Optional[str] = None) -> None:
         for tier_name in ["Tier1", "Tier2", "Tier3"]:
             count = session.query(CandidateScore).filter_by(tier=tier_name, trait_id=tid).count()
             log.info("  %s: %d genes", tier_name, count)
+
+    # Apply global BH FDR correction across all EvolutionScore p-values
+    from pipeline.stats import apply_bh_to_evolution_scores
+    apply_bh_to_evolution_scores()
 
     log.info("Scoring complete.")
 

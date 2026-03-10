@@ -343,6 +343,26 @@ export default function GeneDetail() {
                               ESM {m.esm1v_score.toFixed(2)}
                             </span>
                           )}
+                          {m.motif_direction && m.motif_direction !== 'neutral' && (
+                            <span
+                              className={cn(
+                                'px-1.5 py-0.5 rounded text-[10px] font-semibold border',
+                                m.motif_direction === 'gain_of_function'
+                                  ? 'bg-green-500/15 text-green-400 border-green-500/25'
+                                  : m.motif_direction === 'loss_of_function'
+                                  ? 'bg-orange-500/15 text-orange-400 border-orange-500/25'
+                                  : 'bg-red-500/15 text-red-400 border-red-500/25',
+                              )}
+                              title={
+                                m.motif_direction === 'gain_of_function' ? 'Predicted gain-of-function substitution' :
+                                m.motif_direction === 'loss_of_function' ? 'Predicted protective loss-of-function (LoF-tolerant gene)' :
+                                'Likely pathogenic — LoF-intolerant gene'
+                              }
+                            >
+                              {m.motif_direction === 'gain_of_function' ? '↑ GoF' :
+                               m.motif_direction === 'loss_of_function' ? '↓ LoF' : '⚠ Pathogenic'}
+                            </span>
+                          )}
                           {m.divergence_score != null && (
                             <span className="text-xs font-mono text-accent ml-auto">
                               Δ {(m.divergence_score * 100).toFixed(1)}%

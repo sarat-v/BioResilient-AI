@@ -39,6 +39,7 @@ def seed_species() -> None:
                 genome_assembly=entry.get("genome_assembly"),
                 lineage_group=entry.get("lineage_group"),
                 geo_search_terms=entry.get("geo_search_terms", []),
+                is_control=entry.get("is_control", False),
             )
             session.add(species)
             added += 1
