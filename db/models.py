@@ -129,6 +129,12 @@ class DivergentMotif(Base):
     # U3: AlphaMissense functional consequence (populated in Step 4b)
     consequence_score = Column(Float, nullable=True)    # Mean AlphaMissense pathogenicity [0–1]
 
+    # Item 2: True convergent amino acid count (populated in Step 7b)
+    convergent_aa_count = Column(Integer, default=0, nullable=False)  # lineages sharing the same biochemical substitution
+
+    # Item 5: ESM-1v variant effect score (populated in Step 4c)
+    esm1v_score = Column(Float, nullable=True)          # Mean ESM-1v log-likelihood ratio [negative = destabilising]
+
     ortholog = relationship("Ortholog", back_populates="motifs")
 
     def __repr__(self) -> str:
@@ -197,6 +203,10 @@ class DiseaseAnnotation(Base):
     best_protective_trait = Column(String, nullable=True)       # most significant protective phenotype from PheWAS
     protective_variant_pvalue = Column(Float, nullable=True)    # best GWAS p-value for protective association
 
+    # Item 10: Literature validation score (populated in Step 11c)
+    lit_score = Column(Float, nullable=True)            # PubMed citation density in resilience/longevity literature
+    lit_pmid_count = Column(Integer, nullable=True)     # Number of relevant PubMed papers
+
     gene = relationship("Gene", back_populates="disease_annotation")
 
 
@@ -215,6 +225,10 @@ class DrugTarget(Base):
     existing_drugs = Column(ARRAY(String))
     cansar_score = Column(Float)
     druggability_tier = Column(String)                  # "A", "B", "C", or "undruggable"
+
+    # Item 7: P2Rank ML pocket prediction (populated in Step 12b)
+    p2rank_score = Column(Float, nullable=True)         # Best P2Rank pocket probability [0–1]
+    p2rank_pocket_count = Column(Integer, nullable=True)  # Number of predicted pockets
 
     gene = relationship("Gene", back_populates="drug_target")
 
@@ -251,6 +265,11 @@ class SafetyFlag(Base):
     network_degree = Column(Integer)                    # STRING interaction count
     hub_risk = Column(Boolean)                          # degree > 50
     family_size = Column(Integer)                       # protein family size
+
+    # Item 8: DepMap essentiality + GTEx expression breadth (populated in Step 14b)
+    depmap_score = Column(Float, nullable=True)         # DepMap CRISPR chronos score (more negative = more essential)
+    gtex_tissue_count = Column(Integer, nullable=True)  # Number of tissues with TPM > 1 (GTEx)
+    gtex_max_tpm = Column(Float, nullable=True)         # Maximum median TPM across all GTEx tissues
 
     gene = relationship("Gene", back_populates="safety_flag")
 

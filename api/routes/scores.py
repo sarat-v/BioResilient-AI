@@ -33,6 +33,9 @@ class ScoreBreakdown(BaseModel):
     protective_variant_count: Optional[int] = None
     best_protective_trait: Optional[str] = None
     protective_variant_pvalue: Optional[float] = None
+    # Item 10: Literature validation
+    lit_score: Optional[float] = None
+    lit_pmid_count: Optional[int] = None
 
 
 @router.get("/{gene_id}", response_model=ScoreBreakdown)
@@ -95,4 +98,6 @@ def get_scores(gene_id: str, trait_id: Optional[str] = Query(None, description="
             protective_variant_count=getattr(da, "protective_variant_count", None) if da else None,
             best_protective_trait=getattr(da, "best_protective_trait", None) if da else None,
             protective_variant_pvalue=getattr(da, "protective_variant_pvalue", None) if da else None,
+            lit_score=getattr(da, "lit_score", None) if da else None,
+            lit_pmid_count=getattr(da, "lit_pmid_count", None) if da else None,
         )

@@ -309,6 +309,12 @@ export default function GeneDetail() {
                               {m.domain_name ? m.domain_name.slice(0, 20) : 'Functional domain'}
                             </span>
                           )}
+                          {m.convergent_aa_count >= 2 && (
+                            <span className="px-1.5 py-0.5 rounded text-[10px] font-medium bg-violet-500/15 text-violet-400 border border-violet-500/25"
+                              title={`True convergent substitution: same amino acid change in ${m.convergent_aa_count} independent lineages`}>
+                              Conv ×{m.convergent_aa_count}
+                            </span>
+                          )}
                           {m.consequence_score != null && (
                             <span
                               className={cn(
@@ -322,6 +328,19 @@ export default function GeneDetail() {
                               title="AlphaMissense pathogenicity score for this divergence position"
                             >
                               AM {m.consequence_score.toFixed(2)}
+                            </span>
+                          )}
+                          {m.esm1v_score != null && (
+                            <span
+                              className={cn(
+                                'px-1.5 py-0.5 rounded text-[10px] font-mono border',
+                                m.esm1v_score < -1.0
+                                  ? 'bg-blue-500/15 text-blue-400 border-blue-500/25'
+                                  : 'bg-white/5 text-text-muted border-white/10',
+                              )}
+                              title="ESM-1v log-likelihood ratio — negative values indicate unusual/adaptive substitution"
+                            >
+                              ESM {m.esm1v_score.toFixed(2)}
                             </span>
                           )}
                           {m.divergence_score != null && (
@@ -354,7 +373,7 @@ export default function GeneDetail() {
                 <KV label="gnomAD pLI" value={formatFloat(gene.disease.gnomad_pli)} mono
                   tooltip="Loss-of-function intolerance score. >0.9 = essential gene." />
                 <KV label="Mouse KO phenotype" value={gene.disease.mouse_ko_phenotype} />
-                {gene.disease.protective_variant_count != null && gene.disease.protective_variant_count > 0 && (
+                    {gene.disease.protective_variant_count != null && gene.disease.protective_variant_count > 0 && (
                   <>
                     <KV label="Protective variants" value={gene.disease.protective_variant_count} mono
                       tooltip="Rare human variants (MAF<1%) at positions matching animal divergence direction — the PCSK9 paradigm." />
@@ -365,6 +384,10 @@ export default function GeneDetail() {
                         tooltip="GWAS p-value for the most significant protective phenotype association." />
                     )}
                   </>
+                )}
+                {gene.disease.lit_score != null && (
+                  <KV label="Literature score" value={gene.disease.lit_score.toFixed(3)} mono
+                    tooltip={`PubMed citations in resilience literature (${gene.disease.lit_pmid_count ?? 0} papers). Higher = better-validated gene.`} />
                 )}
               </div>
             </Section>
@@ -378,6 +401,13 @@ export default function GeneDetail() {
                 <KV label="Druggability tier" value={gene.drug_target.druggability_tier} />
                 <KV label="ChEMBL target" value={gene.drug_target.chembl_target_id} mono />
                 <KV label="Known drugs" value={gene.drug_target.existing_drugs?.join(', ')} />
+                {gene.drug_target.p2rank_score != null && (
+                  <>
+                    <KV label="P2Rank score" value={gene.drug_target.p2rank_score.toFixed(3)} mono
+                      tooltip="ML pocket binding probability from P2Rank. Closer to 1.0 = more druggable." />
+                    <KV label="P2Rank pockets" value={gene.drug_target.p2rank_pocket_count} mono />
+                  </>
+                )}
               </div>
             </Section>
           )}

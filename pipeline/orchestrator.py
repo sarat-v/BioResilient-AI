@@ -40,10 +40,12 @@ STEP_LABELS = {
     "step3b":  "Load orthologs into DB",
     "step4":   "Align sequences & find divergent motifs",
     "step4b":  "Domain annotation (Pfam) + functional consequence (AlphaMissense)",
+    "step4c":  "ESM-1v structural variant effect scoring",
     "step5":   "Build phylogenetic tree",
     "step6":   "Evolutionary selection (HyPhy MEME)",
     "step6b":  "FEL + BUSTED supplementary selection tests",
     "step7":   "Convergence & conservation scoring",
+    "step7b":  "True convergent amino acid substitution detection",
     "step8":   "Expression analysis (GEO/DESeq2)",
     "step8b":  "Bgee cross-species expression supplement",
     "step9":   "Compute composite scores",
@@ -51,9 +53,12 @@ STEP_LABELS = {
     "step10b": "Regulatory divergence (AlphaGenome)",
     "step11":  "Disease annotation",
     "step11b": "Rare protective variant mapping (gnomAD)",
+    "step11c": "Literature validation sanity check (PubMed)",
     "step12":  "Druggability assessment",
+    "step12b": "P2Rank ML pocket prediction",
     "step13":  "Gene therapy feasibility",
     "step14":  "Safety pre-screen",
+    "step14b": "DepMap essentiality + GTEx expression breadth",
     "step15":  "Final rescore",
     "step16":  "Pipeline complete",
 }
@@ -314,6 +319,17 @@ def step4b_domain_and_consequence(dry_run: bool = False) -> None:
     log.info("  AlphaMissense: %d motifs received consequence scores.", n_scored)
 
 
+def step4c_esm1v(dry_run: bool = False) -> None:
+    """Score divergent motifs with ESM-1v variant effect predictions."""
+    log.info("Step 4c: ESM-1v structural variant effect scoring...")
+    if dry_run:
+        return
+
+    from pipeline.layer1_sequence.esm1v import run_esm1v_pipeline
+    n = run_esm1v_pipeline()
+    log.info("  ESM-1v: %d motifs scored.", n)
+
+
 def step5_phylogenetic_tree(
     aligned_orthogroups: dict,
     dry_run: bool = False,
@@ -410,6 +426,22 @@ def step7_convergence(dry_run: bool = False) -> None:
     chrom_map = build_chrom_map()
     if chrom_map:
         enrich_phylop_scores(chrom_map)
+
+
+def step7b_convergent_aa(dry_run: bool = False) -> None:
+    """Detect true convergent amino acid substitutions at each motif position.
+
+    Goes beyond lineage counting: checks whether the *same* (or biochemically
+    equivalent) amino acid change evolved independently in multiple lineages.
+    Stores convergent_aa_count on DivergentMotif.
+    """
+    log.info("Step 7b: True convergent amino acid substitution detection...")
+    if dry_run:
+        return
+
+    from pipeline.layer2_evolution.convergent_aa import run_convergent_aa_pipeline
+    n = run_convergent_aa_pipeline()
+    log.info("  Convergent AA: %d motifs with true convergence (≥2 lineages, same substitution).", n)
 
 
 def step8_expression(species_list: list[dict], dry_run: bool = False) -> None:
@@ -519,6 +551,20 @@ def step11b_rare_variants(dry_run: bool = False) -> None:
     log.info("  Rare variants: %d genes with protective variant matches.", n)
 
 
+def step11c_literature(dry_run: bool = False) -> None:
+    """Check top candidates against known resilience/longevity literature (PubMed sanity check)."""
+    log.info("Step 11c: Literature validation (PubMed sanity check)...")
+    if dry_run:
+        return
+    gene_ids = _get_tier12_gene_ids()
+    if not gene_ids:
+        log.warning("  No Tier1/Tier2 candidates; skipping literature check.")
+        return
+    from pipeline.layer3_disease.literature import run_literature_pipeline
+    n = run_literature_pipeline(gene_ids)
+    log.info("  Literature: %d genes with citations in resilience literature.", n)
+
+
 def step12_druggability(dry_run: bool = False) -> None:
     """Layer 4: AlphaFold structures, fpocket, ChEMBL, CanSAR, peptide (Tier1+Tier2 only)."""
     log.info("Step 12: Druggability (Layer 4)...")
@@ -533,6 +579,21 @@ def step12_druggability(dry_run: bool = False) -> None:
     chembl.annotate_genes_chembl(gene_ids)
     cansar.annotate_genes_cansar(gene_ids)
     peptide.annotate_motifs_peptide(None)
+
+
+def step12b_p2rank(dry_run: bool = False) -> None:
+    """Run P2Rank ML pocket prediction on AlphaFold structures."""
+    log.info("Step 12b: P2Rank ML pocket prediction...")
+    if dry_run:
+        return
+    gene_ids = _get_tier12_gene_ids()
+    if not gene_ids:
+        return
+    from pipeline.layer4_druggability.structure import ensure_structures_for_genes
+    from pipeline.layer4_druggability.p2rank import run_p2rank_pipeline
+    gene_to_pdb = ensure_structures_for_genes(gene_ids)
+    n = run_p2rank_pipeline(gene_to_pdb, gene_ids)
+    log.info("  P2Rank: %d genes with pocket predictions.", n)
 
 
 def step13_gene_therapy(dry_run: bool = False) -> None:
@@ -571,6 +632,22 @@ def step14_safety(dry_run: bool = False) -> None:
     selectivity.annotate_genes_selectivity(gene_ids)
 
 
+def step14b_depmap_gtex(dry_run: bool = False) -> None:
+    """Annotate safety with DepMap CRISPR essentiality and GTEx expression breadth."""
+    log.info("Step 14b: DepMap essentiality + GTEx expression breadth...")
+    if dry_run:
+        return
+    gene_ids = _get_tier12_gene_ids()
+    if not gene_ids:
+        return
+    from pipeline.layer6_safety.depmap import run_depmap_pipeline
+    from pipeline.layer6_safety.gtex import run_gtex_pipeline
+    n_depmap = run_depmap_pipeline(gene_ids)
+    log.info("  DepMap: %d genes annotated.", n_depmap)
+    n_gtex = run_gtex_pipeline(gene_ids)
+    log.info("  GTEx: %d genes annotated.", n_gtex)
+
+
 def step15_rescore(dry_run: bool = False) -> None:
     """Re-run composite scoring with Phase 2 weights."""
     log.info("Step 15: Rescore (phase2 weights)...")
@@ -598,10 +675,12 @@ STEPS = {
     "step3b":  step3b_load_orthologs,
     "step4":   step4_alignment_and_divergence,
     "step4b":  step4b_domain_and_consequence,
+    "step4c":  step4c_esm1v,
     "step5":   step5_phylogenetic_tree,
     "step6":   step6_evolutionary_selection,
     "step6b":  step6b_fel_busted,
     "step7":   step7_convergence,
+    "step7b":  step7b_convergent_aa,
     "step8":   step8_expression,
     "step8b":  step8b_bgee,
     "step9":   step9_composite_score,
@@ -609,9 +688,12 @@ STEPS = {
     "step10b": step10b_alphagenome,
     "step11":  step11_disease_annotation,
     "step11b": step11b_rare_variants,
+    "step11c": step11c_literature,
     "step12":  step12_druggability,
+    "step12b": step12b_p2rank,
     "step13":  step13_gene_therapy,
     "step14":  step14_safety,
+    "step14b": step14b_depmap_gtex,
     "step15":  step15_rescore,
     "step16":  step16_start_api,
 }

@@ -40,6 +40,8 @@ class MotifOut(BaseModel):
     domain_name: Optional[str] = None
     in_functional_domain: bool = False
     consequence_score: Optional[float] = None
+    convergent_aa_count: int = 0
+    esm1v_score: Optional[float] = None
 
 
 class OrthologOut(BaseModel):
@@ -72,6 +74,8 @@ class DiseaseOut(BaseModel):
     protective_variant_count: Optional[int] = None
     best_protective_trait: Optional[str] = None
     protective_variant_pvalue: Optional[float] = None
+    lit_score: Optional[float] = None
+    lit_pmid_count: Optional[int] = None
 
 
 class DrugTargetOut(BaseModel):
@@ -81,6 +85,8 @@ class DrugTargetOut(BaseModel):
     existing_drugs: Optional[list[str]]
     cansar_score: Optional[float]
     druggability_tier: Optional[str]
+    p2rank_score: Optional[float] = None
+    p2rank_pocket_count: Optional[int] = None
 
 
 class CandidateListItem(BaseModel):
@@ -287,6 +293,8 @@ def get_candidate(gene_id: str, trait_id: Optional[str] = Query(None, descriptio
                     domain_name=getattr(m, "domain_name", None),
                     in_functional_domain=getattr(m, "in_functional_domain", False) or False,
                     consequence_score=getattr(m, "consequence_score", None),
+                    convergent_aa_count=getattr(m, "convergent_aa_count", 0) or 0,
+                    esm1v_score=getattr(m, "esm1v_score", None),
                 )
                 for m in orth.motifs
             ]
@@ -312,6 +320,8 @@ def get_candidate(gene_id: str, trait_id: Optional[str] = Query(None, descriptio
                 protective_variant_count=getattr(da, "protective_variant_count", None),
                 best_protective_trait=getattr(da, "best_protective_trait", None),
                 protective_variant_pvalue=getattr(da, "protective_variant_pvalue", None),
+                lit_score=getattr(da, "lit_score", None),
+                lit_pmid_count=getattr(da, "lit_pmid_count", None),
             )
 
         dt = session.get(DrugTarget, gene_id)
@@ -324,6 +334,8 @@ def get_candidate(gene_id: str, trait_id: Optional[str] = Query(None, descriptio
                 existing_drugs=dt.existing_drugs or [],
                 cansar_score=dt.cansar_score,
                 druggability_tier=dt.druggability_tier,
+                p2rank_score=getattr(dt, "p2rank_score", None),
+                p2rank_pocket_count=getattr(dt, "p2rank_pocket_count", None),
             )
 
         return CandidateDetail(

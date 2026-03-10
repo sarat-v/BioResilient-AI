@@ -139,14 +139,14 @@ def disease_score(ann: Optional[DiseaseAnnotation]) -> float:
 
 
 def druggability_score(dt: Optional[DrugTarget]) -> float:
-    """Score in [0, 1] from pockets, ChEMBL, CanSAR tier."""
+    """Score in [0, 1] from pockets, ChEMBL, CanSAR tier, and P2Rank ML prediction."""
     if dt is None:
         return 0.0
     s = 0.0
     if dt.pocket_count is not None and dt.pocket_count > 0:
-        s += min(dt.pocket_count / 5.0, 1.0) * 0.3
+        s += min(dt.pocket_count / 5.0, 1.0) * 0.25
     if dt.top_pocket_score is not None:
-        s += min(dt.top_pocket_score, 1.0) * 0.3
+        s += min(dt.top_pocket_score, 1.0) * 0.25
     if dt.chembl_target_id:
         s += 0.2
     if dt.existing_drugs and len(dt.existing_drugs) > 0:
@@ -156,11 +156,21 @@ def druggability_score(dt: Optional[DrugTarget]) -> float:
         s += 0.2
     elif tier == "B":
         s += 0.1
+    # P2Rank ML prediction — supplementary signal (up to 0.1 bonus)
+    p2rank = getattr(dt, "p2rank_score", None)
+    if p2rank is not None and p2rank > 0:
+        s += min(p2rank, 1.0) * 0.1
     return round(min(s, 1.0), 4)
 
 
 def safety_score(sf: Optional[SafetyFlag]) -> float:
-    """Score in [0, 1]; high hub_risk, essential, large family reduce score (inverted for composite)."""
+    """Score in [0, 1]; high hub_risk, essential, large family reduce score (inverted for composite).
+
+    Extended with DepMap CRISPR essentiality and GTEx expression breadth:
+      - depmap_score < -0.5: broadly essential across cell lines → significant penalty
+      - gtex_tissue_count > 30: ubiquitous expression → moderate off-target risk
+      - gtex_max_tpm > 5000: extreme expression in any tissue → modest penalty
+    """
     if sf is None:
         return 1.0
     s = 1.0
@@ -170,6 +180,24 @@ def safety_score(sf: Optional[SafetyFlag]) -> float:
         s -= 0.2
     if sf.family_size is not None and sf.family_size > 100:
         s -= 0.2
+    # DepMap: broad essentiality is a red flag for drug targeting
+    depmap = getattr(sf, "depmap_score", None)
+    if depmap is not None:
+        if depmap < -0.7:
+            s -= 0.3   # Very broadly essential — serious toxicity concern
+        elif depmap < -0.5:
+            s -= 0.15  # Broadly essential
+        elif depmap < -0.3:
+            s -= 0.05  # Moderate essentiality — small penalty
+    # GTEx: ubiquitous expression → harder to target without side effects
+    gtex_count = getattr(sf, "gtex_tissue_count", None)
+    if gtex_count is not None:
+        if gtex_count > 40:
+            s -= 0.2
+        elif gtex_count > 25:
+            s -= 0.1
+        elif gtex_count > 15:
+            s -= 0.05
     return round(max(s, 0.0), 4)
 
 
