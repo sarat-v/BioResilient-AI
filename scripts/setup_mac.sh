@@ -72,13 +72,23 @@ brew_install() {
 }
 
 brew_install mafft mafft
-# fpocket — build from source (no bottle for arm64)
+# fpocket — build from source without the Linux-only molfile plugin
 if ! command -v fpocket &>/dev/null; then
-    echo "  Building fpocket from source..."
+    echo "  Building fpocket from source (macOS ARM — no molfile plugin)..."
     FPOCKET_TMP=$(mktemp -d)
     git clone --depth=1 https://github.com/Discngine/fpocket.git "$FPOCKET_TMP/fpocket"
-    make -C "$FPOCKET_TMP/fpocket" -j4
-    sudo make -C "$FPOCKET_TMP/fpocket" install
+
+    # Patch the Makefile to remove the Linux-only LINUXAMD64 molfile plugin
+    # The plugin provides VMD trajectory reading which we don't need
+    sed -i '' \
+        's|-Lplugins/LINUXAMD64/molfile plugins/LINUXAMD64/molfile/libmolfile_plugin.a -lstdc++||g' \
+        "$FPOCKET_TMP/fpocket/makefile" 2>/dev/null || \
+    sed -i '' \
+        's|-Lplugins/LINUXAMD64/molfile plugins/LINUXAMD64/molfile/libmolfile_plugin.a -lstdc++||g' \
+        "$FPOCKET_TMP/fpocket/Makefile" 2>/dev/null || true
+
+    make -C "$FPOCKET_TMP/fpocket" -j4 fpocket 2>&1 | tail -5
+    sudo cp "$FPOCKET_TMP/fpocket/bin/fpocket" /usr/local/bin/fpocket
     rm -rf "$FPOCKET_TMP"
     echo "  ✓  fpocket installed"
 else
