@@ -1,0 +1,76 @@
+[
+  {
+    "id": "naked_mole_rat",
+    "taxid": 10181,
+    "name": "Heterocephalus glaber",
+    "phenotype": ["cancer_resistance", "longevity"],
+    "genome_assembly": "GCF_000247695.1",
+    "lineage_group": "Rodents",
+    "geo_search_terms": ["naked mole rat", "Heterocephalus glaber", "cancer", "HMW-HA"]
+  },
+  {
+    "id": "bowhead_whale",
+    "taxid": 13397,
+    "name": "Balaena mysticetus",
+    "phenotype": ["longevity", "cancer_resistance"],
+    "genome_assembly": "GCF_028564815.1",
+    "lineage_group": "Cetaceans",
+    "geo_search_terms": ["bowhead whale", "Balaena mysticetus", "longevity", "DNA repair"]
+  },
+  {
+    "id": "african_elephant",
+    "taxid": 9785,
+    "name": "Loxodonta africana",
+    "phenotype": ["cancer_resistance"],
+    "genome_assembly": "GCF_000001905.1",
+    "lineage_group": "Proboscideans",
+    "geo_search_terms": ["Loxodonta africana", "African elephant", "cancer resistance", "TP53", "LIF6"]
+  },
+  {
+    "id": "little_brown_bat",
+    "taxid": 59463,
+    "name": "Myotis lucifugus",
+    "phenotype": ["viral_resistance", "longevity"],
+    "genome_assembly": "GCF_000147115.1",
+    "lineage_group": "Bats",
+    "geo_search_terms": ["Myotis lucifugus", "bat", "viral resistance", "longevity"]
+  },
+  {
+    "id": "greenland_shark",
+    "taxid": 58051,
+    "name": "Somniosus microcephalus",
+    "phenotype": ["longevity"],
+    "genome_assembly": "GCF_963853765.1",
+    "lineage_group": "Sharks",
+    "geo_search_terms": ["Somniosus microcephalus", "Greenland shark", "longevity"]
+  },
+  {
+    "id": "human",
+    "taxid": 9606,
+    "name": "Homo sapiens",
+    "phenotype": ["baseline"],
+    "genome_assembly": "GCF_000001405.40",
+    "lineage_group": "Primates",
+    "geo_search_terms": []
+  },
+  {
+    "id": "rat",
+    "taxid": 10116,
+    "name": "Rattus norvegicus",
+    "phenotype": ["baseline"],
+    "genome_assembly": "GCF_015227675.2",
+    "lineage_group": "Rodents",
+    "is_control": true,
+    "geo_search_terms": []
+  },
+  {
+    "id": "macaque",
+    "taxid": 9544,
+    "name": "Macaca mulatta",
+    "phenotype": ["baseline"],
+    "genome_assembly": "GCF_003339765.1",
+    "lineage_group": "Primates",
+    "is_control": true,
+    "geo_search_terms": []
+  }
+]
