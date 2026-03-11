@@ -168,7 +168,14 @@ check_tool() {
 check_tool orthofinder
 check_tool diamond
 check_tool mafft
-check_tool iqtree2
+# iqtree is packaged as either 'iqtree2' or 'iqtree' depending on conda version
+if command -v iqtree2 &>/dev/null; then
+    echo "    ✓  iqtree2"
+elif command -v iqtree &>/dev/null; then
+    echo "    ✓  iqtree ($(iqtree --version 2>&1 | head -1))"
+else
+    echo "    ✗  iqtree — NOT FOUND"
+fi
 check_tool hyphy
 check_tool fpocket
 check_tool python
