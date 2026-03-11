@@ -41,18 +41,24 @@ echo "    · Greenland shark  (Sharks)"
 echo "  Controls: Rat, Macaque"
 echo "  Reference: Human"
 echo ""
-echo "  Expected runtime on itpl-srv3: 4-8 hours"
+  echo "  Expected runtime: 4-8 hrs (10-core server) / 8-14 hrs (8-core Mac M-series)"
 echo "  Expected Tier1 genes: TP53, ATM, ERCC1, FOXO3 pathway"
 echo "============================================================"
 echo ""
 
-# Check conda environment
+# Check conda environment — activate if not already active
 if [[ -z "$CONDA_DEFAULT_ENV" ]] || [[ "$CONDA_DEFAULT_ENV" != "bioresillient" ]]; then
     echo ">>> Activating bioresillient conda environment..."
-    eval "$(conda shell.bash hook)"
+    # Works on both bash (Linux) and zsh (Mac)
+    if command -v conda &>/dev/null; then
+        eval "$(conda shell.bash hook 2>/dev/null || conda shell.zsh hook 2>/dev/null)"
+    elif [ -f "$HOME/miniconda3/bin/conda" ]; then
+        eval "$($HOME/miniconda3/bin/conda shell.bash hook)"
+    fi
     conda activate bioresillient 2>/dev/null || {
         echo "ERROR: conda environment 'bioresillient' not found."
-        echo "Run: bash scripts/setup_local.sh"
+        echo "Run: bash scripts/setup_mac.sh   (Mac)"
+        echo "  or bash scripts/setup_local.sh  (Linux)"
         exit 1
     }
 fi
@@ -102,11 +108,17 @@ PYEOF
 echo ">>> Seeding database with test species..."
 python db/seed.py
 
-# Use all available CPU cores (Xeon 4210 = 10 physical cores)
-export ORTHOFINDER_THREADS=10
-export MAFFT_THREADS=10
-export IQTREE_THREADS=10
-export HYPHY_THREADS=10
+# Auto-detect available CPU cores (works on both Mac and Linux)
+if [[ "$(uname)" == "Darwin" ]]; then
+    NCORES=$(sysctl -n hw.physicalcpu)
+else
+    NCORES=$(nproc)
+fi
+echo ">>> Detected $NCORES CPU cores"
+export ORTHOFINDER_THREADS=$NCORES
+export MAFFT_THREADS=$NCORES
+export IQTREE_THREADS=$NCORES
+export HYPHY_THREADS=$NCORES
 
 echo ""
 echo ">>> Starting full pipeline (all 30 steps)..."
