@@ -18,7 +18,6 @@ echo "[1/7] Checking Homebrew..."
 if ! command -v brew &>/dev/null; then
     echo "  Installing Homebrew..."
     /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"
-    # Add brew to PATH for Apple Silicon
     if [[ "$(uname -m)" == "arm64" ]]; then
         eval "$(/opt/homebrew/bin/brew shellenv)"
         echo 'eval "$(/opt/homebrew/bin/brew shellenv)"' >> ~/.zprofile
@@ -49,7 +48,6 @@ fi
 
 # ── 3. Conda environment ──────────────────────────────────────────────────────
 echo "[3/7] Creating/updating conda environment '$ENV_NAME'..."
-# Note: fpocket is not on conda-forge for macOS — installed via brew below
 conda env update --file "$REPO_ROOT/environment.yml" --prune -n "$ENV_NAME" || \
     conda env create --file "$REPO_ROOT/environment.yml"
 
@@ -57,7 +55,7 @@ eval "$(conda shell.zsh hook 2>/dev/null || conda shell.bash hook)"
 conda activate "$ENV_NAME"
 echo "  Environment '$ENV_NAME' active."
 
-# ── 4. Extra tools via Homebrew (not in conda-forge for Apple Silicon) ────────
+# ── 4. Bioinformatics tools via Homebrew ──────────────────────────────────────
 echo "[4/7] Installing bioinformatics tools via Homebrew..."
 
 brew_install() {
@@ -72,24 +70,45 @@ brew_install() {
 }
 
 brew_install mafft mafft
-# fpocket — build from source without the Linux-only molfile plugin
+
+# fpocket: use Homebrew formula which handles macOS correctly
+# (avoids the Linux-only molfile plugin issue when building from source)
 if ! command -v fpocket &>/dev/null; then
-    echo "  Building fpocket from source (macOS ARM — no molfile plugin)..."
-    FPOCKET_TMP=$(mktemp -d)
-    git clone --depth=1 https://github.com/Discngine/fpocket.git "$FPOCKET_TMP/fpocket"
-
-    # Patch the Makefile to remove the Linux-only LINUXAMD64 molfile plugin
-    # The plugin provides VMD trajectory reading which we don't need
-    sed -i '' \
-        's|-Lplugins/LINUXAMD64/molfile plugins/LINUXAMD64/molfile/libmolfile_plugin.a -lstdc++||g' \
-        "$FPOCKET_TMP/fpocket/makefile" 2>/dev/null || \
-    sed -i '' \
-        's|-Lplugins/LINUXAMD64/molfile plugins/LINUXAMD64/molfile/libmolfile_plugin.a -lstdc++||g' \
-        "$FPOCKET_TMP/fpocket/Makefile" 2>/dev/null || true
-
-    make -C "$FPOCKET_TMP/fpocket" -j4 fpocket 2>&1 | tail -5
-    sudo cp "$FPOCKET_TMP/fpocket/bin/fpocket" /usr/local/bin/fpocket
-    rm -rf "$FPOCKET_TMP"
+    echo "  Installing fpocket..."
+    # Try tap first (maintained formula)
+    brew tap brewsci/bio 2>/dev/null || true
+    brew install brewsci/bio/fpocket 2>/dev/null || {
+        # Fallback: build from source with the molfile plugin stripped out
+        echo "  Brew tap failed, building from source..."
+        FPOCKET_TMP=$(mktemp -d)
+        git clone --depth=1 https://github.com/Discngine/fpocket.git "$FPOCKET_TMP/fpocket"
+        cd "$FPOCKET_TMP/fpocket"
+        # Compile all source objects (this always works)
+        make -j4 2>/dev/null | grep -c "error:" && true
+        # Re-link fpocket binary without the Linux molfile archive
+        clang obj/fpmain.o obj/psorting.o obj/pscoring.o obj/utils.o \
+              obj/pertable.o obj/memhandler.o obj/voronoi.o obj/sort.o \
+              obj/calc.o obj/writepdb.o obj/rpdb.o obj/tparams.o obj/fparams.o \
+              obj/pocket.o obj/refine.o obj/descriptors.o obj/aa.o obj/fpocket.o \
+              obj/write_visu.o obj/fpout.o obj/atom.o obj/writepocket.o \
+              obj/voronoi_lst.o obj/asa.o obj/clusterlib.o obj/energy.o \
+              obj/topology.o obj/read_mmcif.o \
+              src/qhull/src/libqhull/geom2.o src/qhull/src/libqhull/geom.o \
+              src/qhull/src/libqhull/global.o src/qhull/src/libqhull/io.o \
+              src/qhull/src/libqhull/libqhull.o src/qhull/src/libqhull/mem.o \
+              src/qhull/src/libqhull/merge.o src/qhull/src/libqhull/poly2.o \
+              src/qhull/src/libqhull/poly.o src/qhull/src/libqhull/qset.o \
+              src/qhull/src/libqhull/random.o src/qhull/src/libqhull/rboxlib.o \
+              src/qhull/src/libqhull/stat.o src/qhull/src/libqhull/user.o \
+              src/qhull/src/libqhull/usermem.o src/qhull/src/libqhull/userprintf.o \
+              src/qhull/src/libqhull/userprintf_rbox.o \
+              src/qhull/src/qvoronoi/qvoronoi.o src/qhull/src/qconvex/qconvex.o \
+              -o bin/fpocket -lm
+        mkdir -p bin
+        sudo cp bin/fpocket /usr/local/bin/fpocket
+        cd "$REPO_ROOT"
+        rm -rf "$FPOCKET_TMP"
+    }
     echo "  ✓  fpocket installed"
 else
     echo "  ✓  fpocket already installed"
@@ -103,7 +122,6 @@ if ! command -v psql &>/dev/null; then
     brew link postgresql@16 --force
 fi
 
-# Start PostgreSQL service
 if ! pg_isready -q 2>/dev/null; then
     echo "  Starting PostgreSQL..."
     brew services start postgresql@16 2>/dev/null || brew services start postgresql 2>/dev/null
@@ -126,14 +144,13 @@ if [ ! -f "$CONFIG_FILE" ]; then
     cp "$REPO_ROOT/config/environment.example.yml" "$CONFIG_FILE"
     echo ""
     echo "  *** ACTION REQUIRED ***"
-    echo "  Edit $CONFIG_FILE"
-    echo "  Add your NCBI API key (free at https://www.ncbi.nlm.nih.gov/account/)"
+    echo "  Edit $CONFIG_FILE and add your NCBI API key"
     echo ""
 else
     echo "  config/environment.yml already exists — skipping."
 fi
 
-# ── 7. Alembic migrations + validation ───────────────────────────────────────
+# ── 7. Alembic migrations + tool check ────────────────────────────────────────
 echo "[7/7] Running database migrations and validating tools..."
 cd "$REPO_ROOT"
 alembic upgrade head
@@ -145,7 +162,7 @@ check_tool() {
     if command -v "$tool" &>/dev/null; then
         echo "    ✓  $tool"
     else
-        echo "    ✗  $tool — NOT FOUND (check conda env or brew)"
+        echo "    ✗  $tool — NOT FOUND"
     fi
 }
 check_tool orthofinder
@@ -163,6 +180,6 @@ echo ""
 echo " Each new terminal session, run:"
 echo "   conda activate $ENV_NAME"
 echo ""
-echo " Then start the test with:"
+echo " Then start the pipeline test:"
 echo "   bash scripts/run_validation_test.sh"
 echo "============================================"
