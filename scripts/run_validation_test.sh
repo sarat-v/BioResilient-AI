@@ -69,9 +69,34 @@ echo ">>> Switching to test species registry (8 species)..."
 cp config/species_registry_test.json config/species_registry.json
 
 # Wipe any prior test run state so steps don't appear pre-complete
-echo ">>> Clearing prior pipeline state..."
+echo ">>> Clearing prior pipeline state and data artifacts..."
 rm -f pipeline_state.json pipeline_cache.json pipeline.log pipeline_test.log
+# Remove computed data (but keep downloaded proteomes if present to save NCBI bandwidth)
 rm -f data/aligned_orthogroups.pkl data/motifs_by_og.pkl 2>/dev/null || true
+rm -rf data/alignments/ data/hyphy/ data/phylo/ data/orthofinder_out/ 2>/dev/null || true
+echo "    State files cleared."
+echo "    NOTE: data/proteomes/ kept intact (re-download skipped if already present)"
+echo ""
+
+# Drop and recreate database tables (full clean slate)
+echo ">>> Resetting database to clean state..."
+python3 - <<'PYEOF'
+import sys
+sys.path.insert(0, '.')
+from db.session import get_engine
+from db.models import Base
+from sqlalchemy import text
+
+engine = get_engine()
+try:
+    Base.metadata.drop_all(engine)
+    print("    Dropped all tables.")
+    Base.metadata.create_all(engine)
+    print("    Recreated all tables.")
+except Exception as e:
+    print(f"    ERROR: {e}")
+    sys.exit(1)
+PYEOF
 
 # Seed the database with test species
 echo ">>> Seeding database with test species..."
