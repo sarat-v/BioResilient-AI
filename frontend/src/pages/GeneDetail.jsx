@@ -4,7 +4,7 @@ import { motion } from 'framer-motion'
 import {
   RadarChart, Radar, PolarGrid, PolarAngleAxis, ResponsiveContainer, Tooltip,
 } from 'recharts'
-import { ArrowLeft, ExternalLink, Shield, Pill, Dna, Activity, Info, FileText, Loader2 } from 'lucide-react'
+import { ArrowLeft, ExternalLink, Shield, Pill, Dna, Activity, Info, FileText, Loader2, Syringe, AlertTriangle, Layers } from 'lucide-react'
 import { api } from '@/lib/api'
 import { TierBadge, ScoreBar, PageHeader, Spinner, EmptyState } from '@/components/ui'
 import { formatFloat, cn } from '@/lib/utils'
@@ -250,6 +250,14 @@ export default function GeneDetail() {
                 <KV label="BUSTED p-value" value={scores.busted_pvalue.toExponential(2)} mono
                   tooltip="Gene-wide episodic selection test p-value (BUSTED). <0.05 = gene has experienced positive selection." />
               )}
+              {ev.relax_k != null && (
+                <KV label="RELAX k" value={formatFloat(ev.relax_k)} mono
+                  tooltip="RELAX selection intensity parameter. k>1 = stronger selection in resilient branches; k<1 = relaxed selection." />
+              )}
+              {ev.relax_pvalue != null && (
+                <KV label="RELAX p-value" value={ev.relax_pvalue.toExponential(2)} mono
+                  tooltip="RELAX p-value for branch-specific selection rate shift. <0.05 = significant rate change." />
+              )}
             </div>
           </Section>
 
@@ -428,6 +436,94 @@ export default function GeneDetail() {
                     <KV label="P2Rank pockets" value={gene.drug_target.p2rank_pocket_count} mono />
                   </>
                 )}
+              </div>
+            </Section>
+          )}
+
+          {gene.gene_therapy && (
+            <Section title="Gene Therapy Feasibility" icon={Syringe}>
+              <div className="grid grid-cols-2 gap-x-8">
+                <KV label="Gene size (bp)" value={gene.gene_therapy.gene_size_bp?.toLocaleString()} mono
+                  tooltip="Coding sequence size. AAV payload limit is ~4.7 kb." />
+                <KV label="AAV compatible" value={gene.gene_therapy.aav_compatible ? 'Yes' : 'No'}
+                  tooltip="Whether the gene fits within AAV packaging constraints." />
+                <KV label="CRISPR guide sites" value={gene.gene_therapy.crispr_sites} mono
+                  tooltip="Number of valid CRISPR guide RNA sites with acceptable on-target scores." />
+                <KV label="Off-target risk" value={gene.gene_therapy.offtarget_risk}
+                  tooltip="Predicted CRISPR off-target risk level." />
+                {gene.gene_therapy.tissue_tropism?.length > 0 && (
+                  <KV label="AAV tissue tropism" value={gene.gene_therapy.tissue_tropism.join(', ')}
+                    tooltip="AAV serotypes with tropism for the relevant tissue." />
+                )}
+              </div>
+            </Section>
+          )}
+
+          {gene.safety && (
+            <Section title="Safety Profile" icon={AlertTriangle}>
+              <div className="grid grid-cols-2 gap-x-8">
+                <KV label="Essential gene" value={gene.safety.is_essential ? 'Yes' : 'No'}
+                  tooltip="pLI > 0.9 indicates loss-of-function intolerance." />
+                <KV label="Hub gene risk" value={gene.safety.hub_risk ? 'Yes' : 'No'}
+                  tooltip="Network degree > 50 in STRING protein-protein interaction network." />
+                <KV label="Network degree" value={gene.safety.network_degree} mono
+                  tooltip="Number of protein-protein interactions in STRING." />
+                <KV label="Protein family size" value={gene.safety.family_size} mono
+                  tooltip="Large families increase off-target risk from cross-reactivity." />
+                {gene.safety.depmap_score != null && (
+                  <KV label="DepMap essentiality" value={gene.safety.depmap_score.toFixed(3)} mono
+                    tooltip="DepMap CRISPR chronos score. More negative = more essential across cancer cell lines. <-0.5 = broadly essential." />
+                )}
+                {gene.safety.gtex_tissue_count != null && (
+                  <KV label="GTEx tissues expressed" value={gene.safety.gtex_tissue_count} mono
+                    tooltip="Number of tissues with TPM > 1 in GTEx. >30 = ubiquitous expression, harder to target safely." />
+                )}
+                {gene.safety.gtex_max_tpm != null && (
+                  <KV label="GTEx max TPM" value={gene.safety.gtex_max_tpm.toFixed(1)} mono
+                    tooltip="Maximum median TPM across all GTEx tissues." />
+                )}
+                {gene.safety.phewas_hits && Object.keys(gene.safety.phewas_hits).length > 0 && (
+                  <div className="col-span-2 mt-2">
+                    <p className="text-xs text-text-muted mb-1">PheWAS associations</p>
+                    <div className="flex flex-wrap gap-1.5">
+                      {Object.entries(gene.safety.phewas_hits).slice(0, 10).map(([trait, pval]) => (
+                        <span key={trait} className="px-2 py-0.5 rounded text-[10px] bg-white/5 text-text-muted border border-white/8">
+                          {trait}: {Number(pval).toExponential(1)}
+                        </span>
+                      ))}
+                    </div>
+                  </div>
+                )}
+              </div>
+            </Section>
+          )}
+
+          {gene.regulatory?.length > 0 && (
+            <Section title="Regulatory Divergence (AlphaGenome)" icon={Layers}>
+              <p className="text-xs text-text-muted mb-3">Non-coding sequence changes near promoter regions predicted by AlphaGenome.</p>
+              <div className="overflow-x-auto">
+                <table className="w-full text-sm">
+                  <thead>
+                    <tr className="border-b border-white/5">
+                      <th className="label-muted text-left py-2 pr-4">Species</th>
+                      <th className="label-muted text-left py-2 pr-4">Promoter Divergence</th>
+                      <th className="label-muted text-left py-2 pr-4">Expression log2FC</th>
+                      <th className="label-muted text-left py-2 pr-4">Lineages</th>
+                      <th className="label-muted text-left py-2">Score</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {gene.regulatory.map((r, i) => (
+                      <tr key={i} className="border-b border-white/3 hover:bg-elevated">
+                        <td className="py-2 pr-4 text-text-primary capitalize">{r.species_id?.replace(/_/g, ' ')}</td>
+                        <td className="py-2 pr-4 font-mono text-xs text-text-muted">{formatFloat(r.promoter_divergence)}</td>
+                        <td className="py-2 pr-4 font-mono text-xs text-text-muted">{formatFloat(r.expression_log2fc)}</td>
+                        <td className="py-2 pr-4 font-mono text-xs text-text-muted">{r.lineage_count ?? '—'}</td>
+                        <td className="py-2 font-mono text-xs text-accent">{formatFloat(r.regulatory_score)}</td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
               </div>
             </Section>
           )}

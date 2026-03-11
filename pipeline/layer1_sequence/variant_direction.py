@@ -33,8 +33,10 @@ GNOMAD_API = "https://gnomad.broadinstitute.org/api"
 GNOMAD_GENE_QUERY = """
 {
   gene(gene_symbol: "%s", reference_genome: GRCh38) {
-    pLI
-    LOEUF: gnomad_constraint { loe_uf }
+    gnomad_constraint {
+      pLI
+      oe_lof_upper
+    }
   }
 }
 """
@@ -65,17 +67,13 @@ def _fetch_loeuf(gene_symbol: str) -> Optional[float]:
         if r.status_code == 200:
             data = r.json()
             gene_data = data.get("data", {}).get("gene", {})
-            # Try gnomad_constraint first, then pLI as fallback
-            constraint = gene_data.get("LOEUF", {})
-            if isinstance(constraint, dict):
-                loeuf = constraint.get("loe_uf")
-            else:
-                loeuf = None
-            # pLI fallback: invert (pLI close to 1 = intolerant → low LOEUF equivalent)
+            constraint = gene_data.get("gnomad_constraint") or {}
+            loeuf = constraint.get("oe_lof_upper")
+            # pLI fallback: invert (pLI close to 1 = intolerant -> low LOEUF equivalent)
             if loeuf is None:
-                pli = gene_data.get("pLI")
+                pli = constraint.get("pLI")
                 if pli is not None:
-                    loeuf = 1.0 - float(pli)   # approximate
+                    loeuf = 1.0 - float(pli)
             _loeuf_cache[gene_symbol] = float(loeuf) if loeuf is not None else None
             return _loeuf_cache[gene_symbol]
     except Exception as exc:

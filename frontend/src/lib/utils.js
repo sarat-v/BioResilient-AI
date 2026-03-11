@@ -15,6 +15,7 @@ export function formatFloat(v, decimals = 3) {
 }
 
 export function tierBadgeClass(tier) {
+  if (tier === 'Validated') return 'badge-validated'
   if (tier === 'Tier1') return 'badge-tier1'
   if (tier === 'Tier2') return 'badge-tier2'
   return 'badge-tier3'

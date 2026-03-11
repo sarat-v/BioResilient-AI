@@ -14,7 +14,10 @@ from db.models import (
     DrugTarget,
     EvolutionScore,
     Gene,
+    GeneTherapyScore,
     Ortholog,
+    RegulatoryDivergence,
+    SafetyFlag,
 )
 from db.session import get_session
 
@@ -93,6 +96,33 @@ class DrugTargetOut(BaseModel):
     p2rank_pocket_count: Optional[int] = None
 
 
+class GeneTherapyOut(BaseModel):
+    gene_size_bp: Optional[int]
+    aav_compatible: Optional[bool]
+    tissue_tropism: Optional[list[str]]
+    crispr_sites: Optional[int]
+    offtarget_risk: Optional[str]
+
+
+class SafetyOut(BaseModel):
+    is_essential: Optional[bool]
+    phewas_hits: Optional[dict]
+    network_degree: Optional[int]
+    hub_risk: Optional[bool]
+    family_size: Optional[int]
+    depmap_score: Optional[float] = None
+    gtex_tissue_count: Optional[int] = None
+    gtex_max_tpm: Optional[float] = None
+
+
+class RegulatoryOut(BaseModel):
+    species_id: str
+    promoter_divergence: Optional[float]
+    expression_log2fc: Optional[float]
+    lineage_count: Optional[int]
+    regulatory_score: Optional[float]
+
+
 class CandidateListItem(BaseModel):
     gene_id: str
     gene_symbol: str
@@ -118,6 +148,9 @@ class CandidateDetail(BaseModel):
     orthologs: list[OrthologOut] = []
     disease: Optional[DiseaseOut] = None
     drug_target: Optional[DrugTargetOut] = None
+    gene_therapy: Optional[GeneTherapyOut] = None
+    safety: Optional[SafetyOut] = None
+    regulatory: list[RegulatoryOut] = []
     narrative: Optional[str] = None
     updated_at: Optional[str]
 
@@ -134,6 +167,7 @@ def list_candidates(
     trait_id: Optional[str] = Query(None, description="Trait preset id (e.g. cancer_resistance). Omit for default."),
     pathway: Optional[str] = Query(None, description="Filter by GO term or pathway ID (gene must have this in go_terms or pathway_ids)"),
     in_functional_domain: Optional[bool] = Query(None, description="If true, only return genes with at least one motif in a Pfam/InterPro domain"),
+    variant_direction: Optional[str] = Query(None, description="Filter by motif variant direction: gain_of_function, loss_of_function, likely_pathogenic, neutral"),
     limit: int = Query(100, ge=1, le=1000),
     offset: int = Query(0, ge=0),
     min_score: Optional[float] = Query(None, description="Minimum composite score"),
@@ -161,12 +195,20 @@ def list_candidates(
                 )
             )
         if in_functional_domain is True:
-            # Only genes with at least one motif in a Pfam/InterPro domain
             q = q.filter(
                 Gene.id.in_(
                     session.query(Ortholog.gene_id)
                     .join(DivergentMotif, DivergentMotif.ortholog_id == Ortholog.id)
                     .filter(DivergentMotif.in_functional_domain.is_(True))
+                    .distinct()
+                )
+            )
+        if variant_direction:
+            q = q.filter(
+                Gene.id.in_(
+                    session.query(Ortholog.gene_id)
+                    .join(DivergentMotif, DivergentMotif.ortholog_id == Ortholog.id)
+                    .filter(DivergentMotif.motif_direction == variant_direction)
                     .distinct()
                 )
             )
@@ -346,6 +388,47 @@ def get_candidate(gene_id: str, trait_id: Optional[str] = Query(None, descriptio
                 p2rank_pocket_count=getattr(dt, "p2rank_pocket_count", None),
             )
 
+        gt = session.get(GeneTherapyScore, gene_id)
+        gene_therapy_out = None
+        if gt:
+            gene_therapy_out = GeneTherapyOut(
+                gene_size_bp=gt.gene_size_bp,
+                aav_compatible=gt.aav_compatible,
+                tissue_tropism=gt.tissue_tropism or [],
+                crispr_sites=gt.crispr_sites,
+                offtarget_risk=gt.offtarget_risk,
+            )
+
+        sf = session.get(SafetyFlag, gene_id)
+        safety_out = None
+        if sf:
+            safety_out = SafetyOut(
+                is_essential=sf.is_essential,
+                phewas_hits=sf.phewas_hits,
+                network_degree=sf.network_degree,
+                hub_risk=sf.hub_risk,
+                family_size=sf.family_size,
+                depmap_score=getattr(sf, "depmap_score", None),
+                gtex_tissue_count=getattr(sf, "gtex_tissue_count", None),
+                gtex_max_tpm=getattr(sf, "gtex_max_tpm", None),
+            )
+
+        reg_rows = (
+            session.query(RegulatoryDivergence)
+            .filter(RegulatoryDivergence.gene_id == gene_id)
+            .all()
+        )
+        regulatory_out = [
+            RegulatoryOut(
+                species_id=r.species_id,
+                promoter_divergence=r.promoter_divergence,
+                expression_log2fc=r.expression_log2fc,
+                lineage_count=r.lineage_count,
+                regulatory_score=r.regulatory_score,
+            )
+            for r in reg_rows
+        ]
+
         return CandidateDetail(
             gene_id=gene.id,
             gene_symbol=gene.gene_symbol,
@@ -359,6 +442,9 @@ def get_candidate(gene_id: str, trait_id: Optional[str] = Query(None, descriptio
             orthologs=orthologs_out,
             disease=disease_out,
             drug_target=drug_target_out,
+            gene_therapy=gene_therapy_out,
+            safety=safety_out,
+            regulatory=regulatory_out,
             narrative=getattr(gene, "narrative", None),
             updated_at=cs.updated_at.isoformat() if cs.updated_at else None,
         )

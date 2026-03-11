@@ -42,4 +42,5 @@ export const api = {
   generateNarrative: (body) => post('/research/narrative', body),
   getPathways: () => get('/research/pathways'),
   getTraits: () => get('/research/traits'),
+  getPathwayConvergence: (params) => get('/research/pathway-convergence', params),
 }

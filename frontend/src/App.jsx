@@ -7,6 +7,7 @@ import CandidatesPage from '@/pages/Candidates'
 import GeneDetail from '@/pages/GeneDetail'
 import SpeciesPage from '@/pages/Species'
 import ResearchAssistant from '@/pages/ResearchAssistant'
+import PathwayConvergencePage from '@/pages/PathwayConvergence'
 
 const PAGE_TRANSITION = {
   initial: { opacity: 0, x: 8 },
@@ -29,6 +30,7 @@ export default function App() {
           <Route path="/candidates" element={<Animated><CandidatesPage /></Animated>} />
           <Route path="/candidates/:id" element={<Animated><GeneDetail /></Animated>} />
           <Route path="/research" element={<Animated><ResearchAssistant /></Animated>} />
+          <Route path="/pathways" element={<Animated><PathwayConvergencePage /></Animated>} />
           <Route path="/species" element={<Animated><SpeciesPage /></Animated>} />
         </Routes>
       </AnimatePresence>

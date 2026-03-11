@@ -90,12 +90,12 @@
     "geo_search_terms": ["Somniosus microcephalus", "Greenland shark", "longevity"]
   },
   {
-    "id": "bowhead_rockfish",
+    "id": "rougheye_rockfish",
     "taxid": 161559,
     "name": "Sebastes aleutianus",
     "phenotype": ["longevity"],
     "genome_assembly": "GCF_021917145.1",
-    "lineage_group": "Sharks",
+    "lineage_group": "Fishes",
     "geo_search_terms": ["Sebastes aleutianus", "rougheye rockfish", "longevity"]
   },
   {

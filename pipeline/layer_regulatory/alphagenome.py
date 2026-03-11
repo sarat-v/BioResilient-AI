@@ -49,15 +49,21 @@ EFFECT_THRESHOLD = 0.3
 # Map species_id → lineage group (same as convergence module)
 LINEAGE_MAP = {
     "naked_mole_rat":      "Rodents",
+    "blind_mole_rat":      "Rodents",
     "damaraland_mole_rat": "Rodents",
     "ground_squirrel":     "Rodents",
     "spiny_mouse":         "Rodents",
     "bowhead_whale":       "Cetaceans",
+    "right_whale":         "Cetaceans",
     "little_brown_bat":    "Bats",
+    "brandts_bat":         "Bats",
     "greenland_shark":     "Sharks",
-    "bowhead_rockfish":    "Sharks",
+    "rougheye_rockfish":   "Fishes",
+    "amazon_parrot":       "Birds",
+    "budgerigar":          "Birds",
     "african_elephant":    "Proboscideans",
     "mouse_lemur":         "Primates",
+    "human":               "Primates",
     "axolotl":             "Salamanders",
 }
 

@@ -91,7 +91,14 @@ const COLUMNS = [
   },
 ]
 
-const TIER_OPTIONS = ['All', 'Tier1', 'Tier2', 'Tier3']
+const TIER_OPTIONS = ['All', 'Validated', 'Tier1', 'Tier2', 'Tier3']
+const DIRECTION_OPTIONS = [
+  { value: '', label: 'All directions' },
+  { value: 'loss_of_function', label: '↓ Loss-of-function' },
+  { value: 'gain_of_function', label: '↑ Gain-of-function' },
+  { value: 'likely_pathogenic', label: '⚠ Likely pathogenic' },
+  { value: 'neutral', label: 'Neutral' },
+]
 
 export default function CandidatesPage() {
   const [searchParams] = useSearchParams()
@@ -104,9 +111,13 @@ export default function CandidatesPage() {
   const [pathwayFilter, setPathwayFilter] = useState('')
   const [pathwayOptions, setPathwayOptions] = useState({ go_terms: [], pathway_ids: [] })
   const [sorting, setSorting] = useState([{ id: 'composite_score', desc: true }])
+  const [directionFilter, setDirectionFilter] = useState('')
+  const [traitId, setTraitId] = useState('')
+  const [traits, setTraits] = useState([])
 
   useEffect(() => {
     api.getPathways().then(d => setPathwayOptions(d || { go_terms: [], pathway_ids: [] })).catch(() => {})
+    api.getTraits().then(setTraits).catch(() => [])
   }, [])
 
   useEffect(() => {
@@ -114,10 +125,12 @@ export default function CandidatesPage() {
     const params = { limit: 1000 }
     if (speciesIdFromUrl) params.species_id = speciesIdFromUrl
     if (pathwayFilter) params.pathway = pathwayFilter
+    if (traitId) params.trait_id = traitId
+    if (directionFilter) params.variant_direction = directionFilter
     api.getCandidates(params)
       .then(d => { setAllData(d ?? []); setLoading(false) })
       .catch(() => setLoading(false))
-  }, [speciesIdFromUrl, pathwayFilter])
+  }, [speciesIdFromUrl, pathwayFilter, traitId, directionFilter])
 
   const filtered = useMemo(() => {
     return allData.filter(c => {
@@ -159,6 +172,20 @@ export default function CandidatesPage() {
           />
         </div>
 
+        {/* Trait preset */}
+        {traits.length > 0 && (
+          <select
+            value={traitId}
+            onChange={e => setTraitId(e.target.value)}
+            className="px-3 py-2 bg-surface border border-white/8 rounded-lg text-sm text-text-primary focus:outline-none focus:border-accent/50 min-w-[150px]"
+          >
+            <option value="">Default analysis</option>
+            {traits.map(t => (
+              <option key={t.id} value={t.id}>{t.label}</option>
+            ))}
+          </select>
+        )}
+
         {/* Pathway / biological process */}
         <select
           value={pathwayFilter}
@@ -171,6 +198,17 @@ export default function CandidatesPage() {
           ))}
           {pathwayOptions.pathway_ids?.slice(0, 30).map(pid => (
             <option key={pid} value={pid}>{pid}</option>
+          ))}
+        </select>
+
+        {/* Variant direction filter */}
+        <select
+          value={directionFilter}
+          onChange={e => setDirectionFilter(e.target.value)}
+          className="px-3 py-2 bg-surface border border-white/8 rounded-lg text-sm text-text-primary focus:outline-none focus:border-accent/50 min-w-[160px]"
+        >
+          {DIRECTION_OPTIONS.map(d => (
+            <option key={d.value} value={d.value}>{d.label}</option>
           ))}
         </select>
 

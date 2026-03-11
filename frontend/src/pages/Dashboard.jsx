@@ -15,7 +15,7 @@ const FADE_UP = (i) => ({
   transition: { delay: i * 0.07, duration: 0.4, ease: 'easeOut' },
 })
 
-const TIER_COLOR = { Tier1: '#7c3aed', Tier2: '#f59e0b', Tier3: '#334155' }
+const TIER_COLOR = { Validated: '#10b981', Tier1: '#7c3aed', Tier2: '#f59e0b', Tier3: '#334155' }
 
 function StatusPill({ status }) {
   const map = {
@@ -58,6 +58,7 @@ export default function Dashboard() {
     })
   }, [traitId])
 
+  const validated = candidates?.filter(c => c.tier === 'Validated').length ?? 0
   const tier1 = candidates?.filter(c => c.tier === 'Tier1').length ?? 0
   const tier2 = candidates?.filter(c => c.tier === 'Tier2').length ?? 0
   const tier3 = candidates?.filter(c => c.tier === 'Tier3').length ?? 0
@@ -99,8 +100,9 @@ export default function Dashboard() {
       ) : (
         <>
           {/* Tier summary cards */}
-          <div className="grid grid-cols-2 lg:grid-cols-4 gap-4">
+          <div className="grid grid-cols-2 lg:grid-cols-5 gap-4">
             {[
+              { label: 'Validated', value: validated, sub: 'Evolutionary + human genetic evidence', accent: true },
               { label: 'Tier 1 Candidates', value: tier1, sub: 'High-confidence targets', accent: true },
               { label: 'Tier 2 Candidates', value: tier2, sub: 'Promising — needs validation' },
               { label: 'Tier 3 Candidates', value: tier3, sub: 'Low priority' },

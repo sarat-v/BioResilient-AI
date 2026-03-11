@@ -36,6 +36,10 @@
     @apply inline-flex items-center gap-2 px-4 py-2 text-text-muted font-medium rounded-lg
            hover:bg-white/5 hover:text-text-primary transition-all duration-150;
   }
+  .badge-validated {
+    @apply inline-flex items-center px-2.5 py-0.5 rounded-full text-xs font-semibold
+           bg-emerald-500/20 text-emerald-300 ring-1 ring-emerald-500/30;
+  }
   .badge-tier1 {
     @apply inline-flex items-center px-2.5 py-0.5 rounded-full text-xs font-semibold
            bg-accent-warm/20 text-purple-300 ring-1 ring-purple-500/30 shadow-tier1-glow;

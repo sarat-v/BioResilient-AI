@@ -446,15 +446,12 @@ def step6c_relax(dry_run: bool = False) -> None:
         return
 
     with open(_cache_path, "rb") as f:
-        aligned = pickle.load(f)
+        cached = pickle.load(f)
 
-    motifs_pkl = Path(get_storage_root()) / "motifs_by_og.pkl"
-    motifs_by_og: dict = {}
-    if motifs_pkl.exists():
-        with open(motifs_pkl, "rb") as f:
-            motifs_by_og = pickle.load(f)
+    aligned = cached.get("aligned", {})
+    motifs_by_og = cached.get("motifs_by_og", {})
 
-    treefile = Path(get_storage_root()) / "species.treefile"
+    treefile = Path(get_storage_root()) / "phylo" / "species.treefile"
     if not treefile.exists():
         log.warning("  Species treefile not found; skipping step 6c.")
         return
@@ -913,6 +910,15 @@ def run_pipeline(
                     species_list, dry_run=dry_run
                 )
 
+            elif step_name == "step4b":
+                step4b_domain_and_consequence(dry_run=dry_run)
+
+            elif step_name == "step4c":
+                step4c_esm1v(dry_run=dry_run)
+
+            elif step_name == "step4d":
+                step4d_variant_direction(dry_run=dry_run)
+
             elif step_name == "step5":
                 treefile = step5_phylogenetic_tree(aligned_orthogroups, dry_run=dry_run)
 
@@ -927,11 +933,23 @@ def run_pipeline(
                         aligned_for_hyphy, motifs_by_og, treefile, dry_run=dry_run
                     )
 
+            elif step_name == "step6b":
+                step6b_fel_busted(dry_run=dry_run)
+
+            elif step_name == "step6c":
+                step6c_relax(dry_run=dry_run)
+
             elif step_name == "step7":
                 step7_convergence(dry_run=dry_run)
 
+            elif step_name == "step7b":
+                step7b_convergent_aa(dry_run=dry_run)
+
             elif step_name == "step8":
                 step8_expression(species_list, dry_run=dry_run)
+
+            elif step_name == "step8b":
+                step8b_bgee(dry_run=dry_run)
 
             elif step_name == "step9":
                 step9_composite_score(dry_run=dry_run)
@@ -945,14 +963,29 @@ def run_pipeline(
             elif step_name == "step11":
                 step11_disease_annotation(dry_run=dry_run)
 
+            elif step_name == "step11b":
+                step11b_rare_variants(dry_run=dry_run)
+
+            elif step_name == "step11c":
+                step11c_literature(dry_run=dry_run)
+
+            elif step_name == "step11d":
+                step11d_pathway_convergence(dry_run=dry_run)
+
             elif step_name == "step12":
                 step12_druggability(dry_run=dry_run)
+
+            elif step_name == "step12b":
+                step12b_p2rank(dry_run=dry_run)
 
             elif step_name == "step13":
                 step13_gene_therapy(dry_run=dry_run)
 
             elif step_name == "step14":
                 step14_safety(dry_run=dry_run)
+
+            elif step_name == "step14b":
+                step14b_depmap_gtex(dry_run=dry_run)
 
             elif step_name == "step15":
                 step15_rescore(dry_run=dry_run)

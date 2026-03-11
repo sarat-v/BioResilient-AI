@@ -1,5 +1,5 @@
 import { NavLink } from 'react-router-dom'
-import { LayoutDashboard, FlaskConical, Dna, TreePine, Activity, FileText } from 'lucide-react'
+import { LayoutDashboard, FlaskConical, Dna, TreePine, Activity, FileText, Route } from 'lucide-react'
 import { cn } from '@/lib/utils'
 
 const NAV = [
@@ -7,7 +7,8 @@ const NAV = [
   { to: '/pipeline',  icon: Activity,        label: 'Pipeline'   },
   { to: '/candidates',icon: FlaskConical,    label: 'Candidates' },
   { to: '/research',  icon: FileText,        label: 'Research'    },
-  { to: '/species',   icon: TreePine,       label: 'Species'    },
+  { to: '/pathways',  icon: Route,           label: 'Pathways'   },
+  { to: '/species',   icon: TreePine,        label: 'Species'    },
 ]
 
 export default function Layout({ children }) {
