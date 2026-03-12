@@ -46,6 +46,7 @@ eval "$(conda shell.bash hook)"
 # ── 3. Conda environment ─────────────────────────────────────────────────────
 echo "[3/7] Creating conda environment (includes minimap2 + PHAST)..."
 conda env update --file "$REPO_ROOT/environment.yml" --prune
+export LD_LIBRARY_PATH="${LD_LIBRARY_PATH:-}"
 conda activate "$ENV_NAME"
 
 # Install tools that need bioconda and may not be in environment.yml
