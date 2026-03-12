@@ -33,13 +33,49 @@ def _orthofinder_output_dir(proteomes_dir: Path) -> Optional[Path]:
     return None
 
 
+def _prepare_orthofinder_input(proteomes_dir: Path) -> Path:
+    """Build a staging dir with only valid .reheadered.faa (one per species).
+
+    OrthoFinder must see exactly one FASTA per species. The download step leaves
+    both raw .faa and .reheadered.faa in proteomes_dir; failed species (e.g. 0 proteins)
+    can leave empty/invalid .faa. Using only .reheadered.faa avoids duplicates and
+    invalid inputs that break DIAMOND makedb.
+    """
+    root = Path(get_local_storage_root())
+    staging = root / "orthofinder_input"
+    staging.mkdir(parents=True, exist_ok=True)
+    for p in staging.iterdir():
+        p.unlink()
+
+    for src in sorted(proteomes_dir.glob("*.reheadered.faa")):
+        if src.stat().st_size < 100:
+            log.warning("  Skipping empty or tiny %s", src.name)
+            continue
+        # First line must be FASTA (">") for DIAMOND
+        with open(src) as f:
+            first = f.readline().strip()
+        if not first.startswith(">"):
+            log.warning("  Skipping non-FASTA %s", src.name)
+            continue
+        species_id = src.stem.replace(".reheadered", "")
+        dest = staging / f"{species_id}.fa"
+        if dest.exists():
+            dest.unlink()
+        dest.symlink_to(src.resolve())
+    n = len(list(staging.iterdir()))
+    log.info("  OrthoFinder input: %d species in %s", n, staging)
+    return staging
+
+
 def run_orthofinder(proteomes_dir: Path) -> Path:
     """Run OrthoFinder with DIAMOND on the proteomes directory.
 
     If a completed results directory already exists, reuse it (cache).
+    Builds a staging dir with only .reheadered.faa (one per species) so OrthoFinder
+    does not see raw .faa or invalid files.
 
     Args:
-        proteomes_dir: Directory containing one .faa file per species (reheadered).
+        proteomes_dir: Directory containing .faa and .reheadered.faa per species.
 
     Returns:
         Path to the OrthoFinder results directory.
@@ -57,6 +93,11 @@ def run_orthofinder(proteomes_dir: Path) -> Path:
         log.info("OrthoFinder results already exist — reusing cache: %s", existing)
         return existing
 
+    # Staging dir: only valid reheadered FASTA (one per species)
+    input_dir = _prepare_orthofinder_input(proteomes_dir)
+    if len(list(input_dir.iterdir())) == 0:
+        raise RuntimeError("No valid proteome files for OrthoFinder (check *.reheadered.faa in proteomes dir)")
+
     # Remove stale/incomplete output dir so OrthoFinder can create a fresh one
     if out_dir.exists():
         log.info("Removing stale OrthoFinder output dir: %s", out_dir)
@@ -65,7 +106,7 @@ def run_orthofinder(proteomes_dir: Path) -> Path:
 
     cmd = [
         "orthofinder",
-        "-f", str(proteomes_dir),
+        "-f", str(input_dir),
         "-S", "diamond",
         "-t", str(search_threads),
         "-a", str(align_threads),
@@ -81,6 +122,10 @@ def run_orthofinder(proteomes_dir: Path) -> Path:
     results_path = _orthofinder_output_dir(proteomes_dir)
     if results_path is None:
         raise FileNotFoundError("OrthoFinder output directory not found after run.")
+    if not (results_path / "Orthogroups" / "Orthogroups.tsv").exists():
+        raise FileNotFoundError(
+            "Orthogroups.tsv missing after OrthoFinder run (DIAMOND or OrthoFinder may have failed; check log above)"
+        )
 
     log.info("OrthoFinder complete → %s", results_path)
     return results_path
@@ -100,11 +145,15 @@ def parse_orthogroups(results_dir: Path, proteomes_dir: Path) -> pd.DataFrame:
     df.index.name = "og_id"
     df = df.reset_index()
 
-    # OrthoFinder creates two columns per species: one for original FAA and one
-    # for reheadered FAA. Keep only the reheadered columns (they contain our
-    # species-prefixed IDs like "human|...", "nmr|...").
-    reheadered_cols = ["og_id"] + [c for c in df.columns if "reheadered" in c]
-    df = df[reheadered_cols]
+    # When we feed only .reheadered.faa (as orthofinder_input/species.fa), columns
+    # are one per species (e.g. human, naked_mole_rat). When both raw and reheadered
+    # exist, keep only reheadered columns.
+    reheadered_cols = [c for c in df.columns if "reheadered" in c]
+    if reheadered_cols:
+        df = df[["og_id"] + reheadered_cols]
+    else:
+        species_cols = [c for c in df.columns if c != "og_id"]
+        df = df[["og_id"] + species_cols]
 
     # Keep only groups where human has at least one protein
     human_col = _find_species_column(df, "human")
@@ -164,9 +213,9 @@ def _col_to_species_id(col: str, proteomes_dir: Path) -> str:
 
 
 def load_sequence_map(proteomes_dir: Path) -> dict[str, dict[str, str]]:
-    """Build map: {species_id: {protein_id: sequence}} from FASTA files."""
+    """Build map: {species_id: {protein_id: sequence}} from reheadered FASTA files."""
     seq_map: dict[str, dict[str, str]] = {}
-    for faa in proteomes_dir.glob("*.faa"):
+    for faa in proteomes_dir.glob("*.reheadered.faa"):
         species_id = faa.stem.replace(".reheadered", "")
         seq_map[species_id] = {}
         for rec in SeqIO.parse(str(faa), "fasta"):
