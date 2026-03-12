@@ -42,18 +42,18 @@ if ! command -v aws &>/dev/null; then
 fi
 
 # ── 2. Conda ─────────────────────────────────────────────────────────────────
-if ! command -v conda &>/dev/null; then
+if ! command -v conda &>/dev/null && [[ ! -f "$HOME/miniconda3/bin/conda" ]]; then
     echo "[2/7] Installing Miniconda..."
     wget -q https://repo.anaconda.com/miniconda/Miniconda3-latest-Linux-x86_64.sh \
          -O /tmp/miniconda.sh
     bash /tmp/miniconda.sh -b -p "$HOME/miniconda3"
-    eval "$("$HOME/miniconda3/bin/conda" shell.bash hook)"
-    conda init bash
 else
     echo "[2/7] Conda already installed — skipping."
 fi
 
-eval "$(conda shell.bash hook)"
+# Always ensure conda is on PATH (works whether freshly installed or pre-existing)
+export PATH="$HOME/miniconda3/bin:$PATH"
+eval "$("$HOME/miniconda3/bin/conda" shell.bash hook)"
 
 # ── 3. Conda environment ─────────────────────────────────────────────────────
 echo "[3/7] Creating conda environment (includes minimap2 + PHAST)..."
