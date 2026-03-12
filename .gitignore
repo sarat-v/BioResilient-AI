@@ -38,6 +38,7 @@ data/orthofinder_out/
 data/alignments/
 data/geo_data/
 data/hyphy/
+data/phylo/
 data/genomes/
 !data/fixtures/
 
@@ -56,8 +57,10 @@ logs/
 .DS_Store
 Thumbs.db
 
-## IDE
+## IDE / editor
 .vscode/
 .idea/
+.cursor/
+.pip_deps/
 *.swp
 *.swo
