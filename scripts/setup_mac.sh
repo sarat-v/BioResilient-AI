@@ -4,7 +4,7 @@
 set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-ENV_NAME="bioresillient"
+ENV_NAME="bioresilient"
 
 echo "============================================"
 echo " BioResilient AI — Mac Setup"
@@ -128,7 +128,7 @@ if ! pg_isready -q 2>/dev/null; then
     sleep 3
 fi
 
-DB_NAME="bioresillient"
+DB_NAME="bioresilient"
 if psql -d "$DB_NAME" -c "" 2>/dev/null; then
     echo "  Database '$DB_NAME' already exists — skipping."
 else

@@ -51,7 +51,7 @@ def _proteomes_dir() -> Path:
     root = get_storage_root()
     if root.startswith("s3://"):
         # For cloud, still cache locally under /tmp
-        d = Path("/tmp/bioresillient/proteomes")
+        d = Path("/tmp/bioresilient/proteomes")
     else:
         d = Path(root) / "proteomes"
     d.mkdir(parents=True, exist_ok=True)

@@ -67,16 +67,16 @@ Your Mac
 │  EC2 Spot Instance (c6i.4xlarge)                             │
 │  16 vCPU / 32 GB RAM / Ubuntu 22.04                         │
 │  ┌──────────────────────────────────────────────┐           │
-│  │  bioresillient conda env                      │           │
+│  │  bioresilient conda env                      │           │
 │  │  run_cancer_resistance_stepwise.sh            │    ───►  │  S3 bucket
-│  │  step_cache/  (JSON + MD reports)             │           │  bioresillient-data
+│  │  step_cache/  (JSON + MD reports)             │           │  bioresilient-data
 │  └──────────────────────────────────────────────┘           │  ├── proteomes/
 │                      │                                       │  ├── genomes/
 │                      │                                       │  ├── nucleotide_regions/
 │                      │                                       │  ├── cache/
 │                      ▼                                       │  └── step_cache/
 │  RDS PostgreSQL 15 (db.t3.medium)                           └──────────────────
-│  bioresillient database (private — only EC2 can reach it)
+│  bioresilient database (private — only EC2 can reach it)
 └──────────────────────────────────────────────────────────────┘
 ```
 
@@ -141,7 +141,7 @@ You need a VPC with a public subnet so your EC2 instance gets a public IP
 **In AWS Console → VPC → Your VPCs → Create VPC:**
 ```
 Resources to create:  VPC and more
-Name tag:             bioresillient
+Name tag:             bioresilient
 IPv4 CIDR:            10.0.0.0/16
 Number of AZs:        1
 Public subnets:       1
@@ -154,17 +154,17 @@ Click **Create VPC**. This automatically creates the subnet, internet gateway, a
 
 Security group 1 (for your EC2 instance):
 ```
-Name:         bioresillient-ec2-sg
-VPC:          bioresillient-vpc
+Name:         bioresilient-ec2-sg
+VPC:          bioresilient-vpc
 Inbound rule: SSH | TCP | Port 22 | My IP   ← click "My IP", it fills automatically
 Outbound:     All traffic (default)
 ```
 
 Security group 2 (for RDS — no inbound from internet, only from EC2):
 ```
-Name:         bioresillient-rds-sg
-VPC:          bioresillient-vpc
-Inbound rule: PostgreSQL | TCP | Port 5432 | Custom → bioresillient-ec2-sg
+Name:         bioresilient-rds-sg
+VPC:          bioresilient-vpc
+Inbound rule: PostgreSQL | TCP | Port 5432 | Custom → bioresilient-ec2-sg
 Outbound:     All traffic (default)
 ```
 
@@ -180,18 +180,18 @@ Outbound:     All traffic (default)
 Engine:              PostgreSQL
 Engine version:      PostgreSQL 15.x (latest 15)
 Template:            Dev/Test
-DB instance ID:      bioresillient
-Master username:     bioresillient
+DB instance ID:      bioresilient
+Master username:     bioresilient
 Master password:     <create a strong password — save this, you'll need it later>
 Instance class:      db.t3.medium
 Storage:             20 GB gp2
 Storage autoscaling: Off
-VPC:                 bioresillient-vpc
+VPC:                 bioresilient-vpc
 Subnet group:        default (auto-created)
 Public access:       No
-VPC security group:  bioresillient-rds-sg  (remove the default sg)
+VPC security group:  bioresilient-rds-sg  (remove the default sg)
 Multi-AZ:            No
-DB name:             bioresillient
+DB name:             bioresilient
 ```
 
 Click **Create database**. It takes ~5 minutes to become available.
@@ -199,7 +199,7 @@ Click **Create database**. It takes ~5 minutes to become available.
 Once available, go to the database → **Connectivity & security** tab and note the
 **Endpoint** — it looks like:
 ```
-bioresillient.abc123xyz.us-east-1.rds.amazonaws.com
+bioresilient.abc123xyz.us-east-1.rds.amazonaws.com
 ```
 Save this. You will set it as `RDS_HOST` later.
 
@@ -210,22 +210,22 @@ Save this. You will set it as `RDS_HOST` later.
 
 ```bash
 # Create the bucket (replace us-east-1 with your region if different)
-aws s3 mb s3://bioresillient-data --region us-east-1
+aws s3 mb s3://bioresilient-data --region us-east-1
 
 # Block all public access
 aws s3api put-public-access-block \
-    --bucket bioresillient-data \
+    --bucket bioresilient-data \
     --public-access-block-configuration \
     "BlockPublicAcls=true,IgnorePublicAcls=true,BlockPublicPolicy=true,RestrictPublicBuckets=true"
 ```
 
 Verify it was created:
 ```bash
-aws s3 ls | grep bioresillient
+aws s3 ls | grep bioresilient
 ```
 
-> S3 bucket names are globally unique. If `bioresillient-data` is taken, use
-> `bioresillient-data-<your-initials>` and update `S3_BUCKET` accordingly throughout.
+> S3 bucket names are globally unique. If `bioresilient-data` is taken, use
+> `bioresilient-data-<your-initials>` and update `S3_BUCKET` accordingly throughout.
 
 ---
 
@@ -238,33 +238,33 @@ hard-coded credentials on the instance.
 ```bash
 # Create the role
 aws iam create-role \
-    --role-name bioresillient-ec2-role \
+    --role-name bioresilient-ec2-role \
     --assume-role-policy-document \
     '{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":{"Service":"ec2.amazonaws.com"},"Action":"sts:AssumeRole"}]}'
 
 # Attach S3 and RDS permissions
 aws iam attach-role-policy \
-    --role-name bioresillient-ec2-role \
+    --role-name bioresilient-ec2-role \
     --policy-arn arn:aws:iam::aws:policy/AmazonS3FullAccess
 
 aws iam attach-role-policy \
-    --role-name bioresillient-ec2-role \
+    --role-name bioresilient-ec2-role \
     --policy-arn arn:aws:iam::aws:policy/AmazonRDSFullAccess
 
 # Create an instance profile and attach the role
 aws iam create-instance-profile \
-    --instance-profile-name bioresillient-ec2-profile
+    --instance-profile-name bioresilient-ec2-profile
 
 aws iam add-role-to-instance-profile \
-    --instance-profile-name bioresillient-ec2-profile \
-    --role-name bioresillient-ec2-role
+    --instance-profile-name bioresilient-ec2-profile \
+    --role-name bioresilient-ec2-role
 ```
 
 Verify:
 ```bash
-aws iam get-instance-profile --instance-profile-name bioresillient-ec2-profile \
+aws iam get-instance-profile --instance-profile-name bioresilient-ec2-profile \
     --query 'InstanceProfile.Roles[0].RoleName'
-# Should print: "bioresillient-ec2-role"
+# Should print: "bioresilient-ec2-role"
 ```
 
 ---
@@ -273,17 +273,17 @@ aws iam get-instance-profile --instance-profile-name bioresillient-ec2-profile \
 **Where: AWS Console → EC2 → Launch instances**
 
 ```
-Name:             bioresillient-phase1
+Name:             bioresilient-phase1
 AMI:              Ubuntu Server 22.04 LTS (64-bit x86)
                   (search "ubuntu 22.04" in the AMI search — use the one from Canonical)
 Instance type:    c6i.4xlarge
 Key pair:         <select your existing key pair>
-Network:          bioresillient-vpc
+Network:          bioresilient-vpc
 Subnet:           the public subnet created in §1
 Auto-assign IP:   Enable
-Security group:   bioresillient-ec2-sg
+Security group:   bioresilient-ec2-sg
 Storage:          100 GB gp3  (change from the default 8 GB)
-IAM profile:      bioresillient-ec2-profile
+IAM profile:      bioresilient-ec2-profile
 ```
 
 **To use Spot pricing (saves ~60%):**
@@ -312,12 +312,12 @@ You are now inside the EC2 instance. Everything from here runs **on EC2**.
 sudo apt-get update && sudo apt-get install -y git
 
 # Clone the repo
-git clone https://github.com/<your-org>/bioresillient.git
-cd bioresillient
+git clone https://github.com/<your-org>/bioresilient.git
+cd bioresilient
 ```
 
 > **Tip:** Keep this SSH session open. If you disconnect, use
-> `ssh -i ~/.ssh/<key>.pem ubuntu@<ip>` again and `cd bioresillient` to resume.
+> `ssh -i ~/.ssh/<key>.pem ubuntu@<ip>` again and `cd bioresilient` to resume.
 > For long runs it's worth using `tmux` or `screen` so the pipeline keeps running
 > even if your laptop closes:
 > ```bash
@@ -339,9 +339,9 @@ nano ~/.bashrc
 Add these lines at the bottom (fill in your actual values):
 ```bash
 export DEPLOYMENT=cloud
-export RDS_HOST=bioresillient.xxxx.us-east-1.rds.amazonaws.com   # from §2
+export RDS_HOST=bioresilient.xxxx.us-east-1.rds.amazonaws.com   # from §2
 export RDS_PASSWORD=<the password you set in §2>
-export S3_BUCKET=bioresillient-data
+export S3_BUCKET=bioresilient-data
 export NCBI_API_KEY=<your-ncbi-key>    # free at ncbi.nlm.nih.gov/account — takes 30 sec
 export NCBI_EMAIL=<your-email>
 # Optional — pipeline works without these:
@@ -363,7 +363,7 @@ echo $S3_BUCKET
 ---
 
 ### 8. Bootstrap environment
-**Where: EC2 terminal, inside the `bioresillient` repo directory**
+**Where: EC2 terminal, inside the `bioresilient` repo directory**
 
 ```bash
 bash scripts/setup_cloud.sh
@@ -371,7 +371,7 @@ bash scripts/setup_cloud.sh
 
 This single script does everything:
 1. Installs Miniconda
-2. Creates the `bioresillient` conda environment from `environment.yml`
+2. Creates the `bioresilient` conda environment from `environment.yml`
 3. Installs all bioinformatics tools via conda/bioconda
 4. Writes `config/environment.yml` from your env vars
 5. Runs Alembic DB migrations against RDS
@@ -405,7 +405,7 @@ without them (steps 3c/3d produce NULL scores, validation emits `INFO` not `FAIL
 
 The setup script activates conda automatically, but if you start a new SSH session:
 ```bash
-conda activate bioresillient
+conda activate bioresilient
 ```
 
 Verify the DB connection works:
@@ -420,7 +420,7 @@ Should print: `DB OK: 1`
 
 Verify S3 access:
 ```bash
-aws s3 ls s3://bioresillient-data/
+aws s3 ls s3://bioresilient-data/
 ```
 Should list the prefixes created by the setup script (`proteomes/`, `genomes/`, etc.).
 
@@ -499,8 +499,8 @@ designed to survive this cleanly:
 3. Relaunch a new Spot instance with the **same IAM profile and env vars** and run:
 
 ```bash
-conda activate bioresillient
-cd bioresillient
+conda activate bioresilient
+cd bioresilient
 ./run_cancer_resistance_stepwise.sh --from <last-completed-step>
 ```
 
@@ -518,7 +518,7 @@ If you want to run step 4c on a GPU instance to save ~8 h of CPU time:
 
 # Launch a g4dn.xlarge with the same IAM role and env vars
 # On g4dn instance:
-conda activate bioresillient && cd bioresillient
+conda activate bioresilient && cd bioresilient
 ./run_cancer_resistance_stepwise.sh --only "step4c"
 
 # Return to c6i (or continue on g4dn) for the rest
@@ -542,11 +542,11 @@ watch -n 30 ls -lt step_cache/
 cat step_cache/<stepname>.md
 
 # Check the database is growing as expected
-psql -h $RDS_HOST -U bioresillient -d bioresillient \
+psql -h $RDS_HOST -U bioresilient -d bioresilient \
     -c "SELECT schemaname, relname, pg_size_pretty(pg_total_relation_size(relid))
         FROM pg_catalog.pg_statio_user_tables
         ORDER BY pg_total_relation_size(relid) DESC LIMIT 10;"
 
 # Check S3 data sizes
-aws s3 ls s3://bioresillient-data/ --recursive --human-readable --summarize | tail -3
+aws s3 ls s3://bioresilient-data/ --recursive --human-readable --summarize | tail -3
 ```

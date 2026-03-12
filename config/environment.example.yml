@@ -10,12 +10,12 @@ api:
   key: ''
 
 database:
-  local:  postgresql://localhost/bioresillient
-  cloud:  postgresql://${RDS_HOST}/bioresillient
+  local:  postgresql://localhost/bioresilient
+  cloud:  postgresql://${RDS_HOST}/bioresilient
 
 storage:
   local:  ./data/
-  cloud:  s3://bioresillient-data/
+  cloud:  s3://bioresilient-data/
 
 gpu:
   device: auto          # "cuda", "cpu", or "auto" (auto-detects at runtime)

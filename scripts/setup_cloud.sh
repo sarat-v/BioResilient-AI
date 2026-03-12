@@ -6,7 +6,7 @@
 set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-ENV_NAME="bioresillient"
+ENV_NAME="bioresilient"
 
 echo "============================================"
 echo " BioResilient AI — AWS Cloud Setup"
@@ -17,7 +17,10 @@ echo "============================================"
 : "${NCBI_EMAIL:?NCBI_EMAIL environment variable not set}"
 : "${RDS_HOST:?RDS_HOST environment variable not set (RDS endpoint)}"
 : "${RDS_PASSWORD:?RDS_PASSWORD environment variable not set (RDS master password)}"
-: "${S3_BUCKET:=bioresillient-data}"
+: "${S3_BUCKET:=bioresilient-data}"
+# Optional: RDS master username (default bioresilient; use postgres if you chose that at creation)
+RDS_USER="${RDS_USER:-bioresilient}"
+
 # Optional API keys (pipeline degrades gracefully without them)
 ALPHAGENOME_KEY="${ALPHAGENOME_API_KEY:-}"
 ANTHROPIC_KEY="${ANTHROPIC_API_KEY:-}"
@@ -65,8 +68,8 @@ cat > "$REPO_ROOT/config/environment.yml" <<EOF
 deployment: cloud
 
 database:
-  local:  postgresql://localhost/bioresillient
-  cloud:  postgresql://bioresillient:${RDS_PASSWORD}@${RDS_HOST}/bioresillient
+  local:  postgresql://localhost/bioresilient
+  cloud:  postgresql://${RDS_USER}:${RDS_PASSWORD}@${RDS_HOST}/bioresilient?sslmode=require
 
 storage:
   local:  ./data/

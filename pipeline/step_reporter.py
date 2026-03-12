@@ -320,7 +320,7 @@ def _collect_step2() -> dict:
     from pipeline.config import get_storage_root, get_deployment
     storage = get_storage_root()
     if storage.startswith("s3://"):
-        proteomes_dir = Path("/tmp/bioresillient/proteomes")
+        proteomes_dir = Path("/tmp/bioresilient/proteomes")
     else:
         proteomes_dir = Path(storage) / "proteomes"
 

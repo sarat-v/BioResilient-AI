@@ -58,7 +58,7 @@ _RATE_SLEEP       = 0.11   # 10 req/s with API key
 def _genomes_dir(species_id: str) -> Path:
     root = get_storage_root()
     if root.startswith("s3://"):
-        base = Path("/tmp/bioresillient/genomes")
+        base = Path("/tmp/bioresilient/genomes")
     else:
         base = Path(root) / "genomes"
     d = base / species_id

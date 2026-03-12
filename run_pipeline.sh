@@ -7,13 +7,13 @@
 #
 # Prerequisites:
 #   1. bash scripts/setup_local.sh        # One-time setup (Linux/WSL2)
-#   2. conda activate bioresillient       # Activate environment
+#   2. conda activate bioresilient       # Activate environment
 #   3. Edit config/environment.yml        # Add NCBI API key and DB settings
 
 set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-ENV_NAME="bioresillient"
+ENV_NAME="bioresilient"
 LOG_FILE="$REPO_ROOT/pipeline.log"
 STATE_FILE="$REPO_ROOT/pipeline_cache.json"
 

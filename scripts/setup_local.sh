@@ -4,7 +4,7 @@
 set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-ENV_NAME="bioresillient"
+ENV_NAME="bioresilient"
 
 echo "============================================"
 echo " BioResilient AI — Local Setup"
@@ -52,7 +52,7 @@ if ! pg_isready -q; then
     sudo service postgresql start
 fi
 
-DB_NAME="bioresillient"
+DB_NAME="bioresilient"
 if ! psql -U postgres -lqt 2>/dev/null | cut -d '|' -f1 | grep -qw "$DB_NAME"; then
     echo "  Creating database '$DB_NAME'..."
     sudo -u postgres createdb "$DB_NAME"

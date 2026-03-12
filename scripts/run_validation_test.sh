@@ -40,15 +40,15 @@ echo "============================================================"
 echo ""
 
 # ── Conda activation ──────────────────────────────────────────────────────────
-if [[ -z "${CONDA_DEFAULT_ENV:-}" ]] || [[ "$CONDA_DEFAULT_ENV" != "bioresillient" ]]; then
-    echo ">>> Activating bioresillient conda environment..."
+if [[ -z "${CONDA_DEFAULT_ENV:-}" ]] || [[ "$CONDA_DEFAULT_ENV" != "bioresilient" ]]; then
+    echo ">>> Activating bioresilient conda environment..."
     if command -v conda &>/dev/null; then
         eval "$(conda shell.bash hook 2>/dev/null || conda shell.zsh hook 2>/dev/null)"
     elif [ -f "$HOME/miniconda3/bin/conda" ]; then
         eval "$($HOME/miniconda3/bin/conda shell.bash hook)"
     fi
-    conda activate bioresillient 2>/dev/null || {
-        echo "ERROR: conda environment 'bioresillient' not found."
+    conda activate bioresilient 2>/dev/null || {
+        echo "ERROR: conda environment 'bioresilient' not found."
         echo "Run: bash scripts/setup_cloud.sh"
         exit 1
     }

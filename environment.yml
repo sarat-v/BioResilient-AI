@@ -1,4 +1,4 @@
-name: bioresillient
+name: bioresilient
 channels:
   - conda-forge
   - bioconda
