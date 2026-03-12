@@ -28,10 +28,18 @@ ANTHROPIC_KEY="${ANTHROPIC_API_KEY:-}"
 echo "  RDS host : $RDS_HOST"
 echo "  S3 bucket: $S3_BUCKET"
 
-# ── 1. System packages ────────────────────────────────────────────────────────
+# ── 1. System packages + AWS CLI ───────────────────────────────────────────────
 echo "[1/7] Installing system packages..."
 sudo apt-get update -qq
-sudo apt-get install -y wget curl git postgresql-client build-essential
+sudo apt-get install -y wget curl git unzip postgresql-client build-essential
+
+if ! command -v aws &>/dev/null; then
+    echo "  Installing AWS CLI v2..."
+    curl -sSfL "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" -o /tmp/awscliv2.zip
+    unzip -q -o /tmp/awscliv2.zip -d /tmp
+    sudo /tmp/aws/install -i /usr/local/aws-cli -b /usr/local/bin
+    rm -rf /tmp/aws /tmp/awscliv2.zip
+fi
 
 # ── 2. Conda ─────────────────────────────────────────────────────────────────
 if ! command -v conda &>/dev/null; then
