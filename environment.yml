@@ -31,3 +31,7 @@ dependencies:
     - aiohttp==3.9.1
     - lxml==4.9.3
     - python-multipart==0.0.6
+    - boto3
+    - brotli
+    - torch
+    - fair-esm

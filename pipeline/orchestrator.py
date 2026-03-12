@@ -208,10 +208,10 @@ def step3_run_orthofinder(dry_run: bool = False) -> Path:
         log.info("  [dry-run] skipping OrthoFinder")
         return Path("/tmp/mock_orthofinder_results")
 
-    from pipeline.config import get_storage_root
+    from pipeline.config import get_local_storage_root
     from pipeline.layer1_sequence.orthofinder import run_orthofinder
 
-    proteomes_dir = Path(get_storage_root()) / "proteomes"
+    proteomes_dir = Path(get_local_storage_root()) / "proteomes"
     results_dir = run_orthofinder(proteomes_dir)
     log.info("  OrthoFinder results at: %s", results_dir)
     return results_dir
@@ -223,7 +223,7 @@ def step3b_load_orthologs(results_dir: Path, dry_run: bool = False) -> None:
     if dry_run:
         return
 
-    from pipeline.config import get_storage_root
+    from pipeline.config import get_local_storage_root
     from pipeline.layer1_sequence.orthofinder import (
         flag_one_to_one_orthogroups,
         load_orthologs_to_db,
@@ -231,7 +231,7 @@ def step3b_load_orthologs(results_dir: Path, dry_run: bool = False) -> None:
         parse_orthogroups,
     )
 
-    proteomes_dir = Path(get_storage_root()) / "proteomes"
+    proteomes_dir = Path(get_local_storage_root()) / "proteomes"
     long_df = parse_orthogroups(results_dir, proteomes_dir)
     seq_map = load_sequence_map(proteomes_dir)
 
@@ -265,12 +265,12 @@ def step3d_phylo_conservation(dry_run: bool = False) -> None:
     if dry_run:
         return
 
-    from pipeline.config import get_storage_root
+    from pipeline.config import get_local_storage_root
     from pipeline.layer2_evolution.phylo_conservation import run_phylo_conservation
     from db.models import CandidateScore
     from db.session import get_session as _get_session
 
-    treefile = Path(get_storage_root()) / "phylo" / "species.treefile"
+    treefile = Path(get_local_storage_root()) / "phylo" / "species.treefile"
 
     # Use Tier1+Tier2 gene IDs if step9 has already run; otherwise score all genes.
     tier_gene_ids: list[str] | None = None
@@ -317,7 +317,7 @@ def step4_alignment_and_divergence(
     if dry_run:
         return {}, {}
 
-    from pipeline.config import get_storage_root
+    from pipeline.config import get_local_storage_root
 
     from pipeline.config import get_thresholds
     from pipeline.layer1_sequence.alignment import (
@@ -365,8 +365,8 @@ def step4_alignment_and_divergence(
 
     # Save aligned orthogroups to disk for resume capability
     import pickle
-    from pipeline.config import sync_to_s3
-    _cache_path = Path(get_storage_root()) / "aligned_orthogroups.pkl"
+    from pipeline.config import get_local_storage_root, sync_to_s3
+    _cache_path = Path(get_local_storage_root()) / "aligned_orthogroups.pkl"
     with open(_cache_path, "wb") as _f:
         pickle.dump({"aligned": aligned, "motifs_by_og": motifs_by_og}, _f)
     log.info("  Saved aligned orthogroups cache → %s", _cache_path)
@@ -422,7 +422,7 @@ def step5_phylogenetic_tree(
     if dry_run:
         return Path("/tmp/mock.treefile")
 
-    from pipeline.config import get_storage_root, sync_to_s3
+    from pipeline.config import get_local_storage_root, sync_to_s3
     from pipeline.layer2_evolution.phylo_tree import build_concatenated_alignment, run_iqtree
 
     concat = build_concatenated_alignment(aligned_orthogroups)
@@ -468,12 +468,12 @@ def step6b_fel_busted(dry_run: bool = False) -> None:
     if dry_run:
         return
 
-    from pipeline.config import get_storage_root
+    from pipeline.config import get_local_storage_root
     from pipeline.layer2_evolution.meme_selection import run_fel_busted_pipeline
     from pipeline.layer2_evolution.selection import build_gene_og_map, load_fel_busted_scores
 
     import pickle
-    _cache_path = Path(get_storage_root()) / "aligned_orthogroups.pkl"
+    _cache_path = Path(get_local_storage_root()) / "aligned_orthogroups.pkl"
     if not _cache_path.exists():
         log.warning("  Aligned orthogroups cache not found; skipping step 6b.")
         return
@@ -484,7 +484,7 @@ def step6b_fel_busted(dry_run: bool = False) -> None:
     aligned = cached.get("aligned", {})
     motifs_by_og = cached.get("motifs_by_og", {})
 
-    treefile = Path(get_storage_root()) / "phylo" / "species.treefile"
+    treefile = Path(get_local_storage_root()) / "phylo" / "species.treefile"
     if not treefile.exists():
         log.warning("  Species treefile not found; skipping step 6b.")
         return
@@ -505,12 +505,12 @@ def step6c_relax(dry_run: bool = False) -> None:
     if dry_run:
         return
 
-    from pipeline.config import get_storage_root
+    from pipeline.config import get_local_storage_root
     from pipeline.layer2_evolution.meme_selection import run_relax_pipeline
     from pipeline.layer2_evolution.selection import build_gene_og_map, load_relax_scores
 
     import pickle
-    _cache_path = Path(get_storage_root()) / "aligned_orthogroups.pkl"
+    _cache_path = Path(get_local_storage_root()) / "aligned_orthogroups.pkl"
     if not _cache_path.exists():
         log.warning("  Aligned orthogroups cache not found; skipping step 6c.")
         return
@@ -521,7 +521,7 @@ def step6c_relax(dry_run: bool = False) -> None:
     aligned = cached.get("aligned", {})
     motifs_by_og = cached.get("motifs_by_og", {})
 
-    treefile = Path(get_storage_root()) / "phylo" / "species.treefile"
+    treefile = Path(get_local_storage_root()) / "phylo" / "species.treefile"
     if not treefile.exists():
         log.warning("  Species treefile not found; skipping step 6c.")
         return
@@ -871,15 +871,15 @@ def run_pipeline(
 
     # If resuming past step3, recover results_dir from disk
     from pipeline.layer1_sequence.orthofinder import _orthofinder_output_dir
-    from pipeline.config import get_storage_root
-    _proteomes_dir = Path(get_storage_root()) / "proteomes"
+    from pipeline.config import get_local_storage_root
+    _proteomes_dir = Path(get_local_storage_root()) / "proteomes"
     _existing = _orthofinder_output_dir(_proteomes_dir)
     if _existing is not None:
         results_dir = _existing
 
     # If resuming past step4, recover aligned_orthogroups from disk cache
     if resume_from not in ("step1","step2","step3","step3b","step4"):
-        _pkl_path = Path(get_storage_root()) / "aligned_orthogroups.pkl"
+        _pkl_path = Path(get_local_storage_root()) / "aligned_orthogroups.pkl"
         if _pkl_path.exists():
             try:
                 import pickle
@@ -908,7 +908,7 @@ def run_pipeline(
                 log.warning("Could not recover aligned_orthogroups from DB: %s", _e)
 
     # If resuming past step5, recover treefile from disk
-    _tree_candidate = Path(get_storage_root()) / "phylo" / "species.treefile"
+    _tree_candidate = Path(get_local_storage_root()) / "phylo" / "species.treefile"
     if _tree_candidate.exists():
         treefile = _tree_candidate
 

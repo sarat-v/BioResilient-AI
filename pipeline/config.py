@@ -46,6 +46,14 @@ def get_storage_root() -> str:
     return cfg["storage"][deployment]
 
 
+def get_local_storage_root() -> str:
+    """Path to local data root. When storage is S3, returns /tmp/bioresilient so tools that need local disk (e.g. OrthoFinder) use the same path as download.py."""
+    root = get_storage_root()
+    if root.startswith("s3://") or root.startswith("s3:"):
+        return "/tmp/bioresilient"
+    return root
+
+
 def get_ncbi_api_key() -> str:
     cfg = get_config()
     return os.environ.get("NCBI_API_KEY", (cfg.get("ncbi") or {}).get("api_key", ""))

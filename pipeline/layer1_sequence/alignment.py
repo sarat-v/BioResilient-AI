@@ -19,7 +19,7 @@ from Bio.Align import PairwiseAligner
 
 from db.models import Ortholog
 from db.session import get_session
-from pipeline.config import get_storage_root, get_tool_config
+from pipeline.config import get_local_storage_root, get_tool_config
 
 log = logging.getLogger(__name__)
 
@@ -27,7 +27,7 @@ log = logging.getLogger(__name__)
 
 
 def _alignments_dir() -> Path:
-    root = Path(get_storage_root())
+    root = Path(get_local_storage_root())
     d = root / "alignments"
     d.mkdir(parents=True, exist_ok=True)
     return d

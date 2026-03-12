@@ -413,9 +413,10 @@ conda activate bioresilient
 Verify the DB connection works:
 ```bash
 python -c "
+from sqlalchemy import text
 from db.session import get_session
 with get_session() as s:
-    print('DB OK:', s.execute('SELECT 1').scalar())
+    print('DB OK:', s.execute(text('SELECT 1')).scalar())
 "
 ```
 Should print: `DB OK: 1`
@@ -526,6 +527,19 @@ conda activate bioresilient && cd bioresilient
 # Return to c6i (or continue on g4dn) for the rest
 ./run_cancer_resistance_stepwise.sh --from step4d
 ```
+
+**Optional: PyTorch with CUDA on GPU instances**
+
+The `bioresilient` env includes `torch` and `fair-esm` (CPU build by default). On a GPU instance (e.g. g4dn.xlarge) you can install a CUDA build so step 4c (ESM-1v) runs on the GPU:
+
+```bash
+conda activate bioresilient
+pip install torch --index-url https://download.pytorch.org/whl/cu118   # CUDA 11.8
+# or cu121 for CUDA 12.1
+pip install fair-esm
+```
+
+Then re-run the GPU check: `python -c "import torch; print('GPU:', torch.cuda.is_available())"`
 
 ---
 

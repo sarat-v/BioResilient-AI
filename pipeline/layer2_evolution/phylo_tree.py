@@ -15,7 +15,7 @@ from typing import Optional
 from Bio import SeqIO
 from Bio.SeqRecord import SeqRecord
 
-from pipeline.config import get_storage_root, get_tool_config
+from pipeline.config import get_local_storage_root, get_tool_config
 
 log = logging.getLogger(__name__)
 
@@ -104,7 +104,7 @@ def run_iqtree(concat_alignment: dict[str, str]) -> Path:
     threads = cfg.get("iqtree_threads", "AUTO")
     bootstrap = cfg.get("iqtree_bootstrap", 1000)
 
-    root = Path(get_storage_root())
+    root = Path(get_local_storage_root())
     tree_dir = root / "phylo"
     tree_dir.mkdir(parents=True, exist_ok=True)
 

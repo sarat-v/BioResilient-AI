@@ -136,6 +136,15 @@ python db/seed.py
 
 # ── 6. S3 data directory structure ────────────────────────────────────────────
 echo "[6/7] Creating S3 data structure..."
+if ! aws s3api head-bucket --bucket "$S3_BUCKET" 2>/dev/null; then
+    echo ""
+    echo "  ERROR: S3 bucket '$S3_BUCKET' does not exist."
+    echo "  Create it first (e.g. in your region):"
+    echo "    aws s3 mb s3://$S3_BUCKET --region \${AWS_REGION:-\$AWS_DEFAULT_REGION}"
+    echo "  Note: we use one 'l' — bioresilient-data (not bioresillient-data)."
+    echo "  If you use a different name, set: export S3_BUCKET=your-bucket-name"
+    exit 1
+fi
 aws s3api put-object --bucket "$S3_BUCKET" --key "proteomes/"
 aws s3api put-object --bucket "$S3_BUCKET" --key "orthofinder_out/"
 aws s3api put-object --bucket "$S3_BUCKET" --key "alignments/"
@@ -147,8 +156,16 @@ aws s3api put-object --bucket "$S3_BUCKET" --key "cache/"              # step3/4
 # ── 7. Tool validation ────────────────────────────────────────────────────────
 echo "[7/7] Validating tools..."
 all_ok=true
-for tool in orthofinder diamond mafft iqtree2 hyphy fpocket minimap2 phyloP phastCons; do
-    if command -v "$tool" &>/dev/null; then
+for tool in orthofinder diamond mafft iqtree hyphy fpocket minimap2 phyloP phastCons; do
+    # iqtree is the standard binary name (bioconda); some installs use iqtree2
+    if [[ "$tool" == "iqtree" ]]; then
+        if command -v iqtree &>/dev/null || command -v iqtree2 &>/dev/null; then
+            echo "  ✓  iqtree"
+        else
+            echo "  ✗  iqtree NOT FOUND"
+            all_ok=false
+        fi
+    elif command -v "$tool" &>/dev/null; then
         echo "  ✓  $tool"
     else
         echo "  ✗  $tool NOT FOUND"
@@ -159,7 +176,13 @@ for tool in orthofinder diamond mafft iqtree2 hyphy fpocket minimap2 phyloP phas
     fi
 done
 
-python -c "import torch; print('  GPU:', torch.cuda.is_available())"
+python -c "
+try:
+    import torch
+    print('  GPU:', torch.cuda.is_available())
+except ModuleNotFoundError:
+    print('  GPU: torch not installed (optional for CPU-only runs)')
+"
 
 if [[ "$all_ok" != "true" ]]; then
     echo ""

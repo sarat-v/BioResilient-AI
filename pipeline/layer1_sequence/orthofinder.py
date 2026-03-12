@@ -18,7 +18,7 @@ from Bio import SeqIO
 
 from db.models import Gene, Ortholog
 from db.session import get_session
-from pipeline.config import get_storage_root, get_tool_config
+from pipeline.config import get_local_storage_root, get_tool_config
 
 log = logging.getLogger(__name__)
 
@@ -48,7 +48,7 @@ def run_orthofinder(proteomes_dir: Path) -> Path:
     search_threads = cfg.get("orthofinder_threads", 8)
     align_threads = cfg.get("orthofinder_align_threads", 4)
 
-    root = Path(get_storage_root())
+    root = Path(get_local_storage_root())
     out_dir = root / "orthofinder_out"
 
     # Reuse cached results if they exist
