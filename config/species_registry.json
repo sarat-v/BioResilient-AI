@@ -104,7 +104,7 @@
     "name": "Leucoraja erinacea",
     "common_name": "Little skate",
     "phenotype": ["cancer_resistance"],
-    "genome_assembly": "GCF_000238815.1",
+    "genome_assembly": "GCF_028641065.1",
     "lineage_group": "Sharks",
     "cancer_mechanism": "Elasmobranch outgroup to shark; comparative anchor for shark-specific signals",
     "geo_search_terms": ["Leucoraja erinacea", "little skate", "elasmobranch", "cancer"]
