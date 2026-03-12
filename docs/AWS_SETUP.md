@@ -80,6 +80,8 @@ Your Mac
 └──────────────────────────────────────────────────────────────┘
 ```
 
+**Generated data:** `data/hyphy/`, `data/alignments/`, `data/orthofinder_out/`, `data/genomes/`, `data/proteomes/` are created at pipeline runtime (on EC2 or locally). They are not in the repo (see `.gitignore`). Results and cache are synced to S3 where configured.
+
 RDS is **not publicly accessible** — your Mac cannot connect to it directly.
 The EC2 instance is the only thing that talks to RDS.
 
