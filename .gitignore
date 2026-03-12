@@ -12,6 +12,8 @@ pipeline_state.json
 pipeline_cache.json
 pipeline.log
 data/aligned_orthogroups.pkl
+step_cache/
+config/species_registry.json.backup
 
 ## Python
 __pycache__/
@@ -35,6 +37,8 @@ data/proteomes/
 data/orthofinder_out/
 data/alignments/
 data/geo_data/
+data/hyphy/
+data/genomes/
 !data/fixtures/
 
 ## Database

@@ -380,3 +380,72 @@ class PathwayConvergence(Base):
 
     def __repr__(self) -> str:
         return f"<PathwayConvergence {self.pathway_id} score={self.pathway_score}>"
+
+
+# ---------------------------------------------------------------------------
+# Nucleotide conservation (Steps 3c / 3d)
+# ---------------------------------------------------------------------------
+
+
+class NucleotideRegion(Base):
+    """Raw nucleotide sequences extracted per gene × species for CDS, promoter, and downstream regions."""
+
+    __tablename__ = "nucleotide_region"
+    __table_args__ = (
+        UniqueConstraint("gene_id", "species_id", "region_type", name="uq_nucregion"),
+    )
+
+    id          = Column(String, primary_key=True, default=_uuid)
+    gene_id     = Column(String, ForeignKey("gene.id", ondelete="CASCADE"), nullable=False, index=True)
+    species_id  = Column(String, ForeignKey("species.id", ondelete="CASCADE"), nullable=False, index=True)
+    region_type = Column(String, nullable=False)   # "cds" | "promoter" | "downstream"
+    sequence    = Column(Text)
+    chrom       = Column(String)
+    start       = Column(Integer)
+    end         = Column(Integer)
+
+    gene    = relationship("Gene")
+    species = relationship("Species")
+
+    def __repr__(self) -> str:
+        return f"<NucleotideRegion gene={self.gene_id} species={self.species_id} type={self.region_type}>"
+
+
+class NucleotideScore(Base):
+    """Per-gene per-region alignment statistics and regulatory divergence/convergence counts."""
+
+    __tablename__ = "nucleotide_score"
+    __table_args__ = (
+        UniqueConstraint("gene_id", "region_type", name="uq_nucscore"),
+    )
+
+    id                           = Column(String, primary_key=True, default=_uuid)
+    gene_id                      = Column(String, ForeignKey("gene.id", ondelete="CASCADE"), nullable=False, index=True)
+    region_type                  = Column(String, nullable=False)
+    conservation_score           = Column(Float)    # (pct_identity × aln_len) / region_len; mean across resilient species
+    percent_identity             = Column(Float)    # mean pct identity vs. human across resilient species
+    alignment_length             = Column(Integer)  # mean alignment length
+    gap_fraction                 = Column(Float)    # mean gap fraction
+    regulatory_divergence_count  = Column(Integer, default=0)   # mutations in ≥3 resilient, absent human + controls
+    regulatory_convergence_count = Column(Integer, default=0)   # same mutation in ≥2 distinct lineage clusters
+
+    gene = relationship("Gene")
+
+    def __repr__(self) -> str:
+        return f"<NucleotideScore gene={self.gene_id} type={self.region_type} conservation={self.conservation_score}>"
+
+
+class PhyloConservationScore(Base):
+    """phyloP / PhastCons scores per gene for CDS, promoter, and downstream regions."""
+
+    __tablename__ = "phylo_conservation_score"
+
+    gene_id                = Column(String, ForeignKey("gene.id", ondelete="CASCADE"), primary_key=True)
+    cds_phylo_score        = Column(Float)
+    promoter_phylo_score   = Column(Float)
+    downstream_phylo_score = Column(Float)
+
+    gene = relationship("Gene")
+
+    def __repr__(self) -> str:
+        return f"<PhyloConservationScore gene={self.gene_id} cds={self.cds_phylo_score}>"

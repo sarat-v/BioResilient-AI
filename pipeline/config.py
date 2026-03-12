@@ -63,7 +63,14 @@ def get_anthropic_api_key() -> str:
 
 
 def get_tool_config() -> dict[str, Any]:
-    return get_config().get("tools", {})
+    cfg = get_config()
+    tools = cfg.get("tools", {})
+    # Support both flat format (legacy) and deployment-split format (local/cloud sub-keys)
+    deployment = get_deployment()
+    if deployment in tools and isinstance(tools[deployment], dict):
+        return tools[deployment]
+    # Flat format fallback (no sub-keys)
+    return {k: v for k, v in tools.items() if not isinstance(v, dict)}
 
 
 def get_scoring_weights(phase: str = "phase1") -> dict[str, float]:
@@ -111,3 +118,67 @@ def cfg_get(dotpath: str, default: Any = None) -> Any:
         if node is None:
             return default
     return node
+
+
+def get_s3_bucket() -> str:
+    """Return S3 bucket name from storage.cloud URI or S3_BUCKET env var."""
+    bucket = os.environ.get("S3_BUCKET", "")
+    if bucket:
+        return bucket
+    cloud_uri = (get_config().get("storage") or {}).get("cloud", "")
+    if cloud_uri.startswith("s3://"):
+        return cloud_uri.replace("s3://", "").split("/")[0]
+    return ""
+
+
+def sync_to_s3(local_path: "Path | str", s3_key: str) -> bool:
+    """Upload a local file to S3. No-op when deployment is not 'cloud'.
+
+    Returns True on success, False on error (never raises).
+    """
+    if get_deployment() != "cloud":
+        return True
+    bucket = get_s3_bucket()
+    if not bucket:
+        return False
+    try:
+        import boto3
+        from pathlib import Path as _Path
+        local_path = _Path(local_path)
+        if not local_path.exists():
+            return False
+        boto3.client("s3").upload_file(str(local_path), bucket, s3_key)
+        import logging
+        logging.getLogger(__name__).info("S3 upload: s3://%s/%s", bucket, s3_key)
+        return True
+    except Exception as exc:
+        import logging
+        logging.getLogger(__name__).warning("S3 upload failed for %s → %s: %s", local_path, s3_key, exc)
+        return False
+
+
+def sync_from_s3(s3_key: str, local_path: "Path | str") -> bool:
+    """Download a file from S3 to a local path. No-op when deployment is not 'cloud'.
+
+    Returns True on success (or file already exists locally), False on error.
+    """
+    if get_deployment() != "cloud":
+        return True
+    bucket = get_s3_bucket()
+    if not bucket:
+        return False
+    try:
+        import boto3
+        from pathlib import Path as _Path
+        local_path = _Path(local_path)
+        local_path.parent.mkdir(parents=True, exist_ok=True)
+        if local_path.exists():
+            return True
+        boto3.client("s3").download_file(bucket, s3_key, str(local_path))
+        import logging
+        logging.getLogger(__name__).info("S3 download: s3://%s/%s → %s", bucket, s3_key, local_path)
+        return True
+    except Exception as exc:
+        import logging
+        logging.getLogger(__name__).warning("S3 download failed for %s → %s: %s", s3_key, local_path, exc)
+        return False

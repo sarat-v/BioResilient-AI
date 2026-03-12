@@ -1,12 +1,13 @@
 """Phase 1 Pipeline Orchestrator.
 
-Runs all 10 steps in the correct dependency order. Each step is gated:
+Runs all steps in the correct dependency order. Each step is gated:
 the pipeline will not advance past a step that fails.
 
 Usage:
     python pipeline/orchestrator.py
     python pipeline/orchestrator.py --resume-from step5
     python pipeline/orchestrator.py --steps step1,step2
+    python pipeline/orchestrator.py --phenotype cancer_resistance
     python pipeline/orchestrator.py --dry-run
 """
 
@@ -38,6 +39,8 @@ STEP_LABELS = {
     "step2":   "Download proteomes",
     "step3":   "Run OrthoFinder",
     "step3b":  "Load orthologs into DB",
+    "step3c":  "Nucleotide region extraction + alignment",
+    "step3d":  "Phylogenetic conservation scoring (phyloP/PhastCons)",
     "step4":   "Align sequences & find divergent motifs",
     "step4b":  "Domain annotation (Pfam) + functional consequence (AlphaMissense)",
     "step4c":  "ESM-1v structural variant effect scoring",
@@ -117,10 +120,27 @@ def _mark_step(state: dict, step_name: str, status: str, elapsed: float | None =
 sys.path.insert(0, str(_REPO_ROOT))
 
 
-def _load_species_registry() -> list[dict]:
+def _load_species_registry(phenotype: str | None = None) -> list[dict]:
     registry_path = _REPO_ROOT / "config" / "species_registry.json"
     with open(registry_path) as f:
-        return json.load(f)
+        all_species = json.load(f)
+    if not phenotype:
+        return all_species
+    # Keep species whose phenotype list includes the requested phenotype OR baseline/control
+    filtered = []
+    for sp in all_species:
+        phenotypes = sp.get("phenotype", [])
+        is_control = sp.get("is_control", False)
+        if phenotype in phenotypes or "baseline" in phenotypes or is_control:
+            filtered.append(sp)
+    log.info(
+        "Species filter (phenotype=%s): %d / %d species selected: %s",
+        phenotype,
+        len(filtered),
+        len(all_species),
+        [s["id"] for s in filtered],
+    )
+    return filtered
 
 
 def step1_validate_environment() -> None:
@@ -224,6 +244,53 @@ def step3b_load_orthologs(results_dir: Path, dry_run: bool = False) -> None:
     log.info("  1:1 filter: %d many-to-many orthogroups excluded from downstream analysis.", flagged)
 
 
+def step3c_nucleotide_conservation(species_list: list[dict], dry_run: bool = False) -> None:
+    """Extract nucleotide regions (CDS/promoter/downstream) and align against human."""
+    log.info("Step 3c: Nucleotide region extraction + alignment...")
+    if dry_run:
+        return
+
+    from pipeline.layer1_sequence.nucleotide_scan import run_nucleotide_scan
+    from pipeline.layer1_sequence.nucleotide_align import run_nucleotide_alignment
+
+    n_regions = run_nucleotide_scan()
+    log.info("  Nucleotide scan: %d regions extracted", n_regions)
+    n_scored = run_nucleotide_alignment()
+    log.info("  Nucleotide alignment: %d genes scored", n_scored)
+
+
+def step3d_phylo_conservation(dry_run: bool = False) -> None:
+    """Run phyloP / PhastCons conservation scoring on nucleotide alignments."""
+    log.info("Step 3d: Phylogenetic conservation scoring (phyloP/PhastCons)...")
+    if dry_run:
+        return
+
+    from pipeline.config import get_storage_root
+    from pipeline.layer2_evolution.phylo_conservation import run_phylo_conservation
+    from db.models import CandidateScore
+    from db.session import get_session as _get_session
+
+    treefile = Path(get_storage_root()) / "phylo" / "species.treefile"
+
+    # Use Tier1+Tier2 gene IDs if step9 has already run; otherwise score all genes.
+    tier_gene_ids: list[str] | None = None
+    try:
+        with _get_session() as s:
+            rows = (
+                s.query(CandidateScore.gene_id)
+                .filter(CandidateScore.tier.in_(["Tier1", "Tier2", "Validated"]))
+                .all()
+            )
+            if rows:
+                tier_gene_ids = [r[0] for r in rows]
+                log.info("  Restricting phylo scoring to %d Tier1/2 genes", len(tier_gene_ids))
+    except Exception:
+        pass  # step9 not yet run — score all genes
+
+    n_scored = run_phylo_conservation(tier_gene_ids, treefile)
+    log.info("  Phylogenetic conservation: %d genes scored", n_scored)
+
+
 def _build_human_gene_map(human_sequences: dict[str, str]) -> dict[str, tuple[str, str]]:
     """Build {protein_id: (gene_uuid, gene_symbol)} for human proteins.
 
@@ -298,10 +365,12 @@ def step4_alignment_and_divergence(
 
     # Save aligned orthogroups to disk for resume capability
     import pickle
+    from pipeline.config import sync_to_s3
     _cache_path = Path(get_storage_root()) / "aligned_orthogroups.pkl"
     with open(_cache_path, "wb") as _f:
         pickle.dump({"aligned": aligned, "motifs_by_og": motifs_by_og}, _f)
     log.info("  Saved aligned orthogroups cache → %s", _cache_path)
+    sync_to_s3(_cache_path, "cache/aligned_orthogroups.pkl")
 
     return aligned, motifs_by_og
 
@@ -353,7 +422,7 @@ def step5_phylogenetic_tree(
     if dry_run:
         return Path("/tmp/mock.treefile")
 
-    from pipeline.config import get_storage_root
+    from pipeline.config import get_storage_root, sync_to_s3
     from pipeline.layer2_evolution.phylo_tree import build_concatenated_alignment, run_iqtree
 
     concat = build_concatenated_alignment(aligned_orthogroups)
@@ -361,6 +430,7 @@ def step5_phylogenetic_tree(
         raise RuntimeError("Not enough single-copy orthogroups to build species tree.")
 
     treefile = run_iqtree(concat)
+    sync_to_s3(treefile, "cache/species.treefile")
     return treefile
 
 
@@ -561,20 +631,21 @@ def _get_tier12_gene_ids(trait_id: str = "") -> list[str]:
     from db.models import CandidateScore
     from db.session import get_session
     with get_session() as session:
-        rows = (
-            session.query(CandidateScore.gene_id)
-            .filter(CandidateScore.trait_id == trait_id, CandidateScore.tier.in_(["Tier1", "Tier2"]))
-            .all()
+        q = session.query(CandidateScore.gene_id).filter(
+            CandidateScore.tier.in_(["Tier1", "Tier2"])
         )
+        if trait_id:
+            q = q.filter(CandidateScore.trait_id == trait_id)
+        rows = q.all()
     return [r[0] for r in rows]
 
 
-def step11_disease_annotation(dry_run: bool = False) -> None:
+def step11_disease_annotation(dry_run: bool = False, trait_id: str = "") -> None:
     """Layer 3: OpenTargets, GWAS, gnomAD, IMPC, Human Protein Atlas (Tier1+Tier2 only)."""
     log.info("Step 11: Disease annotation (Layer 3)...")
     if dry_run:
         return
-    gene_ids = _get_tier12_gene_ids()
+    gene_ids = _get_tier12_gene_ids(trait_id)
     if not gene_ids:
         log.warning("  No Tier1/Tier2 candidates; skipping disease annotation.")
         return
@@ -588,12 +659,12 @@ def step11_disease_annotation(dry_run: bool = False) -> None:
     log.info("  Pathways/GO annotated for %d genes.", n_pathways)
 
 
-def step11b_rare_variants(dry_run: bool = False) -> None:
+def step11b_rare_variants(dry_run: bool = False, trait_id: str = "") -> None:
     """Map divergent motif positions to rare protective variants in gnomAD (PCSK9 paradigm)."""
     log.info("Step 11b: Rare protective variant mapping (gnomAD + GWAS Catalog)...")
     if dry_run:
         return
-    gene_ids = _get_tier12_gene_ids()
+    gene_ids = _get_tier12_gene_ids(trait_id)
     if not gene_ids:
         log.warning("  No Tier1/Tier2 candidates; skipping rare variant mapping.")
         return
@@ -602,12 +673,12 @@ def step11b_rare_variants(dry_run: bool = False) -> None:
     log.info("  Rare variants: %d genes with protective variant matches.", n)
 
 
-def step11c_literature(dry_run: bool = False) -> None:
+def step11c_literature(dry_run: bool = False, trait_id: str = "") -> None:
     """Check top candidates against known resilience/longevity literature (PubMed sanity check)."""
     log.info("Step 11c: Literature validation (PubMed sanity check)...")
     if dry_run:
         return
-    gene_ids = _get_tier12_gene_ids()
+    gene_ids = _get_tier12_gene_ids(trait_id)
     if not gene_ids:
         log.warning("  No Tier1/Tier2 candidates; skipping literature check.")
         return
@@ -625,12 +696,12 @@ def step11d_pathway_convergence(dry_run: bool = False) -> None:
     run_pathway_convergence_pipeline()
 
 
-def step12_druggability(dry_run: bool = False) -> None:
+def step12_druggability(dry_run: bool = False, trait_id: str = "") -> None:
     """Layer 4: AlphaFold structures, fpocket, ChEMBL, CanSAR, peptide (Tier1+Tier2 only)."""
     log.info("Step 12: Druggability (Layer 4)...")
     if dry_run:
         return
-    gene_ids = _get_tier12_gene_ids()
+    gene_ids = _get_tier12_gene_ids(trait_id)
     if not gene_ids:
         return
     from pipeline.layer4_druggability import structure, pockets, chembl, cansar, peptide
@@ -641,12 +712,12 @@ def step12_druggability(dry_run: bool = False) -> None:
     peptide.annotate_motifs_peptide(None)
 
 
-def step12b_p2rank(dry_run: bool = False) -> None:
+def step12b_p2rank(dry_run: bool = False, trait_id: str = "") -> None:
     """Run P2Rank ML pocket prediction on AlphaFold structures."""
     log.info("Step 12b: P2Rank ML pocket prediction...")
     if dry_run:
         return
-    gene_ids = _get_tier12_gene_ids()
+    gene_ids = _get_tier12_gene_ids(trait_id)
     if not gene_ids:
         return
     from pipeline.layer4_druggability.structure import ensure_structures_for_genes
@@ -656,20 +727,18 @@ def step12b_p2rank(dry_run: bool = False) -> None:
     log.info("  P2Rank: %d genes with pocket predictions.", n)
 
 
-def step13_gene_therapy(dry_run: bool = False) -> None:
+def step13_gene_therapy(dry_run: bool = False, trait_id: str = "") -> None:
     """Layer 5: AAV + CRISPR (Tier1 only)."""
     log.info("Step 13: Gene therapy (Layer 5)...")
     if dry_run:
         return
-    from pipeline.scoring import get_top_candidates
     from db.models import CandidateScore
     from db.session import get_session
     with get_session() as session:
-        tier1 = (
-            session.query(CandidateScore.gene_id)
-            .filter(CandidateScore.trait_id == "", CandidateScore.tier == "Tier1")
-            .all()
-        )
+        q = session.query(CandidateScore.gene_id).filter(CandidateScore.tier == "Tier1")
+        if trait_id:
+            q = q.filter(CandidateScore.trait_id == trait_id)
+        tier1 = q.all()
     gene_ids = [r[0] for r in tier1]
     if not gene_ids:
         return
@@ -678,12 +747,12 @@ def step13_gene_therapy(dry_run: bool = False) -> None:
     crispr.annotate_genes_crispr(gene_ids)
 
 
-def step14_safety(dry_run: bool = False) -> None:
+def step14_safety(dry_run: bool = False, trait_id: str = "") -> None:
     """Layer 6: PheWAS, STRING, selectivity (Tier1+Tier2 only)."""
     log.info("Step 14: Safety (Layer 6)...")
     if dry_run:
         return
-    gene_ids = _get_tier12_gene_ids()
+    gene_ids = _get_tier12_gene_ids(trait_id)
     if not gene_ids:
         return
     from pipeline.layer6_safety import phewas, network, selectivity
@@ -692,12 +761,12 @@ def step14_safety(dry_run: bool = False) -> None:
     selectivity.annotate_genes_selectivity(gene_ids)
 
 
-def step14b_depmap_gtex(dry_run: bool = False) -> None:
+def step14b_depmap_gtex(dry_run: bool = False, trait_id: str = "") -> None:
     """Annotate safety with DepMap CRISPR essentiality and GTEx expression breadth."""
     log.info("Step 14b: DepMap essentiality + GTEx expression breadth...")
     if dry_run:
         return
-    gene_ids = _get_tier12_gene_ids()
+    gene_ids = _get_tier12_gene_ids(trait_id)
     if not gene_ids:
         return
     from pipeline.layer6_safety.depmap import run_depmap_pipeline
@@ -776,6 +845,7 @@ def run_pipeline(
     resume_from: str = "step1",
     only_steps: list[str] | None = None,
     dry_run: bool = False,
+    trait_id: str = "",
 ) -> None:
     step_order = list(STEPS.keys())
     if only_steps:
@@ -789,6 +859,8 @@ def run_pipeline(
     log.info("BioResilient AI — Phase 1 Pipeline")
     log.info("Steps: %s", step_order)
     log.info("Dry run: %s", dry_run)
+    if trait_id:
+        log.info("Phenotype / trait: %s", trait_id)
     log.info("=" * 60)
 
     # Shared state passed between steps
@@ -905,6 +977,12 @@ def run_pipeline(
                 if results_dir:
                     step3b_load_orthologs(results_dir, dry_run=dry_run)
 
+            elif step_name == "step3c":
+                step3c_nucleotide_conservation(species_list, dry_run=dry_run)
+
+            elif step_name == "step3d":
+                step3d_phylo_conservation(dry_run=dry_run)
+
             elif step_name == "step4":
                 aligned_orthogroups, motifs_by_og = step4_alignment_and_divergence(
                     species_list, dry_run=dry_run
@@ -961,31 +1039,31 @@ def run_pipeline(
                 step10b_alphagenome(dry_run=dry_run)
 
             elif step_name == "step11":
-                step11_disease_annotation(dry_run=dry_run)
+                step11_disease_annotation(dry_run=dry_run, trait_id=trait_id)
 
             elif step_name == "step11b":
-                step11b_rare_variants(dry_run=dry_run)
+                step11b_rare_variants(dry_run=dry_run, trait_id=trait_id)
 
             elif step_name == "step11c":
-                step11c_literature(dry_run=dry_run)
+                step11c_literature(dry_run=dry_run, trait_id=trait_id)
 
             elif step_name == "step11d":
                 step11d_pathway_convergence(dry_run=dry_run)
 
             elif step_name == "step12":
-                step12_druggability(dry_run=dry_run)
+                step12_druggability(dry_run=dry_run, trait_id=trait_id)
 
             elif step_name == "step12b":
-                step12b_p2rank(dry_run=dry_run)
+                step12b_p2rank(dry_run=dry_run, trait_id=trait_id)
 
             elif step_name == "step13":
-                step13_gene_therapy(dry_run=dry_run)
+                step13_gene_therapy(dry_run=dry_run, trait_id=trait_id)
 
             elif step_name == "step14":
-                step14_safety(dry_run=dry_run)
+                step14_safety(dry_run=dry_run, trait_id=trait_id)
 
             elif step_name == "step14b":
-                step14b_depmap_gtex(dry_run=dry_run)
+                step14b_depmap_gtex(dry_run=dry_run, trait_id=trait_id)
 
             elif step_name == "step15":
                 step15_rescore(dry_run=dry_run)
@@ -1069,13 +1147,23 @@ def main() -> None:
         help="Comma-separated list of steps to run (overrides --resume-from)",
     )
     parser.add_argument(
+        "--phenotype",
+        default="",
+        help=(
+            "Filter species registry to this phenotype (e.g. cancer_resistance). "
+            "Human baseline and control species are always included. "
+            "Also used as trait_id for CandidateScore records."
+        ),
+    )
+    parser.add_argument(
         "--dry-run",
         action="store_true",
         help="Run through step logic without executing tools or DB writes",
     )
     args = parser.parse_args()
 
-    species_list = _load_species_registry()
+    trait_id = args.phenotype or ""
+    species_list = _load_species_registry(phenotype=trait_id or None)
     only_steps = [s.strip() for s in args.steps.split(",")] if args.steps else None
 
     run_pipeline(
@@ -1083,6 +1171,7 @@ def main() -> None:
         resume_from=args.resume_from,
         only_steps=only_steps,
         dry_run=args.dry_run,
+        trait_id=trait_id,
     )
 
 

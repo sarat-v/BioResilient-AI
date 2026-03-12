@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # BioResilient AI — AWS cloud environment bootstrap
 # Tested on Ubuntu 22.04 AMI (ami-0c7217cdde317cfec)
-# Run on: c5.4xlarge (CPU tasks) or g4dn.xlarge (GPU tasks)
+# Run on: c6i.4xlarge (CPU tasks) or g4dn.xlarge (GPU tasks)
 # Expected cost: ~$0.27/hr (CPU spot) | ~$0.16/hr (GPU spot)
 set -euo pipefail
 
@@ -17,6 +17,9 @@ echo "============================================"
 : "${NCBI_EMAIL:?NCBI_EMAIL environment variable not set}"
 : "${RDS_HOST:?RDS_HOST environment variable not set (RDS endpoint)}"
 : "${S3_BUCKET:=bioresillient-data}"
+# Optional API keys (pipeline degrades gracefully without them)
+ALPHAGENOME_KEY="${ALPHAGENOME_API_KEY:-}"
+ANTHROPIC_KEY="${ANTHROPIC_API_KEY:-}"
 
 echo "  RDS host : $RDS_HOST"
 echo "  S3 bucket: $S3_BUCKET"
@@ -41,13 +44,22 @@ fi
 eval "$(conda shell.bash hook)"
 
 # ── 3. Conda environment ─────────────────────────────────────────────────────
-echo "[3/7] Creating conda environment..."
+echo "[3/7] Creating conda environment (includes minimap2 + PHAST)..."
 conda env update --file "$REPO_ROOT/environment.yml" --prune
 conda activate "$ENV_NAME"
 
+# Install tools that need bioconda and may not be in environment.yml
+conda install -y -c bioconda minimap2   2>/dev/null || true
+conda install -y -c bioconda phast      2>/dev/null || true   # provides phyloP + phastCons
+conda install -y -c bioconda lastz      2>/dev/null || true   # fallback aligner for step3c
+
 # ── 4. App config ─────────────────────────────────────────────────────────────
 echo "[4/7] Writing cloud config..."
+# This mirrors the exact YAML structure that pipeline/config.py expects.
+# Keys must stay in sync with config.py:get_tool_config() and get_db_url().
 cat > "$REPO_ROOT/config/environment.yml" <<EOF
+# BioResilient AI — Application Configuration (LIVE SECRETS FILE)
+# DO NOT COMMIT THIS FILE — it is in .gitignore
 deployment: cloud
 
 database:
@@ -60,28 +72,38 @@ storage:
 
 gpu:
   device: auto
-  esm_model: esm2_t33_650M_UR50D
-  esm_chunk_size: 64
+  esm1v_model: esm1v_t33_650M_UR90S_1
+  esm_chunk_size: 128
+
+target_phenotype: cancer_resistance
 
 ncbi:
   api_key: ${NCBI_API_KEY}
   email: ${NCBI_EMAIL}
 
-tools:
-  orthofinder_threads: 16
-  orthofinder_align_threads: 8
-  mafft_threads: 8
-  iqtree_threads: AUTO
-  iqtree_bootstrap: 1000
-  hyphy_threads: 8
+alphagenome:
+  api_key: ${ALPHAGENOME_KEY}
 
-scoring_weights:
-  convergence:      0.25
-  selection:        0.20
-  disease:          0.20
-  druggability:     0.15
-  expression:       0.10
-  safety:           0.10
+anthropic:
+  api_key: ${ANTHROPIC_KEY}
+
+tools:
+  local:
+    orthofinder_threads: 6
+    orthofinder_align_threads: 3
+    mafft_threads: 6
+    iqtree_threads: AUTO
+    iqtree_bootstrap: 1000
+    hyphy_threads: 4
+    minimap2_threads: 6
+  cloud:
+    orthofinder_threads: 14
+    orthofinder_align_threads: 7
+    mafft_threads: 14
+    iqtree_threads: AUTO
+    iqtree_bootstrap: 1000
+    hyphy_threads: 14
+    minimap2_threads: 14
 
 thresholds:
   divergence_identity_max: 0.85
@@ -105,22 +127,36 @@ aws s3api put-object --bucket "$S3_BUCKET" --key "proteomes/"
 aws s3api put-object --bucket "$S3_BUCKET" --key "orthofinder_out/"
 aws s3api put-object --bucket "$S3_BUCKET" --key "alignments/"
 aws s3api put-object --bucket "$S3_BUCKET" --key "geo_data/"
+aws s3api put-object --bucket "$S3_BUCKET" --key "genomes/"            # step3c: genomic FASTA cache
+aws s3api put-object --bucket "$S3_BUCKET" --key "nucleotide_regions/" # step3c: extracted region sequences
+aws s3api put-object --bucket "$S3_BUCKET" --key "cache/"              # step3/4/5: pkl/treefile cache
 
 # ── 7. Tool validation ────────────────────────────────────────────────────────
 echo "[7/7] Validating tools..."
-for tool in orthofinder diamond mafft iqtree2 hyphy fpocket; do
+all_ok=true
+for tool in orthofinder diamond mafft iqtree2 hyphy fpocket minimap2 phyloP phastCons; do
     if command -v "$tool" &>/dev/null; then
         echo "  ✓  $tool"
     else
         echo "  ✗  $tool NOT FOUND"
+        # minimap2 / phyloP / phastCons are optional (pipeline falls back gracefully)
+        if [[ "$tool" != "minimap2" && "$tool" != "phyloP" && "$tool" != "phastCons" ]]; then
+            all_ok=false
+        fi
     fi
 done
 
 python -c "import torch; print('  GPU:', torch.cuda.is_available())"
 
+if [[ "$all_ok" != "true" ]]; then
+    echo ""
+    echo "⚠  One or more required tools are missing. Check the output above."
+    exit 1
+fi
+
 echo ""
 echo "============================================"
 echo " Cloud setup complete."
 echo " Run: conda activate $ENV_NAME"
-echo " Then: python pipeline/orchestrator.py"
+echo " Then: bash run_cancer_resistance_stepwise.sh"
 echo "============================================"

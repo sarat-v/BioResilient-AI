@@ -4,7 +4,15 @@ from fastapi import APIRouter, HTTPException, Query
 from pydantic import BaseModel
 from typing import Optional
 
-from db.models import CandidateScore, DiseaseAnnotation, EvolutionScore, ExpressionResult, Gene
+from db.models import (
+    CandidateScore,
+    DiseaseAnnotation,
+    EvolutionScore,
+    ExpressionResult,
+    Gene,
+    NucleotideScore,
+    PhyloConservationScore,
+)
 from db.session import get_session
 
 router = APIRouter()
@@ -36,6 +44,15 @@ class ScoreBreakdown(BaseModel):
     # Item 10: Literature validation
     lit_score: Optional[float] = None
     lit_pmid_count: Optional[int] = None
+    # DNA conservation (steps 3c / 3d)
+    nucleotide_cds_conservation:      Optional[float] = None
+    promoter_conservation:            Optional[float] = None
+    downstream_conservation:          Optional[float] = None
+    regulatory_divergence_count:      Optional[int]   = None
+    regulatory_convergence_count:     Optional[int]   = None
+    cds_phylo_score:                  Optional[float] = None
+    promoter_phylo_score:             Optional[float] = None
+    downstream_phylo_score:           Optional[float] = None
 
 
 @router.get("/{gene_id}", response_model=ScoreBreakdown)
@@ -66,6 +83,12 @@ def get_scores(gene_id: str, trait_id: Optional[str] = Query(None, description="
             }
 
         da = session.get(DiseaseAnnotation, gene_id)
+
+        # DNA conservation data (steps 3c / 3d) — may be None if steps haven't run
+        ns_cds        = session.query(NucleotideScore).filter_by(gene_id=gene_id, region_type="cds").first()
+        ns_promoter   = session.query(NucleotideScore).filter_by(gene_id=gene_id, region_type="promoter").first()
+        ns_downstream = session.query(NucleotideScore).filter_by(gene_id=gene_id, region_type="downstream").first()
+        pcs           = session.get(PhyloConservationScore, gene_id)
 
         expr_evidence = []
         for er in session.query(ExpressionResult).filter_by(gene_id=gene_id).limit(50).all():
@@ -100,4 +123,13 @@ def get_scores(gene_id: str, trait_id: Optional[str] = Query(None, description="
             protective_variant_pvalue=getattr(da, "protective_variant_pvalue", None) if da else None,
             lit_score=getattr(da, "lit_score", None) if da else None,
             lit_pmid_count=getattr(da, "lit_pmid_count", None) if da else None,
+            # DNA conservation
+            nucleotide_cds_conservation=ns_cds.conservation_score if ns_cds else None,
+            promoter_conservation=ns_promoter.conservation_score if ns_promoter else None,
+            downstream_conservation=ns_downstream.conservation_score if ns_downstream else None,
+            regulatory_divergence_count=ns_promoter.regulatory_divergence_count if ns_promoter else None,
+            regulatory_convergence_count=ns_promoter.regulatory_convergence_count if ns_promoter else None,
+            cds_phylo_score=pcs.cds_phylo_score if pcs else None,
+            promoter_phylo_score=pcs.promoter_phylo_score if pcs else None,
+            downstream_phylo_score=pcs.downstream_phylo_score if pcs else None,
         )

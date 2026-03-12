@@ -24,6 +24,7 @@ from pipeline.config import (
     get_ncbi_email,
     get_storage_root,
     get_deployment,
+    sync_to_s3,
 )
 
 log = logging.getLogger(__name__)
@@ -207,6 +208,8 @@ def reheader_fasta(path: Path, species_id: str, out_path: Optional[Path] = None)
 
     SeqIO.write(records, str(out_path), "fasta")
     log.info("  Reheadered %d sequences for %s → %s", len(records), species_id, out_path)
+    # Sync the final reheadered FASTA to S3 so it survives instance restart
+    sync_to_s3(out_path, f"proteomes/{out_path.name}")
     return out_path
 
 

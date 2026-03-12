@@ -527,6 +527,75 @@ export default function GeneDetail() {
               </div>
             </Section>
           )}
+
+          {/* DNA Conservation panel — populated by steps 3c / 3d */}
+          {scores?.nucleotide_cds_conservation != null && (
+            <Section title="DNA Conservation" icon={Dna}>
+              <p className="text-xs text-text-muted mb-3">
+                Nucleotide-level conservation of coding and regulatory regions across species,
+                computed via minimap2 alignment and phyloP/PhastCons evolutionary scoring.
+              </p>
+              <div className="space-y-1">
+                <KV
+                  label="CDS conservation"
+                  value={`${(scores.nucleotide_cds_conservation * 100).toFixed(1)}%`}
+                  mono
+                  tooltip="Fraction of the coding sequence conserved vs. human, averaged across resilient species."
+                />
+                {scores.promoter_conservation != null && (
+                  <KV
+                    label="Promoter conservation"
+                    value={`${(scores.promoter_conservation * 100).toFixed(1)}%`}
+                    mono
+                    tooltip="5 kb upstream promoter region conservation. Lower values indicate potential regulatory divergence."
+                  />
+                )}
+                {scores.downstream_conservation != null && (
+                  <KV
+                    label="Downstream conservation"
+                    value={`${(scores.downstream_conservation * 100).toFixed(1)}%`}
+                    mono
+                    tooltip="2 kb downstream region conservation."
+                  />
+                )}
+              </div>
+              {(scores.regulatory_divergence_count != null || scores.regulatory_convergence_count != null) && (
+                <div className="flex flex-wrap gap-2 mt-3">
+                  {scores.regulatory_divergence_count > 0 && (
+                    <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded text-xs font-medium bg-amber-500/15 text-amber-400 border border-amber-500/20">
+                      Promoter divergence ×{scores.regulatory_divergence_count}
+                    </span>
+                  )}
+                  {scores.regulatory_convergence_count > 0 && (
+                    <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded text-xs font-medium bg-accent/15 text-accent border border-accent/20">
+                      Convergent regulatory events ×{scores.regulatory_convergence_count}
+                    </span>
+                  )}
+                </div>
+              )}
+              {(scores.cds_phylo_score != null || scores.promoter_phylo_score != null) && (
+                <div className="mt-3 space-y-1">
+                  <p className="text-xs text-text-muted font-medium mb-1">Phylogenetic conservation (phyloP/PhastCons)</p>
+                  {scores.cds_phylo_score != null && (
+                    <KV
+                      label="CDS phylo score"
+                      value={formatFloat(scores.cds_phylo_score)}
+                      mono
+                      tooltip="Mean phyloP score across CDS. Positive = conserved; negative = accelerated evolution (potential adaptation)."
+                    />
+                  )}
+                  {scores.promoter_phylo_score != null && (
+                    <KV
+                      label="Promoter phylo score"
+                      value={formatFloat(scores.promoter_phylo_score)}
+                      mono
+                      tooltip="Mean phyloP score across promoter. Negative values in resilient species suggest adaptive regulatory changes."
+                    />
+                  )}
+                </div>
+              )}
+            </Section>
+          )}
         </div>
       </div>
     </div>

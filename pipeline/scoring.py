@@ -30,7 +30,9 @@ from db.models import (
     DrugTarget,
     EvolutionScore,
     Gene,
+    NucleotideScore,
     Ortholog,
+    PhyloConservationScore,
     RegulatoryDivergence,
     SafetyFlag,
 )
@@ -228,6 +230,62 @@ def regulatory_score(gene_id: str, session) -> float:
     return round(min(max_effect + 0.05 * lineage_count, 1.0), 4)
 
 
+def nucleotide_divergence_score(gene_id: str, session) -> float:
+    """Score [0, 1] from NucleotideScore and PhyloConservationScore tables.
+
+    Combines four signals:
+      1. Promoter conservation (inverted — lower conservation in resilient species
+         implies regulatory divergence, which is the signal of interest):
+           promoter_divergence = 1.0 - conservation_score  (from NucleotideScore)
+      2. Regulatory divergence count (mutations shared by ≥3 resilient species,
+         absent in human + controls), capped at 10 → [0, 1]:
+           div_component = min(divergence_count / 10, 1.0)
+      3. Regulatory convergence count (same mutation in ≥2 distinct lineage clusters):
+           conv_bonus = min(convergence_count / 5, 0.2)   (up to 0.2 bonus)
+      4. PhyloP/PhastCons scores (accelerated evolution = negative phyloP score
+         in the promoter, which we reward):
+           phylo_component = 0 if promoter_phylo_score ≥ 0 else min(-phylo_score / 3, 1.0)
+
+    Returns 0.0 if no nucleotide data is available (gracefully absent before step3c).
+    """
+    ns_promoter = (
+        session.query(NucleotideScore)
+        .filter_by(gene_id=gene_id, region_type="promoter")
+        .first()
+    )
+    if ns_promoter is None:
+        return 0.0
+
+    # 1. Promoter divergence (inverted conservation)
+    cons = ns_promoter.conservation_score or 0.0
+    promoter_divergence = round(1.0 - min(cons, 1.0), 4)
+
+    # 2. Regulatory divergence count
+    div_count = ns_promoter.regulatory_divergence_count or 0
+    div_component = round(min(div_count / 10.0, 1.0), 4)
+
+    # 3. Regulatory convergence count (bonus capped at 0.2)
+    conv_count = ns_promoter.regulatory_convergence_count or 0
+    conv_bonus = round(min(conv_count / 5.0, 0.2), 4)
+
+    # 4. phyloP promoter score: reward accelerated evolution (negative score = faster than neutral)
+    phylo_component = 0.0
+    pcs = session.get(PhyloConservationScore, gene_id)
+    if pcs is not None and pcs.promoter_phylo_score is not None:
+        pps = pcs.promoter_phylo_score
+        if pps < 0:
+            phylo_component = round(min(-pps / 3.0, 1.0), 4)
+
+    # Weighted combination: divergence 40%, div_count 30%, phylo 20%, conv_bonus 10%
+    score = (
+        0.40 * promoter_divergence
+        + 0.30 * div_component
+        + 0.20 * phylo_component
+        + 0.10 * (conv_bonus / 0.2)  # normalise conv_bonus to [0, 1] for weight
+    )
+    return round(min(score + conv_bonus, 1.0), 4)
+
+
 def composite_score(sub_scores: dict[str, float], weights: dict[str, float]) -> float:
     """Weighted sum of sub-scores normalised to [0, 1].
 
@@ -365,7 +423,13 @@ def run_scoring(phase: str = "phase1", trait_id: Optional[str] = None) -> None:
             dis_score = disease_score(ann) if weights.get("disease", 0) > 0 else 0.0
             drug_score = druggability_score(dt) if weights.get("druggability", 0) > 0 else 0.0
             safe_score = safety_score(sf) if weights.get("safety", 0) > 0 else 1.0
-            reg_score = regulatory_score(gene.id, session) if weights.get("regulatory", 0) > 0 else 0.0
+            if weights.get("regulatory", 0) > 0:
+                alpha_score = regulatory_score(gene.id, session)
+                nucl_score  = nucleotide_divergence_score(gene.id, session)
+                # Blend: 60% AlphaGenome + 40% nucleotide (nucleotide is 0 when step3c hasn't run)
+                reg_score = round(0.6 * alpha_score + 0.4 * nucl_score, 4)
+            else:
+                reg_score = 0.0
 
             sub_scores = {
                 "convergence": conv_score,
