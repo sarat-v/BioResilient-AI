@@ -91,15 +91,53 @@ The EC2 instance is the only thing that talks to RDS.
 
 ### Phase 1 — Steps 1–9 (OrthoFinder, MAFFT, IQ-TREE2, HyPhy)
 
+#### Option A — Recommended: fastest turnaround
+
+| Property | Value |
+|----------|-------|
+| Instance | **c7i.8xlarge** |
+| vCPU / RAM | 32 vCPU / 64 GB RAM |
+| Spot price | ~$0.45–0.55/hr |
+| Why | DIAMOND all-vs-all (the bottleneck) scales linearly with cores. 32 cores vs 16 halves OrthoFinder time to ~2–3 h. c7i (Sapphire Rapids) has ~15% higher IPC than c6i so it's the fastest current-gen compute-optimised instance. 64 GB gives headroom for MAFFT + IQ-TREE2 + HyPhy running concurrently. |
+| Est. time | ~8–11 h on Spot |
+| Est. cost | **~$5–7 on Spot** |
+| config | `orthofinder_threads: 30`, `orthofinder_align_threads: 14` |
+
+#### Option B — Budget: cheaper, slower
+
 | Property | Value |
 |----------|-------|
 | Instance | **c6i.4xlarge** |
 | vCPU / RAM | 16 vCPU / 32 GB RAM |
-| On-demand | ~$0.68/hr |
 | Spot price | ~$0.20–0.27/hr |
-| Why | All Phase 1 tools are CPU-bound and multi-threaded. 32 GB handles 18-species OrthoFinder (~22 GB peak RAM). c6i (Ice Lake) gives best price/CPU ratio in AWS. |
+| Why | Best price/CPU ratio; 32 GB is sufficient for 18 species. |
 | Est. time | ~16–20 h on Spot |
 | Est. cost | **~$4–6 on Spot** |
+| config | `orthofinder_threads: 14`, `orthofinder_align_threads: 7` (default) |
+
+#### OrthoFinder time comparison by instance
+
+| Instance | vCPU | DIAMOND time | Total Phase 1 |
+|----------|------|-------------|---------------|
+| c6i.4xlarge | 16 | ~4–6 h | ~16–20 h |
+| c6i.8xlarge | 32 | ~2–3 h | ~8–11 h |
+| **c7i.8xlarge** ✓ | **32** | **~1.5–2 h** | **~8–10 h** |
+| c7i.16xlarge | 64 | ~50–70 min | ~5–6 h |
+
+> **Why not c7i.16xlarge (64 vCPU)?** DIAMOND's gain flattens above ~32–40 threads for typical proteome sizes. The c7i.16xlarge costs ~2× more than c7i.8xlarge but saves only ~1 hour — not worth it for a one-off run.
+
+When using **c7i.8xlarge**, set these in `config/environment.yml`:
+
+```yaml
+tools:
+  cloud:
+    orthofinder_threads: 30       # leave 2 for OS
+    orthofinder_align_threads: 14
+    mafft_threads: 30
+    iqtree_threads: AUTO
+    hyphy_threads: 28
+    minimap2_threads: 28
+```
 
 ### Step 4c only — ESM-1v scoring (GPU-bound, optional)
 
@@ -112,10 +150,10 @@ The EC2 instance is the only thing that talks to RDS.
 | Est. cost | ~$0.04 on Spot (25 min) |
 | Option | Skip the instance switch — run step4c on c6i CPU. Adds ~8 h but saves the switch complexity. |
 
-### Practical simplification
+### Practical recommendation
 
-Run everything on a single **c6i.4xlarge** Spot instance, step 4c on CPU.
-Total: **~$7–9** for one complete 18-species run.
+**Use c7i.8xlarge Spot for one complete run.** Run step 4c on the same instance (CPU, ~8 h extra) to avoid the instance-switch overhead.
+Total: **~$8–11** for one complete 18-species run.
 
 ---
 
@@ -123,7 +161,7 @@ Total: **~$7–9** for one complete 18-species run.
 
 | Service | Spec | Cost |
 |---------|------|------|
-| EC2 Spot | c6i.4xlarge, Ubuntu 22.04 LTS, 100 GB gp3 root | ~$6.50/run |
+| EC2 Spot | c7i.8xlarge (recommended) or c6i.4xlarge, Ubuntu 22.04 LTS, 100 GB gp3 root | ~$5–8/run |
 | RDS PostgreSQL 15 | db.t3.medium, 20 GB gp2, no Multi-AZ | ~$1.63/run |
 | S3 | Private bucket, same region | ~$1.15 (persists for reruns) |
 | IAM | EC2 instance role | free |
