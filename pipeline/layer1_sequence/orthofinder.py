@@ -108,6 +108,7 @@ def run_orthofinder(proteomes_dir: Path) -> Path:
         "orthofinder",
         "-f", str(input_dir),
         "-S", "diamond",
+        "-M", "dendroblast",   # legacy tree method — more stable than MSA+fasttree for large all-vs-all runs
         "-t", str(search_threads),
         "-a", str(align_threads),
         "-o", str(out_dir),
