@@ -115,7 +115,7 @@
     "name": "Chrysemys picta",
     "common_name": "Painted turtle",
     "phenotype": ["cancer_resistance"],
-    "genome_assembly": "GCF_000241865.2",
+    "genome_assembly": "GCF_000241765.4",
     "lineage_group": "Reptiles",
     "cancer_mechanism": "Negligible senescence, extremely low cancer incidence, good genome assembly",
     "geo_search_terms": ["Chrysemys picta", "painted turtle", "negligible senescence", "cancer"]
