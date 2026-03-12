@@ -16,6 +16,7 @@ echo "============================================"
 : "${NCBI_API_KEY:?NCBI_API_KEY environment variable not set}"
 : "${NCBI_EMAIL:?NCBI_EMAIL environment variable not set}"
 : "${RDS_HOST:?RDS_HOST environment variable not set (RDS endpoint)}"
+: "${RDS_PASSWORD:?RDS_PASSWORD environment variable not set (RDS master password)}"
 : "${S3_BUCKET:=bioresillient-data}"
 # Optional API keys (pipeline degrades gracefully without them)
 ALPHAGENOME_KEY="${ALPHAGENOME_API_KEY:-}"
@@ -65,7 +66,7 @@ deployment: cloud
 
 database:
   local:  postgresql://localhost/bioresillient
-  cloud:  postgresql://${RDS_HOST}/bioresillient
+  cloud:  postgresql://bioresillient:${RDS_PASSWORD}@${RDS_HOST}/bioresillient
 
 storage:
   local:  ./data/
