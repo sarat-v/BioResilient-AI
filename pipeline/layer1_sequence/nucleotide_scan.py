@@ -175,13 +175,22 @@ def _download_genome_fasta(species_id: str, assembly: str) -> Optional[Path]:
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _parse_gff3_genes(gff_path: Path) -> dict[str, dict]:
-    """Parse GFF3 and return a dict mapping gene_name/xref → {chrom, start, end, strand, tss}.
+    """Parse GFF3 and return a dict mapping identifiers → {chrom, start, end, strand, tss}.
 
-    Handles both compressed (.gz) and plain GFF3 files. Returns coordinates as
-    1-indexed inclusive integers (GFF3 standard).
+    Indexes the following feature types:
+    - gene / mRNA / transcript  → keyed by Name, gene, Dbxref, ID attributes
+    - CDS                       → keyed by protein_id attribute (matches Ortholog.protein_id)
+
+    For CDS features the coordinates are expanded to the parent gene span so
+    promoter / downstream windows are computed correctly. We store the widest
+    CDS span seen per protein_id.
+
+    Returns 1-indexed inclusive coordinates (GFF3 standard).
     """
     opener = gzip.open if gff_path.suffix == ".gz" else open
     genes: dict[str, dict] = {}
+    # Track CDS spans separately: protein_id → {chrom, min_start, max_end, strand}
+    cds_spans: dict[str, dict] = {}
 
     try:
         with opener(gff_path, "rt", errors="replace") as fh:
@@ -192,14 +201,12 @@ def _parse_gff3_genes(gff_path: Path) -> dict[str, dict]:
                 if len(parts) < 9:
                     continue
                 seqid, _, feat_type, start, end, _, strand, _, attrs = parts
-                if feat_type not in ("gene", "mRNA", "transcript"):
-                    continue
                 try:
                     s, e = int(start), int(end)
                 except ValueError:
                     continue
 
-                # Parse attributes
+                # Parse attributes into dict
                 attr_dict: dict[str, str] = {}
                 for part in attrs.split(";"):
                     part = part.strip()
@@ -207,35 +214,78 @@ def _parse_gff3_genes(gff_path: Path) -> dict[str, dict]:
                         k, _, v = part.partition("=")
                         attr_dict[k.strip()] = v.strip()
 
-                # Collect identifiers we can use to match against ortholog protein_id / gene_symbol
-                for key in ("gene", "Name", "gene_name", "Dbxref", "ID"):
-                    val = attr_dict.get(key, "")
-                    if val:
-                        # Handle comma-separated Dbxref (e.g. "GeneID:12345,Genbank:NP_xxx")
-                        for item in val.split(","):
-                            item = item.strip()
-                            genes[item.upper()] = {
-                                "chrom":  seqid,
-                                "start":  s,
-                                "end":    e,
-                                "strand": strand,
-                                "tss":    s if strand == "+" else e,
-                            }
+                coord = {
+                    "chrom":  seqid,
+                    "start":  s,
+                    "end":    e,
+                    "strand": strand,
+                    "tss":    s if strand == "+" else e,
+                }
+
+                if feat_type in ("gene", "mRNA", "transcript"):
+                    # Index by every useful attribute
+                    for key in ("gene", "Name", "gene_name", "ID"):
+                        val = attr_dict.get(key, "")
+                        if val:
+                            genes[val.upper()] = coord
+                    # Dbxref can be comma-separated: "GeneID:12345,Genbank:NP_xxx"
+                    for item in attr_dict.get("Dbxref", "").split(","):
+                        item = item.strip()
+                        if item:
+                            genes[item.upper()] = coord
+
+                elif feat_type == "CDS":
+                    # protein_id attribute holds the RefSeq protein accession (e.g. XP_004853481.1)
+                    prot_id = attr_dict.get("protein_id", "").strip()
+                    if prot_id:
+                        key = prot_id.upper()
+                        if key not in cds_spans:
+                            cds_spans[key] = {"chrom": seqid, "min_s": s, "max_e": e, "strand": strand}
+                        else:
+                            cds_spans[key]["min_s"] = min(cds_spans[key]["min_s"], s)
+                            cds_spans[key]["max_e"] = max(cds_spans[key]["max_e"], e)
+                        # Also index version-stripped accession (NP_001234.1 → NP_001234)
+                        base = prot_id.split(".")[0].upper()
+                        if base != key:
+                            cds_spans.setdefault(base, cds_spans[key])
+
     except Exception as exc:
         log.warning("  GFF3 parse error for %s: %s", gff_path, exc)
+
+    # Merge CDS spans into genes index
+    for prot_key, span in cds_spans.items():
+        gs = span["min_s"]
+        ge = span["max_e"]
+        st = span["strand"]
+        genes[prot_key] = {
+            "chrom":  span["chrom"],
+            "start":  gs,
+            "end":    ge,
+            "strand": st,
+            "tss":    gs if st == "+" else ge,
+        }
+
     return genes
 
 
 def _find_gene_coords(gene_symbol: str, protein_id: str, gff_index: dict[str, dict]) -> Optional[dict]:
-    """Look up gene coordinates from the GFF3 index using gene symbol or protein ID."""
-    for key in [
-        gene_symbol.upper(),
-        protein_id.upper(),
-        f"GENEID:{protein_id}".upper(),
-        # Strip version suffix (e.g. NP_001234.1 → NP_001234)
-        protein_id.split(".")[0].upper(),
-    ]:
-        if key in gff_index:
+    """Look up gene coordinates from the GFF3 index.
+
+    Tries multiple matching strategies in priority order:
+    1. Exact protein accession match (e.g. XP_004853481.1) — most reliable
+    2. Version-stripped accession (XP_004853481)
+    3. Human gene symbol (e.g. TP53) — works for human; may hit orthologous names
+    4. GeneID: prefixed Dbxref lookup
+    """
+    candidates = [
+        protein_id.upper() if protein_id else "",
+        protein_id.split(".")[0].upper() if protein_id else "",
+        gene_symbol.upper() if gene_symbol else "",
+        f"GENEID:{protein_id}".upper() if protein_id else "",
+        f"GENE:{gene_symbol}".upper() if gene_symbol else "",
+    ]
+    for key in candidates:
+        if key and key in gff_index:
             return gff_index[key]
     return None
 
@@ -408,6 +458,7 @@ def run_nucleotide_scan(gene_ids: list[str] | None = None) -> int:
                 continue
 
             species_written = 0
+            genes_matched = 0
             for gene in genes:
                 species_orthologs = og_index.get(gene.id, {})
                 region_dicts = extract_regions_for_gene(
@@ -415,9 +466,11 @@ def run_nucleotide_scan(gene_ids: list[str] | None = None) -> int:
                 )
                 if region_dicts:
                     species_written += _upsert_regions(session, region_dicts)
+                    genes_matched += 1
 
             session.commit()
-            log.info("  %s: %d regions written", sp.id, species_written)
+            log.info("  %s: %d regions written (%d/%d genes matched in GFF3)",
+                     sp.id, species_written, genes_matched, len(genes))
             total_written += species_written
 
             # Free genome memory before next species
