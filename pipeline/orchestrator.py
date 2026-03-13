@@ -811,6 +811,8 @@ STEPS = {
     "step2":   step2_download_proteomes,
     "step3":   step3_run_orthofinder,
     "step3b":  step3b_load_orthologs,
+    "step3c":  step3c_nucleotide_conservation,
+    "step3d":  step3d_phylo_conservation,
     "step4":   step4_alignment_and_divergence,
     "step4b":  step4b_domain_and_consequence,
     "step4c":  step4c_esm1v,
