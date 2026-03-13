@@ -271,17 +271,24 @@ def _parse_gff3_genes(gff_path: Path) -> dict[str, dict]:
 def _find_gene_coords(gene_symbol: str, protein_id: str, gff_index: dict[str, dict]) -> Optional[dict]:
     """Look up gene coordinates from the GFF3 index.
 
+    The Ortholog table stores protein_id in the format "{species_id}|{accession}"
+    (e.g. "naked_mole_rat|XP_004853481.1") because reheader_fasta() prefixes
+    headers. We strip the species prefix before lookup.
+
     Tries multiple matching strategies in priority order:
-    1. Exact protein accession match (e.g. XP_004853481.1) — most reliable
+    1. Raw accession after stripping species prefix (XP_004853481.1) — most reliable
     2. Version-stripped accession (XP_004853481)
-    3. Human gene symbol (e.g. TP53) — works for human; may hit orthologous names
+    3. Human gene symbol (e.g. TP53)
     4. GeneID: prefixed Dbxref lookup
     """
+    # Strip species prefix if present (format: "species_id|accession")
+    raw_accession = protein_id.split("|")[-1] if protein_id and "|" in protein_id else protein_id
+
     candidates = [
-        protein_id.upper() if protein_id else "",
-        protein_id.split(".")[0].upper() if protein_id else "",
+        raw_accession.upper() if raw_accession else "",
+        raw_accession.split(".")[0].upper() if raw_accession else "",
         gene_symbol.upper() if gene_symbol else "",
-        f"GENEID:{protein_id}".upper() if protein_id else "",
+        f"GENEID:{raw_accession}".upper() if raw_accession else "",
         f"GENE:{gene_symbol}".upper() if gene_symbol else "",
     ]
     for key in candidates:
