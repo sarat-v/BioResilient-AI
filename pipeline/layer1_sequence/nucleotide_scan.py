@@ -84,15 +84,14 @@ def _ncbi_params(**kwargs) -> dict:
 def _download_gff3(species_id: str, assembly: str) -> Optional[Path]:
     """Download and cache the GFF3 annotation for a genome assembly.
 
-    Uses the NCBI Datasets v2 API to fetch the genome + annotation package
-    (includes genomic FASTA + GFF3). Only the GFF3 file is extracted here;
-    the genomic FASTA is fetched separately when sequences are needed.
+    Cache key includes assembly accession so stale files from old assemblies
+    are not reused when the assembly is updated.
     """
     gdir = _genomes_dir(species_id)
     gff_path = gdir / f"{species_id}.gff3.gz"
-    s3_key   = f"genomes/{species_id}/{species_id}.gff3.gz"
+    s3_key   = f"genomes/{species_id}/{assembly}/{species_id}.gff3.gz"
 
-    # Try restoring from S3 first
+    # Try restoring from S3 first (assembly-versioned key)
     if not gff_path.exists():
         sync_from_s3(s3_key, gff_path)
 
@@ -132,10 +131,13 @@ def _download_gff3(species_id: str, assembly: str) -> Optional[Path]:
 
 
 def _download_genome_fasta(species_id: str, assembly: str) -> Optional[Path]:
-    """Download and cache the genomic FASTA for sequence extraction."""
+    """Download and cache the genomic FASTA for sequence extraction.
+
+    Cache key includes assembly accession to avoid stale files from old assemblies.
+    """
     gdir = _genomes_dir(species_id)
     fa_path = gdir / f"{species_id}.genome.fa.gz"
-    s3_key  = f"genomes/{species_id}/{species_id}.genome.fa.gz"
+    s3_key  = f"genomes/{species_id}/{assembly}/{species_id}.genome.fa.gz"
 
     if not fa_path.exists():
         sync_from_s3(s3_key, fa_path)
