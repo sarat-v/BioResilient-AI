@@ -60,11 +60,15 @@ _MIN_CONVERGENT_CLUSTERS = 2
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _detect_aligner() -> str:
-    """Return the first available nucleotide aligner: minimap2 → lastz → blastn."""
-    for tool in ("minimap2", "lastz", "blastn"):
+    """Return the first available nucleotide aligner: blastn → minimap2 → lastz.
+
+    blastn is preferred for cross-species comparisons since minimap2 presets
+    are optimised for same-species or high-identity assemblies.
+    """
+    for tool in ("blastn", "minimap2", "lastz"):
         if shutil.which(tool):
             return tool
-    log.warning("No nucleotide aligner found (minimap2/lastz/blastn). Alignment step will be skipped.")
+    log.warning("No nucleotide aligner found (blastn/minimap2/lastz). Alignment step will be skipped.")
     return ""
 
 
@@ -424,6 +428,7 @@ def run_nucleotide_alignment(gene_ids: list[str] | None = None) -> int:
                         gap_fracs.append(result["gap_fraction"])
 
                 if not pct_ids:
+                    log.debug("  No alignment results for gene %s region %s", gene.gene_symbol, region_type)
                     continue
 
                 mean_pct_id = round(sum(pct_ids) / len(pct_ids), 2)
@@ -446,8 +451,7 @@ def run_nucleotide_alignment(gene_ids: list[str] | None = None) -> int:
                     "regulatory_convergence_count": conv_count,
                 }
                 _upsert_nucleotide_score(session, gene.id, region_type, stats)
-
-            genes_scored += 1
+                genes_scored += 1
 
         session.commit()
 
