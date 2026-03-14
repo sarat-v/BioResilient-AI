@@ -277,21 +277,34 @@ def _find_gene_coords(gene_symbol: str, protein_id: str, gff_index: dict[str, di
     (e.g. "naked_mole_rat|XP_004853481.1") because reheader_fasta() prefixes
     headers. We strip the species prefix before lookup.
 
+    For human, gene_symbol is stored in UniProt format "GENE_HUMAN" (e.g. "TP53_HUMAN").
+    The human GFF3 uses bare gene symbols (e.g. "TP53") in the gene= attribute.
+
     Tries multiple matching strategies in priority order:
-    1. Raw accession after stripping species prefix (XP_004853481.1) — most reliable
-    2. Version-stripped accession (XP_004853481)
-    3. Human gene symbol (e.g. TP53)
-    4. GeneID: prefixed Dbxref lookup
+    1. Raw accession after stripping species prefix — most reliable for non-human
+    2. Version-stripped accession
+    3. Bare gene symbol — strips UniProt species suffix (TP53_HUMAN → TP53)
+    4. Full gene symbol as-is
+    5. GeneID: prefixed Dbxref lookup
     """
     # Strip species prefix if present (format: "species_id|accession")
     raw_accession = protein_id.split("|")[-1] if protein_id and "|" in protein_id else protein_id
 
+    # Strip UniProt species suffix from gene symbol (TP53_HUMAN → TP53)
+    bare_symbol = gene_symbol
+    if gene_symbol and "_" in gene_symbol:
+        parts = gene_symbol.rsplit("_", 1)
+        # Only strip if suffix looks like a species tag (all caps, 2-6 chars)
+        if len(parts[1]) <= 6 and parts[1].isupper():
+            bare_symbol = parts[0]
+
     candidates = [
         raw_accession.upper() if raw_accession else "",
         raw_accession.split(".")[0].upper() if raw_accession else "",
+        bare_symbol.upper() if bare_symbol else "",
         gene_symbol.upper() if gene_symbol else "",
         f"GENEID:{raw_accession}".upper() if raw_accession else "",
-        f"GENE:{gene_symbol}".upper() if gene_symbol else "",
+        f"GENE:{bare_symbol}".upper() if bare_symbol else "",
     ]
     for key in candidates:
         if key and key in gff_index:
