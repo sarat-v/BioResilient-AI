@@ -77,19 +77,32 @@ def _write_fasta(path: Path, seqid: str, seq: str) -> None:
 
 
 def _run_minimap2(query_seq: str, target_seq: str, query_id: str = "query", target_id: str = "target") -> Optional[dict]:
-    """Align query → target with minimap2 -x asm5. Returns alignment stats or None."""
+    """Align query → target with minimap2. Uses asm5 for sequences ≥10 kb,
+    falls back to sr (short-read) preset for shorter sequences."""
     with tempfile.TemporaryDirectory() as tmpdir:
         tmp = Path(tmpdir)
         query_fa  = tmp / "query.fa"
         target_fa = tmp / "target.fa"
         _write_fasta(query_fa,  query_id,  query_seq)
         _write_fasta(target_fa, target_id, target_seq)
+        # asm5 requires long sequences; use sr preset for short regions
+        preset = "asm5" if min(len(query_seq), len(target_seq)) >= 10_000 else "sr"
         try:
             result = subprocess.run(
-                ["minimap2", "-x", "asm5", "--cs", "-c", str(target_fa), str(query_fa)],
+                ["minimap2", "-x", preset, "--cs", "-c", str(target_fa), str(query_fa)],
                 capture_output=True, text=True, timeout=120,
             )
-            return _parse_paf(result.stdout, len(query_seq))
+            parsed = _parse_paf(result.stdout, len(query_seq))
+            if parsed:
+                return parsed
+            # If sr preset also failed, try with no preset (general purpose)
+            if preset == "sr":
+                result2 = subprocess.run(
+                    ["minimap2", "--cs", "-c", str(target_fa), str(query_fa)],
+                    capture_output=True, text=True, timeout=120,
+                )
+                return _parse_paf(result2.stdout, len(query_seq))
+            return None
         except Exception as exc:
             log.debug("minimap2 failed: %s", exc)
             return None
@@ -204,17 +217,22 @@ def _run_lastz(query_seq: str, target_seq: str) -> Optional[dict]:
 
 
 def align_sequences(query_seq: str, target_seq: str, aligner: str) -> Optional[dict]:
-    """Run alignment with the specified tool and return stats dict."""
+    """Run alignment with the specified tool and return stats dict.
+    Always falls back to blastn if primary aligner returns nothing."""
     if not query_seq or not target_seq:
         return None
+    result = None
     if aligner == "minimap2":
-        return _run_minimap2(query_seq, target_seq)
-    if aligner == "lastz":
+        result = _run_minimap2(query_seq, target_seq)
+        if result is None:
+            result = _run_blastn(query_seq, target_seq)
+    elif aligner == "lastz":
         result = _run_lastz(query_seq, target_seq)
-        return result or _run_blastn(query_seq, target_seq)
-    if aligner == "blastn":
-        return _run_blastn(query_seq, target_seq)
-    return None
+        if result is None:
+            result = _run_blastn(query_seq, target_seq)
+    elif aligner == "blastn":
+        result = _run_blastn(query_seq, target_seq)
+    return result
 
 
 # ─────────────────────────────────────────────────────────────────────────────
