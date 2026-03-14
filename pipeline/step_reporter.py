@@ -264,11 +264,24 @@ def _collect_step1() -> dict:
     import time
 
     data: dict[str, Any] = {"step": "step1", "timestamp": _now()}
-    tools = ["orthofinder", "mafft", "iqtree2", "iqtree", "hyphy", "HYPHYMP", "diamond", "fpocket"]
+    # Singleton tools — must be present
+    single_tools = ["orthofinder", "mafft", "diamond", "fpocket"]
+    # Aliased tools — at least one name in each pair must be present
+    aliased_tools = [("iqtree2", "iqtree"), ("hyphy", "HYPHYMP")]
+
+    def _which(t: str) -> bool:
+        return subprocess.run(["which", t], capture_output=True).returncode == 0
+
     found, missing = [], []
-    for t in tools:
-        ok = subprocess.run(["which", t], capture_output=True).returncode == 0
-        (found if ok else missing).append(t)
+    for t in single_tools:
+        (found if _which(t) else missing).append(t)
+    for aliases in aliased_tools:
+        hit = next((a for a in aliases if _which(a)), None)
+        if hit:
+            found.append(hit)
+        else:
+            missing.append(aliases[0])  # report canonical name only
+
     data["tools_found"] = found
     data["tools_missing"] = missing
 
@@ -1082,9 +1095,9 @@ def validate(step: str, data: dict) -> ValidationResult:
             vr.add("database", "PASS", f"{data.get('db_ping_ms')}ms", "reachable")
 
         if not data.get("gpu_available"):
-            vr.add("gpu", "WARN", "not detected",
+            vr.add("gpu", "INFO", "not detected",
                    "optional",
-                   "No GPU — step 4c will run on CPU (~8h instead of ~25 min). Acceptable for CPU instance.")
+                   "No GPU — step 4c (ESM embeddings) will run on CPU. Slower but functional.")
         else:
             vr.add("gpu", "PASS", data.get("gpu_name"), "optional")
 
