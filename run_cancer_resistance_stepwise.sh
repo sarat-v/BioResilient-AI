@@ -51,12 +51,12 @@ declare -a STEP_GROUPS=(
     "Proteome download|step2"
     "OrthoFinder clustering|step3,step3b"
     "Nucleotide region extraction + alignment|step3c"
-    "Phylogenetic conservation scoring|step3d"
     "Divergence + motif finding|step4"
     "Domain & AlphaMissense annotation|step4b"
     "ESM-1v variant scoring|step4c"
     "GoF / LoF direction|step4d"
     "Phylogenetic tree|step5"
+    "Phylogenetic conservation scoring (phyloP/PhastCons)|step3d"
     "MEME positive selection|step6"
     "FEL + BUSTED selection tests|step6b"
     "RELAX rate acceleration|step6c"
@@ -127,6 +127,32 @@ write_and_show_report() {
     python pipeline/step_reporter.py --step "$step" 2>&1
     VALIDATION_STATUS=$?    # 0 = PASS/WARN, 1 = FAIL
     return 0
+}
+
+sync_cache_to_s3() {
+    # Upload step cache files to S3 with date-versioned backup.
+    # Current copy: s3://{bucket}/step_cache/{step}.{md,json}
+    # Versioned copy: s3://{bucket}/step_cache/history/{step}/{date}.{md,json}
+    local step="$1"
+    local bucket="${S3_BUCKET:-bioresilient-data}"
+    local date_tag
+    date_tag=$(date -u +"%Y-%m-%dT%H%M%SZ")
+
+    if ! command -v aws &>/dev/null; then
+        return 0
+    fi
+
+    for ext in json md; do
+        local src="$CACHE_DIR/${step}.${ext}"
+        [[ -f "$src" ]] || continue
+        # Upload as current
+        aws s3 cp "$src" "s3://${bucket}/step_cache/${step}.${ext}" \
+            --quiet 2>/dev/null && \
+            echo -e "${DIM}   S3 cache saved: step_cache/${step}.${ext}${RESET}"
+        # Upload versioned backup
+        aws s3 cp "$src" "s3://${bucket}/step_cache/history/${step}/${date_tag}.${ext}" \
+            --quiet 2>/dev/null
+    done
 }
 
 show_report_md() {
@@ -303,6 +329,7 @@ for grp in "${STEP_GROUPS[@]}"; do
 
     # Write report and validate (using last step of group)
     write_and_show_report "$LAST_STEP"
+    sync_cache_to_s3 "$LAST_STEP"
     VSTATUS="PASS"
     if [[ -f "$CACHE_DIR/${LAST_STEP}.json" ]]; then
         VSTATUS=$(python -c "
