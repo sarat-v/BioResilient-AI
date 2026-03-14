@@ -252,22 +252,35 @@ def run_divergence_pipeline(
     Returns {og_id: [motif_dict, ...]}
     """
     n_cpu = os.cpu_count() or 8
-    n_workers = max(1, n_cpu - 2)
+    # Use fewer workers to avoid memory pressure with 12k large orthogroups in flight
+    n_workers = max(1, min(n_cpu - 2, 32))
     items = list(aligned_orthogroups.items())
     total = len(items)
 
     all_motifs: dict[str, list[dict]] = {}
     motif_total = 0
+    done = 0
 
     log.info("Divergence scan: %d orthogroups with %d parallel workers.", total, n_workers)
 
     with ProcessPoolExecutor(max_workers=n_workers) as pool:
-        futures = {pool.submit(_divergence_worker, item): item[0] for item in items}
-        for future in as_completed(futures):
-            og_id, motifs = future.result()
-            if motifs:
-                all_motifs[og_id] = motifs
-                motif_total += len(motifs)
+        # Submit in batches of 500 to avoid holding 12k futures in memory
+        batch_size = 500
+        for batch_start in range(0, total, batch_size):
+            batch = items[batch_start: batch_start + batch_size]
+            futures = {pool.submit(_divergence_worker, item): item[0] for item in batch}
+            for future in as_completed(futures, timeout=300):
+                try:
+                    og_id, motifs = future.result(timeout=60)
+                    if motifs:
+                        all_motifs[og_id] = motifs
+                        motif_total += len(motifs)
+                except Exception as exc:
+                    og_id = futures[future]
+                    log.debug("Divergence worker failed for %s: %s", og_id, exc)
+                done += 1
+                if done % 1000 == 0 or done == total:
+                    log.info("  Divergence: %d / %d orthogroups (%.0f%%).", done, total, 100 * done / total)
 
     log.info("Divergence scan: %d motifs across %d orthogroups.", motif_total, len(all_motifs))
     return all_motifs
