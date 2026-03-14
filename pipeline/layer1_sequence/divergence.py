@@ -11,7 +11,6 @@ Threshold: a motif is flagged if sequence identity < 85% in ≥ 2 protective spe
 
 import logging
 import os
-from concurrent.futures import ProcessPoolExecutor, as_completed
 from pathlib import Path
 from typing import Optional
 
@@ -244,43 +243,37 @@ def _divergence_worker(args: tuple) -> tuple[str, list[dict]]:
     return og_id, extract_divergent_motifs(og_id, aligned_seqs)
 
 
+def _divergence_worker_simple(aligned_seqs: dict[str, str]) -> list[dict]:
+    """Worker for pool.map — takes sequences only, returns motifs list."""
+    try:
+        return extract_divergent_motifs("", aligned_seqs)
+    except Exception:
+        return []
+
+
 def run_divergence_pipeline(
     aligned_orthogroups: dict[str, dict[str, str]],
 ) -> dict[str, list[dict]]:
-    """Run sliding window divergence for all aligned orthogroups in parallel.
+    """Run sliding window divergence for all aligned orthogroups.
 
+    Pure Python sliding window — fast enough sequentially (no subprocess overhead).
     Returns {og_id: [motif_dict, ...]}
     """
-    n_cpu = os.cpu_count() or 8
-    # Use fewer workers to avoid memory pressure with 12k large orthogroups in flight
-    n_workers = max(1, min(n_cpu - 2, 32))
     items = list(aligned_orthogroups.items())
     total = len(items)
 
     all_motifs: dict[str, list[dict]] = {}
     motif_total = 0
-    done = 0
 
-    log.info("Divergence scan: %d orthogroups with %d parallel workers.", total, n_workers)
+    log.info("Divergence scan: %d orthogroups (sequential sliding window).", total)
 
-    with ProcessPoolExecutor(max_workers=n_workers) as pool:
-        # Submit in batches of 500 to avoid holding 12k futures in memory
-        batch_size = 500
-        for batch_start in range(0, total, batch_size):
-            batch = items[batch_start: batch_start + batch_size]
-            futures = {pool.submit(_divergence_worker, item): item[0] for item in batch}
-            for future in as_completed(futures, timeout=300):
-                try:
-                    og_id, motifs = future.result(timeout=60)
-                    if motifs:
-                        all_motifs[og_id] = motifs
-                        motif_total += len(motifs)
-                except Exception as exc:
-                    og_id = futures[future]
-                    log.debug("Divergence worker failed for %s: %s", og_id, exc)
-                done += 1
-                if done % 1000 == 0 or done == total:
-                    log.info("  Divergence: %d / %d orthogroups (%.0f%%).", done, total, 100 * done / total)
+    for done, (og_id, aligned_seqs) in enumerate(items, 1):
+        motifs = extract_divergent_motifs(og_id, aligned_seqs)
+        if motifs:
+            all_motifs[og_id] = motifs
+            motif_total += len(motifs)
+        if done % 2000 == 0 or done == total:
+            log.info("  Divergence: %d / %d orthogroups (%.0f%%).", done, total, 100 * done / total)
 
     log.info("Divergence scan: %d motifs across %d orthogroups.", motif_total, len(all_motifs))
     return all_motifs
