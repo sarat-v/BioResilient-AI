@@ -30,6 +30,7 @@ import re
 import subprocess
 import tempfile
 import time
+from concurrent.futures import ProcessPoolExecutor, as_completed
 from pathlib import Path
 from typing import Optional
 
@@ -474,68 +475,82 @@ def parse_busted_results(busted_json: dict) -> dict:
 # FEL + BUSTED pipeline entry point
 # ---------------------------------------------------------------------------
 
+def _fel_busted_worker(args: tuple) -> tuple[str, dict]:
+    """Top-level worker: run FEL + BUSTED for one orthogroup."""
+    og_id, aligned_seqs, species_treefile_str = args
+    from pipeline.layer2_evolution.phylo_tree import prune_tree_to_species
+    from pathlib import Path as _Path
+    from Bio import SeqIO as _SeqIO
+
+    root = get_storage_root()
+    species_ids = [label.split("|")[0] for label in aligned_seqs]
+    pruned_tree = prune_tree_to_species(_Path(species_treefile_str), species_ids)
+
+    codon_aln_path = _Path(root) / "meme" / og_id / "codon_aln.fna"
+    codon_aln = None
+    if codon_aln_path.exists():
+        try:
+            codon_aln = {r.id: str(r.seq) for r in _SeqIO.parse(str(codon_aln_path), "fasta")}
+        except Exception:
+            codon_aln = None
+
+    if codon_aln is None:
+        cds_seqs: dict[str, str] = {}
+        for label in aligned_seqs:
+            parts = label.split("|")
+            accession = parts[-1] if parts else label
+            cds = fetch_cds_for_protein(accession)
+            if cds:
+                cds_seqs[label] = cds
+        if len(cds_seqs) == len(aligned_seqs):
+            codon_aln = protein_to_codon_alignment(aligned_seqs, cds_seqs)
+
+    if codon_aln is None:
+        return og_id, {}
+
+    fel_json = run_fel(codon_aln, pruned_tree, og_id)
+    busted_json = run_busted(codon_aln, pruned_tree, og_id)
+    fel_result = parse_fel_results(fel_json) if fel_json else {"fel_sites": 0}
+    busted_result = parse_busted_results(busted_json) if busted_json else {"busted_pvalue": 1.0}
+    return og_id, {**fel_result, **busted_result}
+
+
 def run_fel_busted_pipeline(
     aligned_orthogroups: dict[str, dict[str, str]],
     motifs_by_og: dict[str, list],
     species_treefile: Path,
 ) -> dict[str, dict]:
-    """Run FEL and BUSTED for all candidate orthogroups that have codon alignments.
-
-    Reads existing codon alignments from disk (written by run_meme_pipeline).
-    Falls back gracefully if codon alignment files are missing.
+    """Run FEL and BUSTED in parallel for all candidate orthogroups.
 
     Returns {og_id: {"fel_sites": int, "busted_pvalue": float}}.
     """
-    from pipeline.layer2_evolution.phylo_tree import prune_tree_to_species
     from pipeline.layer2_evolution.selection import _should_run_hyphy
 
-    all_results: dict[str, dict] = {}
     candidates = [og for og in aligned_orthogroups if _should_run_hyphy(og, motifs_by_og)]
     log.info("Running FEL + BUSTED on %d candidate orthogroups...", len(candidates))
 
-    root = Path(get_storage_root())
-    success = 0
+    n_cpu = os.cpu_count() or 8
+    n_workers = max(1, n_cpu - 2)
+    total = len(candidates)
+    all_results: dict[str, dict] = {}
+    done = 0
 
-    for og_id in candidates:
-        aligned_seqs = aligned_orthogroups[og_id]
-        species_ids = [label.split("|")[0] for label in aligned_seqs]
-        pruned_tree = prune_tree_to_species(species_treefile, species_ids)
+    work_items = [
+        (og_id, aligned_orthogroups[og_id], str(species_treefile))
+        for og_id in candidates
+    ]
 
-        # Reuse codon alignment from MEME step if it exists
-        codon_aln_path = root / "meme" / og_id / "codon_aln.fna"
-        codon_aln: Optional[dict[str, str]] = None
-        if codon_aln_path.exists():
-            try:
-                from Bio import SeqIO
-                codon_aln = {r.id: str(r.seq) for r in SeqIO.parse(str(codon_aln_path), "fasta")}
-            except Exception:
-                codon_aln = None
+    with ProcessPoolExecutor(max_workers=n_workers) as pool:
+        futures = {pool.submit(_fel_busted_worker, item): item[0] for item in work_items}
+        for future in as_completed(futures):
+            og_id, result = future.result()
+            done += 1
+            if result:
+                all_results[og_id] = result
+            if done % 100 == 0 or done == total:
+                log.info("  FEL+BUSTED: %d / %d orthogroups (%.0f%%).", done, total, 100 * done / total)
 
-        if codon_aln is None:
-            # No codon alignment available — try to build it
-            cds_seqs: dict[str, str] = {}
-            for label in aligned_seqs:
-                parts = label.split("|")
-                accession = parts[-1] if parts else label
-                cds = fetch_cds_for_protein(accession)
-                if cds:
-                    cds_seqs[label] = cds
-            if len(cds_seqs) == len(aligned_seqs):
-                codon_aln = protein_to_codon_alignment(aligned_seqs, cds_seqs)
-
-        if codon_aln is None:
-            continue
-
-        fel_json = run_fel(codon_aln, pruned_tree, og_id)
-        busted_json = run_busted(codon_aln, pruned_tree, og_id)
-
-        fel_result = parse_fel_results(fel_json) if fel_json else {"fel_sites": 0}
-        busted_result = parse_busted_results(busted_json) if busted_json else {"busted_pvalue": 1.0}
-
-        all_results[og_id] = {**fel_result, **busted_result}
-        success += 1
-
-    log.info("FEL + BUSTED complete: %d / %d orthogroups processed.", success, len(candidates))
+    log.info("FEL + BUSTED complete: %d / %d orthogroups processed.", len(all_results), len(candidates))
     return all_results
 
 
@@ -635,50 +650,68 @@ def parse_relax_results(relax_json: dict) -> dict:
         return {"relax_k": None, "relax_pvalue": None}
 
 
+def _relax_worker(args: tuple) -> tuple[str, Optional[dict]]:
+    """Top-level worker: run RELAX for one orthogroup."""
+    og_id, aligned_seqs, species_treefile_str, storage_root = args
+    from pipeline.layer2_evolution.phylo_tree import prune_tree_to_species
+    from pathlib import Path as _Path
+    from Bio import SeqIO as _SeqIO
+
+    codon_aln_path = _Path(storage_root) / "meme" / og_id / "codon_aln.fna"
+    if not codon_aln_path.exists():
+        return og_id, None
+    try:
+        codon_aln = {rec.id: str(rec.seq) for rec in _SeqIO.parse(str(codon_aln_path), "fasta")}
+    except Exception:
+        return og_id, None
+    if not codon_aln:
+        return og_id, None
+
+    species_ids = [label.split("|")[0] for label in aligned_seqs]
+    pruned_tree = prune_tree_to_species(_Path(species_treefile_str), species_ids)
+    relax_json = run_relax(codon_aln, pruned_tree, og_id)
+    if relax_json is not None:
+        return og_id, parse_relax_results(relax_json)
+    return og_id, None
+
+
 def run_relax_pipeline(
     aligned_orthogroups: dict[str, dict[str, str]],
     motifs_by_og: dict[str, list],
     species_treefile: Path,
 ) -> dict[str, dict]:
-    """Run RELAX for all candidate orthogroups that have codon alignments.
+    """Run RELAX in parallel for all candidate orthogroups that have codon alignments.
 
     Returns {og_id: {"relax_k": float, "relax_pvalue": float}}.
     """
-    from pipeline.layer2_evolution.phylo_tree import prune_tree_to_species
     from pipeline.layer2_evolution.selection import _should_run_hyphy
 
-    all_results: dict[str, dict] = {}
     candidates = [og for og in aligned_orthogroups if _should_run_hyphy(og, motifs_by_og)]
     log.info("Running RELAX on %d candidate orthogroups...", len(candidates))
 
-    root = Path(get_storage_root())
-    success = 0
+    n_cpu = os.cpu_count() or 8
+    n_workers = max(1, n_cpu - 2)
+    total = len(candidates)
+    all_results: dict[str, dict] = {}
+    done = 0
+    storage_root = str(get_storage_root())
 
-    for og_id in candidates:
-        aligned_seqs = aligned_orthogroups[og_id]
-        species_ids = [label.split("|")[0] for label in aligned_seqs]
-        pruned_tree = prune_tree_to_species(species_treefile, species_ids)
+    work_items = [
+        (og_id, aligned_orthogroups[og_id], str(species_treefile), storage_root)
+        for og_id in candidates
+    ]
 
-        codon_aln_path = root / "meme" / og_id / "codon_aln.fna"
-        if not codon_aln_path.exists():
-            continue
+    with ProcessPoolExecutor(max_workers=n_workers) as pool:
+        futures = {pool.submit(_relax_worker, item): item[0] for item in work_items}
+        for future in as_completed(futures):
+            og_id, result = future.result()
+            done += 1
+            if result is not None:
+                all_results[og_id] = result
+            if done % 100 == 0 or done == total:
+                log.info("  RELAX: %d / %d orthogroups (%.0f%%).", done, total, 100 * done / total)
 
-        try:
-            from Bio import SeqIO as _SeqIO
-            codon_aln = {rec.id: str(rec.seq) for rec in _SeqIO.parse(str(codon_aln_path), "fasta")}
-        except Exception:
-            continue
-
-        if not codon_aln:
-            continue
-
-        relax_json = run_relax(codon_aln, pruned_tree, og_id)
-        if relax_json is not None:
-            parsed = parse_relax_results(relax_json)
-            all_results[og_id] = parsed
-            success += 1
-
-    log.info("RELAX complete: %d / %d orthogroups", success, len(candidates))
+    log.info("RELAX complete: %d / %d orthogroups", len(all_results), len(candidates))
     return all_results
 
 
@@ -686,72 +719,86 @@ def run_relax_pipeline(
 # Pipeline entry point
 # ---------------------------------------------------------------------------
 
+def _meme_worker(args: tuple) -> tuple[str, Optional[dict]]:
+    """Top-level worker: run MEME (or aBSREL proxy) for one orthogroup."""
+    og_id, aligned_seqs, species_treefile_str, motifs_by_og = args
+    from pipeline.layer2_evolution.phylo_tree import prune_tree_to_species
+    from pipeline.layer2_evolution.selection import (
+        _should_run_hyphy, parse_absrel_results, run_absrel, write_hyphy_input,
+    )
+    species_ids = [label.split("|")[0] for label in aligned_seqs]
+    pruned_tree = prune_tree_to_species(Path(species_treefile_str), species_ids)
+
+    cds_seqs: dict[str, str] = {}
+    for label in aligned_seqs:
+        parts = label.split("|")
+        accession = parts[-1] if parts else label
+        cds = fetch_cds_for_protein(accession)
+        if cds:
+            cds_seqs[label] = cds
+
+    codon_aln = None
+    if len(cds_seqs) == len(aligned_seqs):
+        codon_aln = protein_to_codon_alignment(aligned_seqs, cds_seqs)
+
+    if codon_aln is not None:
+        meme_json = run_meme(codon_aln, pruned_tree, og_id)
+        if meme_json is not None:
+            return og_id, ("meme", parse_meme_results(meme_json, og_id))
+
+    aln_path, tree_path = write_hyphy_input(og_id, aligned_seqs, pruned_tree)
+    raw_result = run_absrel(aln_path, tree_path, og_id)
+    if raw_result is not None:
+        return og_id, ("proxy", parse_absrel_results(raw_result))
+    return og_id, None
+
+
 def run_meme_pipeline(
     aligned_orthogroups: dict[str, dict[str, str]],
     motifs_by_og: dict[str, list],
     species_treefile: Path,
 ) -> dict[str, dict]:
-    """Run MEME for all candidate orthogroups.
+    """Run MEME in parallel for all candidate orthogroups.
 
     Falls back to protein divergence proxy for any orthogroup where CDS
     fetching fails (e.g. UniProt accessions, missing NCBI links).
 
     Returns {og_id: parsed_selection_result}.
     """
-    from pipeline.layer2_evolution.phylo_tree import prune_tree_to_species
-    from pipeline.layer2_evolution.selection import (
-        _should_run_hyphy,
-        parse_absrel_results,
-        run_absrel,
-        write_hyphy_input,
-    )
-
-    all_results: dict[str, dict] = {}
     candidates = [og for og in aligned_orthogroups if _should_run_hyphy(og, motifs_by_og)]
     log.info("Running MEME on %d candidate orthogroups (falls back to proxy if CDS unavailable)...",
              len(candidates))
 
+    n_cpu = os.cpu_count() or 8
+    n_workers = max(1, n_cpu - 2)
+    total = len(candidates)
+    all_results: dict[str, dict] = {}
     meme_success = 0
     proxy_fallback = 0
+    done = 0
 
-    for og_id in candidates:
-        aligned_seqs = aligned_orthogroups[og_id]
-        species_ids = [label.split("|")[0] for label in aligned_seqs]
-        pruned_tree = prune_tree_to_species(species_treefile, species_ids)
+    work_items = [
+        (og_id, aligned_orthogroups[og_id], str(species_treefile), motifs_by_og)
+        for og_id in candidates
+    ]
 
-        # --- Try MEME path ---
-        cds_seqs: dict[str, str] = {}
-        for label in aligned_seqs:
-            # Extract protein accession from label "species|species|accession"
-            parts = label.split("|")
-            accession = parts[-1] if parts else label
-            cds = fetch_cds_for_protein(accession)
-            if cds:
-                cds_seqs[label] = cds
-
-        codon_aln = None
-        if len(cds_seqs) == len(aligned_seqs):
-            # All CDS available — try full codon alignment
-            codon_aln = protein_to_codon_alignment(aligned_seqs, cds_seqs)
-
-        if codon_aln is not None:
-            meme_json = run_meme(codon_aln, pruned_tree, og_id)
-            if meme_json is not None:
-                parsed = parse_meme_results(meme_json, og_id)
+    with ProcessPoolExecutor(max_workers=n_workers) as pool:
+        futures = {pool.submit(_meme_worker, item): item[0] for item in work_items}
+        for future in as_completed(futures):
+            og_id, result = future.result()
+            done += 1
+            if result is not None:
+                kind, parsed = result
                 all_results[og_id] = parsed
-                meme_success += 1
-                continue
+                if kind == "meme":
+                    meme_success += 1
+                else:
+                    proxy_fallback += 1
+            if done % 100 == 0 or done == total:
+                log.info("  MEME: %d / %d orthogroups (%.0f%%).", done, total, 100 * done / total)
 
-        # --- Fallback to protein divergence proxy ---
-        aln_path, tree_path = write_hyphy_input(og_id, aligned_seqs, pruned_tree)
-        raw_result = run_absrel(aln_path, tree_path, og_id)
-        if raw_result is not None:
-            parsed = parse_absrel_results(raw_result)
-            all_results[og_id] = parsed
-            proxy_fallback += 1
-
-    log.info("MEME complete: %d MEME + %d proxy = %d / %d orthogroups",
-             meme_success, proxy_fallback, len(all_results), len(candidates))
+    log.info("MEME complete: %d MEME, %d proxy fallback, %d failed.",
+             meme_success, proxy_fallback, total - meme_success - proxy_fallback)
 
     # Apply Benjamini-Hochberg FDR correction across all site-level p-values
     from pipeline.stats import apply_bh_to_meme_results

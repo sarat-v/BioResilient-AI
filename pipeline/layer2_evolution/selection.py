@@ -12,6 +12,7 @@ import logging
 import os
 import subprocess
 import tempfile
+from concurrent.futures import ProcessPoolExecutor, as_completed
 from pathlib import Path
 from typing import Optional
 
@@ -291,12 +292,25 @@ def build_gene_og_map() -> dict[str, str]:
     return og_map
 
 
+def _absrel_worker(args: tuple) -> tuple[str, Optional[dict]]:
+    """Top-level worker for multiprocessing."""
+    og_id, aligned_seqs, species_treefile_str = args
+    from pipeline.layer2_evolution.phylo_tree import prune_tree_to_species
+    species_ids = [label.split("|")[0] for label in aligned_seqs]
+    pruned_tree = prune_tree_to_species(Path(species_treefile_str), species_ids)
+    aln_path, tree_path = write_hyphy_input(og_id, aligned_seqs, pruned_tree)
+    raw_result = run_absrel(aln_path, tree_path, og_id)
+    if raw_result is None:
+        return og_id, None
+    return og_id, parse_absrel_results(raw_result)
+
+
 def run_selection_pipeline(
     aligned_orthogroups: dict[str, dict[str, str]],
     motifs_by_og: dict[str, list],
     species_treefile: Path,
 ) -> dict[str, dict]:
-    """Run HyPhy aBSREL for all candidate orthogroups.
+    """Run HyPhy aBSREL in parallel across all candidate orthogroups.
 
     Args:
         aligned_orthogroups: {og_id: {label: aligned_seq}}
@@ -306,28 +320,32 @@ def run_selection_pipeline(
     Returns:
         {og_id: parsed_absrel_result}
     """
-    from pipeline.layer2_evolution.phylo_tree import prune_tree_to_species
-
-    all_results: dict[str, dict] = {}
     candidates = [og for og in aligned_orthogroups if _should_run_hyphy(og, motifs_by_og)]
     log.info("Running HyPhy aBSREL on %d candidate orthogroups...", len(candidates))
 
-    for og_id in candidates:
-        aligned_seqs = aligned_orthogroups[og_id]
-        species_ids = [label.split("|")[0] for label in aligned_seqs]
-        pruned_tree = prune_tree_to_species(species_treefile, species_ids)
+    n_cpu = os.cpu_count() or 8
+    n_workers = max(1, n_cpu - 2)
+    total = len(candidates)
+    all_results: dict[str, dict] = {}
+    done = 0
 
-        aln_path, tree_path = write_hyphy_input(og_id, aligned_seqs, pruned_tree)
-        raw_result = run_absrel(aln_path, tree_path, og_id)
+    work_items = [
+        (og_id, aligned_orthogroups[og_id], str(species_treefile))
+        for og_id in candidates
+    ]
 
-        if raw_result is None:
-            continue
-
-        parsed = parse_absrel_results(raw_result)
-        all_results[og_id] = parsed
-        log.debug("  %s: dN/dS=%.3f p=%.4f branches=%s",
-                  og_id, parsed["dnds_ratio"], parsed["dnds_pvalue"],
-                  parsed["branches_under_selection"])
+    with ProcessPoolExecutor(max_workers=n_workers) as pool:
+        futures = {pool.submit(_absrel_worker, item): item[0] for item in work_items}
+        for future in as_completed(futures):
+            og_id, result = future.result()
+            done += 1
+            if result is not None:
+                all_results[og_id] = result
+                log.debug("  %s: dN/dS=%.3f p=%.4f branches=%s",
+                          og_id, result["dnds_ratio"], result["dnds_pvalue"],
+                          result["branches_under_selection"])
+            if done % 100 == 0 or done == total:
+                log.info("  HyPhy aBSREL: %d / %d orthogroups (%.0f%%).", done, total, 100 * done / total)
 
     log.info("HyPhy complete: %d / %d orthogroups processed.", len(all_results), len(candidates))
     return all_results
