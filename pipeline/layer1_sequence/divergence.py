@@ -288,6 +288,7 @@ def update_sequence_identities(aligned_orthogroups: dict[str, dict[str, str]]) -
     from pipeline.layer1_sequence.alignment import calculate_sequence_identity
 
     # Build {(species_id, protein_id): identity} map in memory first
+    log.info("  Computing sequence identities for %d orthogroups...", len(aligned_orthogroups))
     identity_map: dict[tuple[str, str], float] = {}
     for og_id, aligned_seqs in aligned_orthogroups.items():
         human_seq = _get_human_sequence(aligned_seqs)
@@ -300,6 +301,7 @@ def update_sequence_identities(aligned_orthogroups: dict[str, dict[str, str]]) -
             identity_map[(species_id, protein_id)] = round(
                 calculate_sequence_identity(human_seq, animal_seq), 2
             )
+    log.info("  Identity map built: %d pairs.", len(identity_map))
 
     if not identity_map:
         return

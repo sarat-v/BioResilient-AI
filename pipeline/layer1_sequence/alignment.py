@@ -158,22 +158,35 @@ def calculate_sequence_identity(seq_a: str, seq_b: str) -> float:
 
     Returns a value in [0, 100] (percentage).
     Gaps in both sequences are excluded from the denominator.
+    Uses numpy for fast vectorized comparison.
     """
     if len(seq_a) != len(seq_b):
         raise ValueError("Sequences must be aligned (same length).")
 
-    matches = 0
-    comparable = 0
-    for a, b in zip(seq_a, seq_b):
-        if a == "-" and b == "-":
-            continue
-        comparable += 1
-        if a == b:
-            matches += 1
-
-    if comparable == 0:
-        return 0.0
-    return (matches / comparable) * 100.0
+    try:
+        import numpy as np
+        a = np.frombuffer(seq_a.encode(), dtype=np.uint8)
+        b = np.frombuffer(seq_b.encode(), dtype=np.uint8)
+        gap = ord("-")
+        both_gap = (a == gap) & (b == gap)
+        comparable = int((~both_gap).sum())
+        if comparable == 0:
+            return 0.0
+        matches = int(((a == b) & ~both_gap).sum())
+        return (matches / comparable) * 100.0
+    except Exception:
+        # Pure Python fallback
+        matches = 0
+        comparable = 0
+        for a, b in zip(seq_a, seq_b):
+            if a == "-" and b == "-":
+                continue
+            comparable += 1
+            if a == b:
+                matches += 1
+        if comparable == 0:
+            return 0.0
+        return (matches / comparable) * 100.0
 
 
 def _align_worker(args: tuple) -> tuple[str, Optional[dict[str, str]]]:
