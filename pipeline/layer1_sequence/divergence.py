@@ -280,28 +280,49 @@ def run_divergence_pipeline(
 
 
 def update_sequence_identities(aligned_orthogroups: dict[str, dict[str, str]]) -> None:
-    """Update Ortholog.sequence_identity_pct in the database from alignment data."""
+    """Update Ortholog.sequence_identity_pct in the database from alignment data.
+
+    Uses a bulk UPDATE via a single pass: compute all identities in memory,
+    then batch-update in chunks to avoid N+1 queries.
+    """
     from pipeline.layer1_sequence.alignment import calculate_sequence_identity
 
-    with get_session() as session:
-        for og_id, aligned_seqs in aligned_orthogroups.items():
-            human_seq = _get_human_sequence(aligned_seqs)
-            if human_seq is None:
+    # Build {(species_id, protein_id): identity} map in memory first
+    identity_map: dict[tuple[str, str], float] = {}
+    for og_id, aligned_seqs in aligned_orthogroups.items():
+        human_seq = _get_human_sequence(aligned_seqs)
+        if human_seq is None:
+            continue
+        for label, animal_seq in aligned_seqs.items():
+            if "human" in label:
                 continue
+            species_id, protein_id = _parse_label(label)
+            identity_map[(species_id, protein_id)] = round(
+                calculate_sequence_identity(human_seq, animal_seq), 2
+            )
 
-            for label, animal_seq in aligned_seqs.items():
-                if "human" in label:
-                    continue
-                species_id, protein_id = _parse_label(label)
+    if not identity_map:
+        return
 
-                identity = calculate_sequence_identity(human_seq, animal_seq)
+    # Bulk update in chunks of 1000
+    chunk_size = 1000
+    keys = list(identity_map.keys())
+    updated = 0
+    with get_session() as session:
+        for i in range(0, len(keys), chunk_size):
+            chunk = keys[i: i + chunk_size]
+            # Fetch all matching orthologs in one query
+            conditions = [
+                (Ortholog.species_id == sid) & (Ortholog.protein_id == pid)
+                for sid, pid in chunk
+            ]
+            from sqlalchemy import or_
+            orthologs = session.query(Ortholog).filter(or_(*conditions)).all()
+            for o in orthologs:
+                key = (o.species_id, o.protein_id)
+                if key in identity_map:
+                    o.sequence_identity_pct = identity_map[key]
+                    updated += 1
+            session.flush()
 
-                ortholog = (
-                    session.query(Ortholog)
-                    .filter_by(species_id=species_id, protein_id=protein_id)
-                    .first()
-                )
-                if ortholog:
-                    ortholog.sequence_identity_pct = round(identity, 2)
-
-    log.info("Sequence identities updated.")
+    log.info("Sequence identities updated: %d rows.", updated)
