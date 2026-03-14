@@ -23,12 +23,14 @@ Entry point: run_nucleotide_alignment(gene_ids=None) -> int
 """
 
 import logging
+import os
 import re
 import shutil
 import subprocess
 import tempfile
 import uuid
 from collections import defaultdict
+from concurrent.futures import ProcessPoolExecutor, as_completed
 from pathlib import Path
 from typing import Optional
 
@@ -80,7 +82,7 @@ def _write_fasta(path: Path, seqid: str, seq: str) -> None:
     path.write_text(f">{seqid}\n{seq}\n")
 
 
-def _run_minimap2(query_seq: str, target_seq: str, query_id: str = "query", target_id: str = "target") -> Optional[dict]:
+def _run_minimap2(query_seq: str, target_seq: str, query_id: str = "query", target_id: str = "target", threads: int = 1) -> Optional[dict]:
     """Align query → target with minimap2. Uses asm5 for sequences ≥10 kb,
     falls back to sr (short-read) preset for shorter sequences."""
     with tempfile.TemporaryDirectory() as tmpdir:
@@ -93,7 +95,7 @@ def _run_minimap2(query_seq: str, target_seq: str, query_id: str = "query", targ
         preset = "asm5" if min(len(query_seq), len(target_seq)) >= 10_000 else "sr"
         try:
             result = subprocess.run(
-                ["minimap2", "-x", preset, "--cs", "-c", str(target_fa), str(query_fa)],
+                ["minimap2", "-x", preset, "-t", str(threads), "--cs", "-c", str(target_fa), str(query_fa)],
                 capture_output=True, text=True, timeout=120,
             )
             parsed = _parse_paf(result.stdout, len(query_seq))
@@ -102,7 +104,7 @@ def _run_minimap2(query_seq: str, target_seq: str, query_id: str = "query", targ
             # If sr preset also failed, try with no preset (general purpose)
             if preset == "sr":
                 result2 = subprocess.run(
-                    ["minimap2", "--cs", "-c", str(target_fa), str(query_fa)],
+                    ["minimap2", "-t", str(threads), "--cs", "-c", str(target_fa), str(query_fa)],
                     capture_output=True, text=True, timeout=120,
                 )
                 return _parse_paf(result2.stdout, len(query_seq))
@@ -149,7 +151,7 @@ def _parse_paf(paf_output: str, query_len: int) -> Optional[dict]:
     return best
 
 
-def _run_blastn(query_seq: str, target_seq: str) -> Optional[dict]:
+def _run_blastn(query_seq: str, target_seq: str, threads: int = 1) -> Optional[dict]:
     """Fallback alignment using BLASTN when minimap2/lastz are unavailable."""
     with tempfile.TemporaryDirectory() as tmpdir:
         tmp = Path(tmpdir)
@@ -166,7 +168,8 @@ def _run_blastn(query_seq: str, target_seq: str) -> Optional[dict]:
             res = subprocess.run(
                 ["blastn", "-query", str(query_fa), "-db", str(db_path),
                  "-outfmt", "6 pident length gaps",
-                 "-num_alignments", "1", "-dust", "no"],
+                 "-num_alignments", "1", "-dust", "no",
+                 "-num_threads", str(threads)],
                 capture_output=True, text=True, timeout=120,
             )
             for line in res.stdout.strip().splitlines():
@@ -368,12 +371,68 @@ def _upsert_nucleotide_score(session, gene_id: str, region_type: str, stats: dic
 # Main entry point
 # ─────────────────────────────────────────────────────────────────────────────
 
+def _score_gene(args: tuple) -> tuple[str, dict[str, dict] | None]:
+    """Worker: align all region_types for a single gene and return scores.
+
+    Runs in a subprocess worker — DB writes are done in the main process.
+    Returns (gene_id, {region_type: stats_dict}) or (gene_id, None) on skip.
+    """
+    gene_id, gene_symbol, gene_regions_data, species_meta_data, aligner = args
+
+    # gene_regions_data: [{region_type, species_id, sequence}, ...]
+    by_type: dict[str, dict] = defaultdict(dict)
+    for row in gene_regions_data:
+        by_type[row["region_type"]][row["species_id"]] = row["sequence"]
+
+    results: dict[str, dict] = {}
+    for region_type, regions_by_species in by_type.items():
+        human_seq = regions_by_species.get("human")
+        if not human_seq:
+            continue
+
+        region_len = len(human_seq)
+        pct_ids, aln_lens, gap_fracs = [], [], []
+
+        for sid, seq in regions_by_species.items():
+            if sid == "human" or not seq:
+                continue
+            sp = species_meta_data.get(sid)
+            if sp is None or sp.get("is_control"):
+                continue
+            result = align_sequences(seq, human_seq, aligner)
+            if result:
+                pct_ids.append(result["pct_identity"])
+                aln_lens.append(result["alignment_length"])
+                gap_fracs.append(result["gap_fraction"])
+
+        if not pct_ids:
+            log.debug("  No alignment results for gene %s region %s", gene_symbol, region_type)
+            continue
+
+        mean_pct_id = round(sum(pct_ids) / len(pct_ids), 2)
+        mean_aln    = round(sum(aln_lens) / len(aln_lens))
+        mean_gap    = round(sum(gap_fracs) / len(gap_fracs), 4)
+        cons_score  = compute_conservation_score(mean_pct_id, mean_aln, region_len)
+
+        results[region_type] = {
+            "conservation_score":  cons_score,
+            "percent_identity":    mean_pct_id,
+            "alignment_length":    mean_aln,
+            "gap_fraction":        mean_gap,
+            # Regulatory divergence requires full Species ORM objects — computed in main process
+            "regulatory_divergence_count":  0,
+            "regulatory_convergence_count": 0,
+        }
+
+    return gene_id, results if results else None
+
+
 def run_nucleotide_alignment(gene_ids: list[str] | None = None) -> int:
     """Align nucleotide regions and compute conservation + regulatory divergence scores.
 
-    Reads NucleotideRegion rows, aligns each species against human, aggregates
-    conservation stats and regulatory divergence/convergence counts, then upserts
-    NucleotideScore rows.
+    Reads NucleotideRegion rows, aligns each species against human in parallel
+    (one worker per gene), aggregates conservation stats and regulatory
+    divergence/convergence counts, then upserts NucleotideScore rows.
 
     Returns count of genes scored.
     """
@@ -382,12 +441,17 @@ def run_nucleotide_alignment(gene_ids: list[str] | None = None) -> int:
         log.warning("Nucleotide alignment skipped — no aligner available. Install minimap2.")
         return 0
 
-    log.info("Nucleotide alignment using: %s", aligner)
-    genes_scored = 0
+    n_cpu = os.cpu_count() or 8
+    n_workers = max(1, n_cpu - 2)
+    log.info("Nucleotide alignment using: %s  |  %d parallel workers", aligner, n_workers)
 
     with get_session() as session:
-        # Load all species metadata for control/resilient classification
         species_meta: dict[str, Species] = {sp.id: sp for sp in session.query(Species).all()}
+        # Serialisable form for workers (no ORM objects across process boundaries)
+        species_meta_data: dict[str, dict] = {
+            sid: {"is_control": sp.is_control, "lineage_group": sp.lineage_group}
+            for sid, sp in species_meta.items()
+        }
 
         q = session.query(Gene)
         if gene_ids:
@@ -395,63 +459,64 @@ def run_nucleotide_alignment(gene_ids: list[str] | None = None) -> int:
         genes = q.all()
         log.info("Aligning nucleotide regions for %d genes...", len(genes))
 
-        for gene in genes:
-            # Load all NucleotideRegion rows for this gene, keyed by species_id
-            gene_regions = session.query(NucleotideRegion).filter_by(gene_id=gene.id).all()
-            if not gene_regions:
-                continue
+        # Pre-fetch all NucleotideRegion rows in a single query and group by gene_id
+        all_regions = session.query(NucleotideRegion)
+        if gene_ids:
+            all_regions = all_regions.filter(NucleotideRegion.gene_id.in_(gene_ids))
+        regions_by_gene: dict[str, list[dict]] = defaultdict(list)
+        for nr in all_regions:
+            if nr.sequence:
+                regions_by_gene[nr.gene_id].append({
+                    "region_type": nr.region_type,
+                    "species_id":  nr.species_id,
+                    "sequence":    nr.sequence,
+                })
 
-            # Group by region_type: {region_type: {species_id: NucleotideRegion}}
-            by_type: dict[str, dict[str, NucleotideRegion]] = defaultdict(dict)
-            for nr in gene_regions:
-                by_type[nr.region_type][nr.species_id] = nr
+        # Prepare worker args
+        work_items = [
+            (g.id, g.gene_symbol, regions_by_gene.get(g.id, []), species_meta_data, aligner)
+            for g in genes
+            if regions_by_gene.get(g.id)
+        ]
+        total = len(work_items)
+        genes_scored = 0
+        done = 0
 
-            for region_type, regions_by_species in by_type.items():
-                human_region = regions_by_species.get("human")
-                if human_region is None or not human_region.sequence:
-                    continue
+        # Run alignment in parallel; collect results and write to DB in main process
+        # (avoids SQLAlchemy session sharing across processes)
+        with ProcessPoolExecutor(max_workers=n_workers) as pool:
+            futures = {pool.submit(_score_gene, item): item[0] for item in work_items}
+            for future in as_completed(futures):
+                gene_id, region_scores = future.result()
+                done += 1
 
-                human_seq    = human_region.sequence
-                region_len   = len(human_seq)
-                pct_ids, aln_lens, gap_fracs = [], [], []
+                if region_scores:
+                    # Compute regulatory divergence (needs ORM objects) in main process
+                    gene_regions = regions_by_gene.get(gene_id, [])
+                    by_type_full: dict[str, dict[str, NucleotideRegion]] = defaultdict(dict)
+                    for row in gene_regions:
+                        # We need real NucleotideRegion-like objects; reconstruct minimally
+                        class _R:
+                            pass
+                        r = _R()
+                        r.sequence = row["sequence"]
+                        r.species_id = row["species_id"]
+                        by_type_full[row["region_type"]][row["species_id"]] = r
 
-                for sid, nr in regions_by_species.items():
-                    if sid == "human" or not nr.sequence:
-                        continue
-                    sp = species_meta.get(sid)
-                    if sp is None or sp.is_control:
-                        continue  # align resilient species only for stats
-                    result = align_sequences(nr.sequence, human_seq, aligner)
-                    if result:
-                        pct_ids.append(result["pct_identity"])
-                        aln_lens.append(result["alignment_length"])
-                        gap_fracs.append(result["gap_fraction"])
+                    for region_type, stats in region_scores.items():
+                        if region_type == "promoter":
+                            div_count, conv_count = compute_regulatory_divergence(
+                                gene_id, region_type, by_type_full.get(region_type, {}), species_meta
+                            )
+                            stats["regulatory_divergence_count"]  = div_count
+                            stats["regulatory_convergence_count"] = conv_count
 
-                if not pct_ids:
-                    log.debug("  No alignment results for gene %s region %s", gene.gene_symbol, region_type)
-                    continue
+                        _upsert_nucleotide_score(session, gene_id, region_type, stats)
+                        genes_scored += 1
 
-                mean_pct_id = round(sum(pct_ids) / len(pct_ids), 2)
-                mean_aln    = round(sum(aln_lens) / len(aln_lens))
-                mean_gap    = round(sum(gap_fracs) / len(gap_fracs), 4)
-                cons_score  = compute_conservation_score(mean_pct_id, mean_aln, region_len)
-
-                div_count, conv_count = (0, 0)
-                if region_type == "promoter":
-                    div_count, conv_count = compute_regulatory_divergence(
-                        gene.id, region_type, regions_by_species, species_meta
-                    )
-
-                stats = {
-                    "conservation_score":           cons_score,
-                    "percent_identity":             mean_pct_id,
-                    "alignment_length":             mean_aln,
-                    "gap_fraction":                 mean_gap,
-                    "regulatory_divergence_count":  div_count,
-                    "regulatory_convergence_count": conv_count,
-                }
-                _upsert_nucleotide_score(session, gene.id, region_type, stats)
-                genes_scored += 1
+                if done % 500 == 0 or done == total:
+                    log.info("  Aligned %d / %d genes (%.0f%%).", done, total, 100 * done / total)
+                    session.commit()
 
         session.commit()
 

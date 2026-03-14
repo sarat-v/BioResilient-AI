@@ -10,6 +10,8 @@ Threshold: a motif is flagged if sequence identity < 85% in ≥ 2 protective spe
 """
 
 import logging
+import os
+from concurrent.futures import ProcessPoolExecutor, as_completed
 from pathlib import Path
 from typing import Optional
 
@@ -236,23 +238,38 @@ def filter_by_independent_lineages(
     return filtered
 
 
+def _divergence_worker(args: tuple) -> tuple[str, list[dict]]:
+    """Top-level worker for multiprocessing (must be picklable)."""
+    og_id, aligned_seqs = args
+    return og_id, extract_divergent_motifs(og_id, aligned_seqs)
+
+
 def run_divergence_pipeline(
     aligned_orthogroups: dict[str, dict[str, str]],
 ) -> dict[str, list[dict]]:
-    """Run sliding window divergence for all aligned orthogroups.
+    """Run sliding window divergence for all aligned orthogroups in parallel.
 
     Returns {og_id: [motif_dict, ...]}
     """
+    n_cpu = os.cpu_count() or 8
+    n_workers = max(1, n_cpu - 2)
+    items = list(aligned_orthogroups.items())
+    total = len(items)
+
     all_motifs: dict[str, list[dict]] = {}
-    total = 0
+    motif_total = 0
 
-    for og_id, aligned_seqs in aligned_orthogroups.items():
-        motifs = extract_divergent_motifs(og_id, aligned_seqs)
-        if motifs:
-            all_motifs[og_id] = motifs
-            total += len(motifs)
+    log.info("Divergence scan: %d orthogroups with %d parallel workers.", total, n_workers)
 
-    log.info("Divergence scan: %d motifs across %d orthogroups.", total, len(all_motifs))
+    with ProcessPoolExecutor(max_workers=n_workers) as pool:
+        futures = {pool.submit(_divergence_worker, item): item[0] for item in items}
+        for future in as_completed(futures):
+            og_id, motifs = future.result()
+            if motifs:
+                all_motifs[og_id] = motifs
+                motif_total += len(motifs)
+
+    log.info("Divergence scan: %d motifs across %d orthogroups.", motif_total, len(all_motifs))
     return all_motifs
 
 

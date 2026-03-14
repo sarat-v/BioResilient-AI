@@ -8,8 +8,10 @@ before MAFFT to those where ≥2 resilient species diverge from human by >15%.
 """
 
 import logging
+import os
 import subprocess
 import tempfile
+from concurrent.futures import ProcessPoolExecutor, as_completed
 from pathlib import Path
 from typing import Optional
 
@@ -33,13 +35,13 @@ def _alignments_dir() -> Path:
     return d
 
 
-def align_orthogroup(og_id: str, sequences: dict[str, str], threads: int = 4) -> Optional[dict[str, str]]:
+def align_orthogroup(og_id: str, sequences: dict[str, str], threads: int = 1) -> Optional[dict[str, str]]:
     """Run MAFFT then trimAl-mask on a set of sequences for one orthogroup.
 
     Args:
         og_id: OrthoGroup identifier (used for output file naming).
         sequences: {label: protein_sequence} — label should be unique.
-        threads: CPU threads for MAFFT.
+        threads: CPU threads for MAFFT per worker.
 
     Returns:
         {label: aligned_sequence} (trimAl-masked when available) or None on failure.
@@ -174,10 +176,19 @@ def calculate_sequence_identity(seq_a: str, seq_b: str) -> float:
     return (matches / comparable) * 100.0
 
 
+def _align_worker(args: tuple) -> tuple[str, Optional[dict[str, str]]]:
+    """Top-level helper for multiprocessing (must be picklable)."""
+    og_id, seqs, threads = args
+    return og_id, align_orthogroup(og_id, seqs, threads=threads)
+
+
 def align_all_orthogroups(
     orthogroups: dict[str, dict[str, str]],
 ) -> dict[str, dict[str, str]]:
-    """Align all orthogroups and return a map of og_id → aligned sequences.
+    """Align all orthogroups in parallel and return a map of og_id → aligned sequences.
+
+    Uses ProcessPoolExecutor with one worker per logical CPU.  Each worker runs
+    MAFFT with 1 thread so the total CPU usage is n_workers × 1 ≈ all cores.
 
     Args:
         orthogroups: {og_id: {label: sequence}} — output from load_orthogroup_sequences().
@@ -185,12 +196,32 @@ def align_all_orthogroups(
     Returns:
         {og_id: {label: aligned_sequence}}
     """
+    n_cpu = os.cpu_count() or 8
+    # Reserve 2 cores for OS/DB overhead; each MAFFT uses 1 thread
+    n_workers = max(1, n_cpu - 2)
+    mafft_threads_per_worker = 1
+
+    items = list(orthogroups.items())
+    total = len(items)
     aligned: dict[str, dict[str, str]] = {}
-    for og_id, seqs in orthogroups.items():
-        result = align_orthogroup(og_id, seqs)
-        if result:
-            aligned[og_id] = result
-    log.info("Aligned %d / %d orthogroups.", len(aligned), len(orthogroups))
+    done = 0
+
+    log.info("Aligning %d orthogroups with %d parallel workers (1 MAFFT thread each).", total, n_workers)
+
+    with ProcessPoolExecutor(max_workers=n_workers) as pool:
+        futures = {
+            pool.submit(_align_worker, (og_id, seqs, mafft_threads_per_worker)): og_id
+            for og_id, seqs in items
+        }
+        for future in as_completed(futures):
+            og_id, result = future.result()
+            done += 1
+            if result:
+                aligned[og_id] = result
+            if done % 500 == 0 or done == total:
+                log.info("  Aligned %d / %d orthogroups (%.0f%%).", done, total, 100 * done / total)
+
+    log.info("Aligned %d / %d orthogroups.", len(aligned), total)
     return aligned
 
 

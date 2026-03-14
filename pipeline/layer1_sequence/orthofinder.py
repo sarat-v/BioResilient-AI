@@ -8,6 +8,7 @@ keeping only groups where the human protein is present.
 """
 
 import logging
+import os
 import shutil
 import subprocess
 from pathlib import Path
@@ -81,8 +82,9 @@ def run_orthofinder(proteomes_dir: Path) -> Path:
         Path to the OrthoFinder results directory.
     """
     cfg = get_tool_config()
-    search_threads = cfg.get("orthofinder_threads", 8)
-    align_threads = cfg.get("orthofinder_align_threads", 4)
+    n_cpu = os.cpu_count() or 8
+    search_threads = cfg.get("orthofinder_threads", n_cpu)
+    align_threads  = cfg.get("orthofinder_align_threads", max(1, n_cpu // 4))
 
     root = Path(get_local_storage_root())
     out_dir = root / "orthofinder_out"
