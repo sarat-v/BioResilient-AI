@@ -130,11 +130,13 @@ write_and_show_report() {
 }
 
 sync_cache_to_s3() {
-    # Upload step cache files to S3 with date-versioned backup.
-    # Current copy: s3://{bucket}/step_cache/{step}.{md,json}
-    # Versioned copy: s3://{bucket}/step_cache/history/{step}/{date}.{md,json}
+    # Upload step cache files to S3.
+    # Current copy: s3://{bucket}/step_cache/{phenotype}/{step}.{md,json}  (always overwritten)
+    # History copy: s3://{bucket}/step_cache/history/{phenotype}/{step}/{date}.{md,json}
+    #   — only written if the content differs from the current S3 copy (i.e. a real change)
     local step="$1"
     local bucket="${S3_BUCKET:-bioresilient-data}"
+    local phenotype_key="${PHENOTYPE:-cancer_resistance}"
     local date_tag
     date_tag=$(date -u +"%Y-%m-%dT%H%M%SZ")
 
@@ -145,13 +147,28 @@ sync_cache_to_s3() {
     for ext in json md; do
         local src="$CACHE_DIR/${step}.${ext}"
         [[ -f "$src" ]] || continue
-        # Upload as current
-        aws s3 cp "$src" "s3://${bucket}/step_cache/${step}.${ext}" \
-            --quiet 2>/dev/null && \
-            echo -e "${DIM}   S3 cache saved: step_cache/${step}.${ext}${RESET}"
-        # Upload versioned backup
-        aws s3 cp "$src" "s3://${bucket}/step_cache/history/${step}/${date_tag}.${ext}" \
-            --quiet 2>/dev/null
+        local s3_current="s3://${bucket}/step_cache/${phenotype_key}/${step}.${ext}"
+        local s3_history="s3://${bucket}/step_cache/history/${phenotype_key}/${step}/${date_tag}.${ext}"
+        local tmp_prev="/tmp/_s3_prev_${step}.${ext}"
+
+        # Check if current S3 content differs from new file
+        local changed=true
+        if aws s3 cp "$s3_current" "$tmp_prev" --quiet 2>/dev/null; then
+            if diff -q "$src" "$tmp_prev" &>/dev/null; then
+                changed=false
+            fi
+            rm -f "$tmp_prev"
+        fi
+
+        # Always overwrite current
+        aws s3 cp "$src" "$s3_current" --quiet 2>/dev/null && \
+            echo -e "${DIM}   S3 cache saved: step_cache/${phenotype_key}/${step}.${ext}${RESET}"
+
+        # Only save history if content changed
+        if $changed; then
+            aws s3 cp "$src" "$s3_history" --quiet 2>/dev/null && \
+                echo -e "${DIM}   S3 history saved: ${date_tag}${RESET}"
+        fi
     done
 }
 
