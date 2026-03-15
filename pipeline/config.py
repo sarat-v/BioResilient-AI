@@ -3,22 +3,52 @@
 Priority: environment variables > config file values.
 """
 
+import json
+import logging
 import os
 from functools import lru_cache
 from pathlib import Path
 from typing import Any
+from urllib.parse import parse_qs, urlencode, urlparse, urlunparse
 
 import yaml
 
+log = logging.getLogger(__name__)
+
 _CONFIG_PATH = Path(__file__).resolve().parents[1] / "config" / "environment.yml"
 _EXAMPLE_PATH = _CONFIG_PATH.with_name("environment.example.yml")
+_SCORING_WEIGHTS_PATH = Path(__file__).resolve().parents[1] / "config" / "scoring_weights.json"
 
 
 @lru_cache(maxsize=1)
 def _load_raw() -> dict[str, Any]:
-    path = _CONFIG_PATH if _CONFIG_PATH.exists() else _EXAMPLE_PATH
+    if _CONFIG_PATH.exists():
+        path = _CONFIG_PATH
+    elif _EXAMPLE_PATH.exists():
+        log.warning(
+            "config/environment.yml not found — using example config. "
+            "Copy environment.example.yml to environment.yml and fill in your values."
+        )
+        path = _EXAMPLE_PATH
+    else:
+        raise FileNotFoundError(
+            f"No pipeline config found at {_CONFIG_PATH} or {_EXAMPLE_PATH}. "
+            "Create config/environment.yml from the example template."
+        )
     with open(path) as f:
         return yaml.safe_load(f)
+
+
+@lru_cache(maxsize=1)
+def _load_scoring_weights() -> dict[str, Any]:
+    """Load and cache scoring_weights.json once for the process lifetime."""
+    if not _SCORING_WEIGHTS_PATH.exists():
+        raise FileNotFoundError(
+            f"Scoring weights config not found at {_SCORING_WEIGHTS_PATH}. "
+            "Ensure config/scoring_weights.json exists."
+        )
+    with open(_SCORING_WEIGHTS_PATH) as f:
+        return json.load(f)
 
 
 def get_config() -> dict[str, Any]:
@@ -35,8 +65,18 @@ def get_db_url() -> str:
         return os.environ["DATABASE_URL"]
     cfg = get_config()
     deployment = get_deployment()
-    url_template = cfg["database"][deployment]
-    # Expand ${RDS_HOST} if present
+    db_section = cfg.get("database", {})
+    if deployment not in db_section:
+        raise KeyError(
+            f"Database config for deployment '{deployment}' not found in environment.yml. "
+            f"Available deployments: {list(db_section.keys())}"
+        )
+    url_template = db_section[deployment]
+    if not url_template:
+        raise ValueError(
+            f"Database URL for deployment '{deployment}' is empty in environment.yml."
+        )
+    # Expand ${RDS_HOST} and similar env vars
     return os.path.expandvars(url_template)
 
 
@@ -47,33 +87,44 @@ def get_psycopg2_conn():
     psycopg2.connect(url) can silently hang on SSL handshake with some RDS
     configurations. This helper strips the sslmode param from the URL and
     passes it as an explicit keyword argument to guarantee it is applied.
+
+    The connect_timeout can be overridden via config thresholds.db_connect_timeout.
     """
     import psycopg2
-    from urllib.parse import urlparse, parse_qs, urlencode, urlunparse
 
     url = get_db_url()
     parsed = urlparse(url)
     params = parse_qs(parsed.query)
 
-    # Extract sslmode before passing to psycopg2
     sslmode = params.pop("sslmode", ["require"])[0]
     clean_query = urlencode({k: v[0] for k, v in params.items()})
     clean_url = urlunparse(parsed._replace(query=clean_query))
 
-    return psycopg2.connect(clean_url, sslmode=sslmode, connect_timeout=30)
+    thresholds = get_thresholds()
+    connect_timeout = int(thresholds.get("db_connect_timeout", 30))
+
+    return psycopg2.connect(clean_url, sslmode=sslmode, connect_timeout=connect_timeout)
 
 
 def get_storage_root() -> str:
     cfg = get_config()
     deployment = get_deployment()
-    return cfg["storage"][deployment]
+    storage_section = cfg.get("storage", {})
+    if deployment not in storage_section:
+        raise KeyError(
+            f"Storage config for deployment '{deployment}' not found in environment.yml. "
+            f"Available deployments: {list(storage_section.keys())}"
+        )
+    return storage_section[deployment]
 
 
 def get_local_storage_root() -> str:
-    """Path to local data root. When storage is S3, returns /tmp/bioresilient so tools that need local disk (e.g. OrthoFinder) use the same path as download.py."""
+    """Path to local data root. When storage is S3, returns /tmp/bioresilient so
+    tools that need local disk (e.g. OrthoFinder) use the same path as download.py."""
     root = get_storage_root()
     if root.startswith("s3://") or root.startswith("s3:"):
-        return "/tmp/bioresilient"
+        cfg = get_config()
+        return cfg.get("local_tmp_root", "/tmp/bioresilient")
     return root
 
 
@@ -105,18 +156,22 @@ def get_tool_config() -> dict[str, Any]:
 
 
 def get_scoring_weights(phase: str = "phase1") -> dict[str, float]:
-    import json
-    weights_path = Path(__file__).resolve().parents[1] / "config" / "scoring_weights.json"
-    with open(weights_path) as f:
-        data = json.load(f)
+    data = _load_scoring_weights()
+    if phase not in data:
+        raise KeyError(
+            f"Scoring phase '{phase}' not found in scoring_weights.json. "
+            f"Available phases: {[k for k in data.keys() if k != 'tier_thresholds']}"
+        )
     return data[phase]
 
 
 def get_tier_thresholds() -> dict[str, float]:
-    import json
-    weights_path = Path(__file__).resolve().parents[1] / "config" / "scoring_weights.json"
-    with open(weights_path) as f:
-        data = json.load(f)
+    data = _load_scoring_weights()
+    if "tier_thresholds" not in data:
+        raise KeyError(
+            "Key 'tier_thresholds' not found in scoring_weights.json. "
+            "Add a tier_thresholds section with tier1 and tier2 keys."
+        )
     return data["tier_thresholds"]
 
 
@@ -167,24 +222,23 @@ def sync_to_s3(local_path: "Path | str", s3_key: str) -> bool:
 
     Returns True on success, False on error (never raises).
     """
+    import boto3
+
     if get_deployment() != "cloud":
         return True
     bucket = get_s3_bucket()
     if not bucket:
         return False
     try:
-        import boto3
-        from pathlib import Path as _Path
-        local_path = _Path(local_path)
+        local_path = Path(local_path)
         if not local_path.exists():
+            log.warning("S3 upload skipped — local file does not exist: %s", local_path)
             return False
         boto3.client("s3").upload_file(str(local_path), bucket, s3_key)
-        import logging
-        logging.getLogger(__name__).info("S3 upload: s3://%s/%s", bucket, s3_key)
+        log.info("S3 upload: s3://%s/%s", bucket, s3_key)
         return True
     except Exception as exc:
-        import logging
-        logging.getLogger(__name__).warning("S3 upload failed for %s → %s: %s", local_path, s3_key, exc)
+        log.warning("S3 upload failed for %s → %s: %s", local_path, s3_key, exc)
         return False
 
 
@@ -193,23 +247,21 @@ def sync_from_s3(s3_key: str, local_path: "Path | str") -> bool:
 
     Returns True on success (or file already exists locally), False on error.
     """
+    import boto3
+
     if get_deployment() != "cloud":
         return True
     bucket = get_s3_bucket()
     if not bucket:
         return False
     try:
-        import boto3
-        from pathlib import Path as _Path
-        local_path = _Path(local_path)
+        local_path = Path(local_path)
         local_path.parent.mkdir(parents=True, exist_ok=True)
         if local_path.exists():
             return True
         boto3.client("s3").download_file(bucket, s3_key, str(local_path))
-        import logging
-        logging.getLogger(__name__).info("S3 download: s3://%s/%s → %s", bucket, s3_key, local_path)
+        log.info("S3 download: s3://%s/%s → %s", bucket, s3_key, local_path)
         return True
     except Exception as exc:
-        import logging
-        logging.getLogger(__name__).warning("S3 download failed for %s → %s: %s", s3_key, local_path, exc)
+        log.warning("S3 download failed for %s → %s: %s", s3_key, local_path, exc)
         return False

@@ -48,8 +48,8 @@ def _load_esm1v_model():
         return _ESM1V_MODEL_CACHE
 
     try:
-        import torch
         import esm as esm_lib
+        import torch
 
         log.info("Loading ESM-1v model (this may take a few minutes on first use)...")
         model, alphabet = esm_lib.pretrained.esm1v_t33_650M_UR90S_1()
@@ -88,17 +88,22 @@ def compute_esm1v_llr(
         device = "cuda" if torch.cuda.is_available() else "cpu"
         model = model.to(device)
 
-        # ESM-1v uses masked marginal scoring:
-        # For each position, mask it and compute log P(ref) - log P(alt)
-        # LLR(alt) = log P(alt | context) - log P(ref | context)
-
         llrs = []
 
         for pos, human_aa, animal_aa in substitutions:
             if pos >= len(human_protein_seq):
                 continue
 
-            # Create masked sequence for this position
+            # Verify the stored human AA matches the sequence at this position.
+            # A mismatch means the motif coordinates are misaligned with the sequence.
+            if human_protein_seq[pos] != human_aa:
+                log.debug(
+                    "AA mismatch at pos %d: expected %s, got %s — skipping substitution",
+                    pos, human_aa, human_protein_seq[pos],
+                )
+                continue
+
+            # ESM-1v masked marginal scoring: mask position, compute log P(alt) - log P(ref)
             masked_seq = human_protein_seq[:pos] + "<mask>" + human_protein_seq[pos + 1:]
             data = [("protein", masked_seq)]
             _, _, batch_tokens = batch_converter(data)
@@ -107,14 +112,15 @@ def compute_esm1v_llr(
             with torch.no_grad():
                 logits = model(batch_tokens)["logits"]  # [1, L+2, vocab]
 
-            # Get log-probs at the masked position (offset +1 for <cls> token)
+            # offset +1 for <cls> token
             token_idx = pos + 1
             log_probs = torch.nn.functional.log_softmax(logits[0, token_idx], dim=-1)
 
-            aa_idx_human = alphabet.get_idx(human_aa)
-            aa_idx_animal = alphabet.get_idx(animal_aa)
-
-            if aa_idx_human is None or aa_idx_animal is None:
+            try:
+                aa_idx_human = alphabet.get_idx(human_aa)
+                aa_idx_animal = alphabet.get_idx(animal_aa)
+            except KeyError:
+                log.debug("Unknown amino acid token for %s or %s — skipping", human_aa, animal_aa)
                 continue
 
             llr = (log_probs[aa_idx_animal] - log_probs[aa_idx_human]).item()
@@ -130,8 +136,8 @@ def compute_esm1v_llr(
 def annotate_esm1v_scores(gene_ids: Optional[list[str]] = None) -> int:
     """Annotate DivergentMotif rows with ESM-1v variant effect scores.
 
-    For efficiency, loads the ESM-1v model once and processes all motifs.
-    Skips gracefully if ESM library is not installed.
+    Loads the ESM-1v model once, processes all motifs in memory, then writes
+    all updated scores in a single batch commit per gene to avoid N+1 sessions.
 
     Returns number of motifs scored.
     """
@@ -140,20 +146,17 @@ def annotate_esm1v_scores(gene_ids: Optional[list[str]] = None) -> int:
         log.info("ESM-1v not available — skipping variant effect scoring.")
         return 0
 
+    # Load all gene data in a single session, keeping objects attached
     with get_session() as session:
         if gene_ids is None:
             gene_ids = [g.id for g in session.query(Gene).all()]
-        genes = session.query(Gene).filter(Gene.id.in_(gene_ids)).all()
 
-    log.info("Computing ESM-1v scores for %d genes...", len(genes))
-    scored = 0
-
-    for gene in genes:
-        # Get the human protein sequence from any human ortholog
-        with get_session() as session:
+        # Pre-fetch human sequences and motifs while the session is open
+        gene_data: list[tuple[str, str, list]] = []
+        for gid in gene_ids:
             human_orth = (
                 session.query(Ortholog)
-                .filter(Ortholog.gene_id == gene.id, Ortholog.species_id == "human")
+                .filter(Ortholog.gene_id == gid, Ortholog.species_id == "human")
                 .first()
             )
             if not human_orth or not human_orth.protein_seq:
@@ -163,30 +166,39 @@ def annotate_esm1v_scores(gene_ids: Optional[list[str]] = None) -> int:
             motifs = (
                 session.query(DivergentMotif)
                 .join(Ortholog, DivergentMotif.ortholog_id == Ortholog.id)
-                .filter(Ortholog.gene_id == gene.id)
+                .filter(Ortholog.gene_id == gid)
                 .all()
             )
+            if motifs:
+                gene_data.append((gid, human_seq, motifs))
 
-        for motif in motifs:
-            substitutions = []
-            for i, (h_aa, a_aa) in enumerate(zip(motif.human_seq, motif.animal_seq)):
-                if h_aa == "-" or a_aa == "-" or h_aa == a_aa:
+        log.info("Computing ESM-1v scores for %d genes...", len(gene_data))
+        scored = 0
+
+        for gid, human_seq, motifs in gene_data:
+            updates: dict[str, float] = {}
+            for motif in motifs:
+                substitutions = []
+                for i, (h_aa, a_aa) in enumerate(zip(motif.human_seq, motif.animal_seq)):
+                    if h_aa == "-" or a_aa == "-" or h_aa == a_aa:
+                        continue
+                    abs_pos = motif.start_pos + i
+                    if abs_pos < len(human_seq):
+                        substitutions.append((abs_pos, h_aa, a_aa))
+
+                if not substitutions:
                     continue
-                abs_pos = motif.start_pos + i
-                if abs_pos < len(human_seq):
-                    substitutions.append((abs_pos, h_aa, a_aa))
 
-            if not substitutions:
-                continue
+                llr = compute_esm1v_llr(human_seq, substitutions, model_tuple)
+                if llr is not None:
+                    updates[motif.id] = llr
 
-            llr = compute_esm1v_llr(human_seq, substitutions, model_tuple)
-            if llr is not None:
-                with get_session() as session:
-                    m = session.get(DivergentMotif, motif.id)
-                    if m:
-                        m.esm1v_score = llr
-                        session.commit()
-                scored += 1
+            if updates:
+                for motif in motifs:
+                    if motif.id in updates:
+                        motif.esm1v_score = updates[motif.id]
+                        scored += 1
+                session.commit()
 
     log.info("ESM-1v scoring complete: %d motifs scored.", scored)
     return scored

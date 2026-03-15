@@ -25,6 +25,12 @@ from pipeline.config import get_local_storage_root, get_tool_config
 
 log = logging.getLogger(__name__)
 
+try:
+    import numpy as np
+    _NUMPY_AVAILABLE = True
+except ImportError:
+    _NUMPY_AVAILABLE = False
+
 
 def _alignments_dir() -> Path:
     root = Path(get_local_storage_root())
@@ -74,9 +80,11 @@ def align_orthogroup(og_id: str, sequences: dict[str, str], threads: int = 1) ->
 
             if result.returncode != 0:
                 log.warning("  MAFFT failed for %s: %s", og_id, result.stderr.decode())
+                out_path.unlink(missing_ok=True)
                 return None
         except Exception as exc:
             log.error("  MAFFT error for %s: %s", og_id, exc)
+            out_path.unlink(missing_ok=True)
             return None
         finally:
             Path(tmp_path).unlink(missing_ok=True)
@@ -162,18 +170,19 @@ def calculate_sequence_identity(seq_a: str, seq_b: str) -> float:
         raise ValueError("Sequences must be aligned (same length).")
 
     try:
-        import numpy as np
-        a = np.frombuffer(seq_a.encode(), dtype=np.uint8)
-        b = np.frombuffer(seq_b.encode(), dtype=np.uint8)
-        gap = ord("-")
-        both_gap = (a == gap) & (b == gap)
-        comparable = int((~both_gap).sum())
-        if comparable == 0:
-            return 0.0
-        matches = int(((a == b) & ~both_gap).sum())
-        return (matches / comparable) * 100.0
-    except Exception:
-        # Pure Python fallback
+        if _NUMPY_AVAILABLE:
+            a = np.frombuffer(seq_a.encode(), dtype=np.uint8)
+            b = np.frombuffer(seq_b.encode(), dtype=np.uint8)
+            gap = ord("-")
+            both_gap = (a == gap) & (b == gap)
+            comparable = int((~both_gap).sum())
+            if comparable == 0:
+                return 0.0
+            matches = int(((a == b) & ~both_gap).sum())
+            return (matches / comparable) * 100.0
+    except Exception as exc:
+        log.debug("numpy identity calculation failed, falling back to pure Python: %s", exc)
+    # Pure Python fallback
         matches = 0
         comparable = 0
         for a, b in zip(seq_a, seq_b):
@@ -229,7 +238,7 @@ def align_all_orthogroups(
                 og_id, result = future.result(timeout=120)
             except Exception as exc:
                 og_id = futures[future]
-                log.debug("Alignment worker failed for %s: %s", og_id, exc)
+                log.warning("Alignment worker failed for %s: %s", og_id, exc)
                 done += 1
                 continue
             done += 1
@@ -313,7 +322,7 @@ def load_orthogroup_sequences_from_db(one_to_one_only: bool = True) -> dict[str,
     orthogroups: dict[str, dict[str, str]] = {}
 
     with get_session() as session:
-        q = session.query(Ortholog).filter(Ortholog.protein_seq.isnot(None))
+        q = session.query(Ortholog).filter(Ortholog.protein_seq.isnot(None), Ortholog.protein_seq != "")
         if one_to_one_only:
             q = q.filter(Ortholog.is_one_to_one.is_(True))
         orthologs = q.all()

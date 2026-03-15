@@ -36,6 +36,7 @@ from typing import Optional
 
 import requests
 
+from db.models import DivergentMotif, Gene, Ortholog
 from db.session import get_session
 
 log = logging.getLogger(__name__)
@@ -52,6 +53,11 @@ GNOMAD_GENE_QUERY = """
 }
 """
 
+# Classification thresholds — named constants so they can be found and changed together.
+_AM_PATHOGENIC_THRESHOLD = 0.6   # AlphaMissense: scores above this indicate high pathogenicity in human
+_ESM_DESTAB_THRESHOLD = -2.0     # ESM-1v LLR: scores below this indicate protein destabilisation
+_LOEUF_INTOLERANT_THRESHOLD = 0.5  # gnomAD LOEUF: scores at or below this indicate LoF intolerance
+_GNOMAD_RATE_LIMIT_SLEEP = 0.25  # seconds between gnomAD API requests
 
 # ---------------------------------------------------------------------------
 # gnomAD LOEUF fetch (cached in-process for a single run)
@@ -65,6 +71,9 @@ def _fetch_loeuf(gene_symbol: str) -> Optional[float]:
 
     Returns a float in [0, 1+]. Lower = more LoF intolerant.
     Caches results to avoid repeated requests.
+
+    Falls back to None (not pLI) when LOEUF is unavailable because pLI and LOEUF
+    are on incompatible scales — converting between them introduces spurious precision.
     """
     if gene_symbol in _loeuf_cache:
         return _loeuf_cache[gene_symbol]
@@ -80,13 +89,14 @@ def _fetch_loeuf(gene_symbol: str) -> Optional[float]:
             gene_data = data.get("data", {}).get("gene", {})
             constraint = gene_data.get("gnomad_constraint") or {}
             loeuf = constraint.get("oe_lof_upper")
-            # pLI fallback: invert (pLI close to 1 = intolerant -> low LOEUF equivalent)
-            if loeuf is None:
-                pli = constraint.get("pLI")
-                if pli is not None:
-                    loeuf = 1.0 - float(pli)
-            _loeuf_cache[gene_symbol] = float(loeuf) if loeuf is not None else None
-            return _loeuf_cache[gene_symbol]
+            if loeuf is not None:
+                _loeuf_cache[gene_symbol] = float(loeuf)
+                return _loeuf_cache[gene_symbol]
+            # No LOEUF available — do not fall back to pLI since the scales are
+            # incompatible. Return None and let the caller treat unknown as neutral.
+            log.debug("No LOEUF for %s (pLI available but not used as proxy)", gene_symbol)
+        else:
+            log.debug("gnomAD API returned %d for gene %s", r.status_code, gene_symbol)
     except Exception as exc:
         log.debug("gnomAD LOEUF fetch error for %s: %s", gene_symbol, exc)
 
@@ -110,17 +120,21 @@ def classify_motif_direction(
         consequence_score: AlphaMissense score in [0,1] (high = pathogenic in human)
         loeuf: gnomAD LOEUF value (low = LoF intolerant in human population)
 
+    When loeuf is None (no gnomAD data), constraint is treated as unknown and the
+    label defaults to 'neutral' rather than assuming either tolerant or intolerant.
+
     Note: These scores are derived from human-centric ML models. A variant
-    flagged as 'functional_shift' (previously 'likely_pathogenic') may actually
-    represent successful adaptation in a resilient species. Treat all labels as
-    hypotheses, not conclusions.
+    flagged as 'functional_shift' may actually represent successful adaptation
+    in a resilient species. Treat all labels as hypotheses, not conclusions.
     """
-    am_high = (consequence_score is not None and consequence_score > 0.6)
-    esm_destab = (esm1v_score is not None and esm1v_score < -2.0)
-    lof_tolerant = (loeuf is None or loeuf > 0.5)   # unknown treated as tolerant
+    am_high = (consequence_score is not None and consequence_score > _AM_PATHOGENIC_THRESHOLD)
+    esm_destab = (esm1v_score is not None and esm1v_score < _ESM_DESTAB_THRESHOLD)
 
     if esm_destab and am_high:
-        if lof_tolerant:
+        if loeuf is None:
+            # Unknown constraint: cannot confidently assign LoF vs functional_shift
+            return "neutral"
+        if loeuf > _LOEUF_INTOLERANT_THRESHOLD:
             return "loss_of_function"
         else:
             return "functional_shift"
@@ -143,8 +157,6 @@ def annotate_variant_directions(gene_ids: Optional[list[str]] = None) -> int:
     Returns:
         Number of motifs annotated.
     """
-    from db.models import DivergentMotif, Gene, Ortholog
-
     updated = 0
     with get_session() as session:
         q = (
@@ -158,18 +170,17 @@ def annotate_variant_directions(gene_ids: Optional[list[str]] = None) -> int:
         motifs = q.all()
         log.info("Classifying variant direction for %d motifs...", len(motifs))
 
-        # Pre-fetch LOEUF values per gene symbol
-        symbol_map: dict[str, Optional[str]] = {}
+        # Pre-fetch LOEUF values per gene symbol before the session closes
         gene_symbols_needed: set[str] = set()
         for motif in motifs:
             gs = motif.ortholog.gene.gene_symbol if motif.ortholog and motif.ortholog.gene else None
             if gs:
                 gene_symbols_needed.add(gs)
 
+        symbol_map: dict[str, Optional[float]] = {}
         for gs in gene_symbols_needed:
-            loeuf = _fetch_loeuf(gs)
-            symbol_map[gs] = loeuf
-            time.sleep(0.25)  # gnomAD rate limit
+            symbol_map[gs] = _fetch_loeuf(gs)
+            time.sleep(_GNOMAD_RATE_LIMIT_SLEEP)
 
         for motif in motifs:
             gs = (motif.ortholog.gene.gene_symbol
@@ -185,14 +196,21 @@ def annotate_variant_directions(gene_ids: Optional[list[str]] = None) -> int:
 
         session.commit()
 
-    dist: dict[str, int] = {}
-    for v in ["gain_of_function", "loss_of_function", "functional_shift", "neutral"]:
-        dist[v] = 0
-    for motif in motifs:
-        dist[getattr(motif, "motif_direction", "neutral")] = dist.get(
-            getattr(motif, "motif_direction", "neutral"), 0) + 1
-    log.info("Variant direction distribution: %s", dist)
+        # Read distribution from committed values while session is still open
+        dist: dict[str, int] = {
+            "gain_of_function": 0,
+            "loss_of_function": 0,
+            "functional_shift": 0,
+            "neutral": 0,
+        }
+        for motif in motifs:
+            key = motif.motif_direction or "neutral"
+            if key in dist:
+                dist[key] += 1
+            else:
+                dist[key] = 1
 
+    log.info("Variant direction distribution: %s", dist)
     return updated
 
 

@@ -14,8 +14,12 @@ Usage:
 import argparse
 import json
 import logging
+import os
+import pickle
+import subprocess
 import sys
 import time
+import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -77,16 +81,16 @@ def _now_iso() -> str:
 def _write_state(state: dict) -> None:
     try:
         _STATE_FILE.write_text(json.dumps(state, indent=2))
-    except Exception:
-        pass
+    except Exception as exc:
+        log.warning("Could not write pipeline state file %s: %s", _STATE_FILE, exc)
 
 
 def _read_state() -> dict:
     try:
         if _STATE_FILE.exists():
             return json.loads(_STATE_FILE.read_text())
-    except Exception:
-        pass
+    except Exception as exc:
+        log.warning("Could not read pipeline state file %s: %s — starting fresh", _STATE_FILE, exc)
     return {"status": "idle", "steps": {}}
 
 
@@ -113,15 +117,18 @@ def _mark_step(state: dict, step_name: str, status: str, elapsed: float | None =
                     run.step_statuses = state.get("steps", {})
                     run.status = "running"
                     session.commit()
-        except Exception:
-            pass
-
-# Add repo root to sys.path so imports work from any working directory
+        except Exception as exc:
+            log.warning("Could not update PipelineRun %s in DB: %s", run_id, exc) so imports work from any working directory
 sys.path.insert(0, str(_REPO_ROOT))
 
 
 def _load_species_registry(phenotype: str | None = None) -> list[dict]:
     registry_path = _REPO_ROOT / "config" / "species_registry.json"
+    if not registry_path.exists():
+        raise FileNotFoundError(
+            f"Species registry not found at {registry_path}. "
+            "Ensure config/species_registry.json is present."
+        )
     with open(registry_path) as f:
         all_species = json.load(f)
     if not phenotype:
@@ -145,8 +152,6 @@ def _load_species_registry(phenotype: str | None = None) -> list[dict]:
 
 def step1_validate_environment() -> None:
     """Validate that all required tools are installed and the DB is reachable."""
-    import subprocess
-
     log.info("Step 1: Validating environment...")
     # Each entry is (canonical_name, [accepted_binary_names])
     tools = [
@@ -284,8 +289,8 @@ def step3d_phylo_conservation(dry_run: bool = False) -> None:
             if rows:
                 tier_gene_ids = [r[0] for r in rows]
                 log.info("  Restricting phylo scoring to %d Tier1/2 genes", len(tier_gene_ids))
-    except Exception:
-        pass  # step9 not yet run — score all genes
+    except Exception as exc:
+        log.debug("step9 not yet run (no CandidateScore rows) — scoring all genes: %s", exc)
 
     n_scored = run_phylo_conservation(tier_gene_ids, treefile)
     log.info("  Phylogenetic conservation: %d genes scored", n_scored)
@@ -297,13 +302,12 @@ def _build_human_gene_map(human_sequences: dict[str, str]) -> dict[str, tuple[st
     In Phase 1 we use the UniProt accession as both gene_uuid and gene_symbol
     until we enrich with NCBI Gene IDs in Phase 2.
     """
-    import uuid
     gene_map = {}
     for protein_id in human_sequences:
         # UniProt accession is like "human|P12345"
         acc = protein_id.split("|")[-1]
         # Use deterministic UUID from accession
-        gene_uuid = str(uuid.uuid5(uuid.NAMESPACE_DNS, f"human.{acc}"))
+        gene_uuid = str(uuid.uuid5(uuid.NAMESPACE_URL, f"human.{acc}"))
         gene_map[protein_id] = (gene_uuid, acc)
     return gene_map
 
@@ -888,8 +892,8 @@ def run_pipeline(
         _pkl_path = Path(get_local_storage_root()) / "aligned_orthogroups.pkl"
         if _pkl_path.exists():
             try:
-                import pickle
-                _data = pickle.load(open(_pkl_path, "rb"))
+                with open(_pkl_path, "rb") as _f:
+                    _data = pickle.load(_f)
                 aligned_orthogroups = _data["aligned"]
                 motifs_by_og = _data["motifs_by_og"]
                 log.info("Recovered %d aligned orthogroups from disk cache", len(aligned_orthogroups))
@@ -929,7 +933,6 @@ def run_pipeline(
             for s in step_order
         },
     }
-    import os
     run_id = os.environ.get("PIPELINE_RUN_ID")
     try:
         from db.models import PipelineRun
@@ -954,8 +957,8 @@ def run_pipeline(
                 session.commit()
                 run_id = run.id
             state["run_id"] = run_id
-    except Exception:
-        pass
+    except Exception as exc:
+        log.warning("Could not create/update PipelineRun row in DB: %s", exc)
     _write_state(state)
 
     # Also add a file handler so the log streams to pipeline.log for SSE tailing
@@ -982,6 +985,12 @@ def run_pipeline(
             elif step_name == "step3b":
                 if results_dir:
                     step3b_load_orthologs(results_dir, dry_run=dry_run)
+                else:
+                    raise RuntimeError(
+                        "step3b: results_dir is None — OrthoFinder has not been run "
+                        "or its output directory could not be found. "
+                        "Run step3 first, or set results_dir manually."
+                    )
 
             elif step_name == "step3c":
                 step3c_nucleotide_conservation(species_list, dry_run=dry_run)
@@ -1007,15 +1016,24 @@ def run_pipeline(
                 treefile = step5_phylogenetic_tree(aligned_orthogroups, dry_run=dry_run)
 
             elif step_name == "step6":
-                if treefile and motifs_by_og:
-                    aligned_for_hyphy = {
-                        og: aligned_orthogroups[og]
-                        for og in motifs_by_og
-                        if og in aligned_orthogroups
-                    }
-                    step6_evolutionary_selection(
-                        aligned_for_hyphy, motifs_by_og, treefile, dry_run=dry_run
+                if not treefile:
+                    raise RuntimeError(
+                        "step6: treefile is None — phylogenetic tree has not been built. "
+                        "Run step5 first."
                     )
+                if not motifs_by_og:
+                    raise RuntimeError(
+                        "step6: motifs_by_og is empty — no divergent motifs found in step4. "
+                        "Ensure step4 completed successfully with motifs in the database."
+                    )
+                aligned_for_hyphy = {
+                    og: aligned_orthogroups[og]
+                    for og in motifs_by_og
+                    if og in aligned_orthogroups
+                }
+                step6_evolutionary_selection(
+                    aligned_for_hyphy, motifs_by_og, treefile, dry_run=dry_run
+                )
 
             elif step_name == "step6b":
                 step6b_fel_busted(dry_run=dry_run)
@@ -1090,11 +1108,8 @@ def run_pipeline(
                     completed_list.append(step_name)
                 existing_cache["completed"] = completed_list
                 _cache_path.write_text(json.dumps(existing_cache, indent=2))
-            except Exception:
-                pass
-
-    except Exception as exc:
-        log.error("Pipeline FAILED at %s: %s", step_name, exc, exc_info=True)
+            except Exception as exc:
+                log.warning("Could not write step cache file: %s", exc)
         _mark_step(state, step_name, "failed")
         state["status"] = "failed"
         state["failed_at"] = _now_iso()
@@ -1112,8 +1127,8 @@ def run_pipeline(
                         run.finished_at = datetime.now(timezone.utc)
                         run.step_statuses = state.get("steps", {})
                         session.commit()
-            except Exception:
-                pass
+            except Exception as exc:
+                log.warning("Could not update PipelineRun %s status to 'failed' in DB: %s", run_id, exc)
         sys.exit(1)
 
     total = time.time() - start_time
@@ -1137,8 +1152,8 @@ def run_pipeline(
                     run.finished_at = datetime.now(timezone.utc)
                     run.step_statuses = state.get("steps", {})
                     session.commit()
-        except Exception:
-            pass
+        except Exception as exc:
+            log.warning("Could not update PipelineRun %s status to 'completed' in DB: %s", run_id, exc)
 
 
 def main() -> None:
@@ -1168,9 +1183,28 @@ def main() -> None:
     )
     args = parser.parse_args()
 
+    known_steps = set(STEPS.keys())
+
+    # Validate --resume-from before starting the pipeline
+    if args.resume_from and args.resume_from not in known_steps:
+        parser.error(
+            f"Unknown step '{args.resume_from}' for --resume-from. "
+            f"Valid steps: {', '.join(STEPS.keys())}"
+        )
+
+    # Validate --steps entries
+    only_steps: list[str] | None = None
+    if args.steps:
+        only_steps = [s.strip() for s in args.steps.split(",")]
+        invalid = [s for s in only_steps if s not in known_steps]
+        if invalid:
+            parser.error(
+                f"Unknown step(s) in --steps: {', '.join(invalid)}. "
+                f"Valid steps: {', '.join(STEPS.keys())}"
+            )
+
     trait_id = args.phenotype or ""
     species_list = _load_species_registry(phenotype=trait_id or None)
-    only_steps = [s.strip() for s in args.steps.split(",")] if args.steps else None
 
     run_pipeline(
         species_list=species_list,
