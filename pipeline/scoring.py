@@ -401,11 +401,39 @@ def run_scoring(phase: str = "phase1", trait_id: Optional[str] = None) -> None:
         genes = session.query(Gene).all()
         log.info("Scoring %d genes...", len(genes))
 
+        # Pre-fetch all related tables in bulk to avoid N+1 queries
+        ev_map  = {r.gene_id: r for r in session.query(EvolutionScore).all()}
+        ann_map = {r.gene_id: r for r in session.query(DiseaseAnnotation).all()}
+        dt_map  = {r.gene_id: r for r in session.query(DrugTarget).all()}
+        sf_map  = {r.gene_id: r for r in session.query(SafetyFlag).all()}
+        # Expression scores stored in CandidateScore trait_id=""
+        expr_map = {
+            r.gene_id: (r.expression_score or 0.0)
+            for r in session.query(CandidateScore).filter_by(trait_id="").all()
+        }
+        # Regulatory divergence: max promoter score per gene
+        reg_rows_all = session.query(RegulatoryDivergence).all()
+        reg_map: dict[str, list] = {}
+        for r in reg_rows_all:
+            reg_map.setdefault(r.gene_id, []).append(r)
+        # Nucleotide scores (promoter)
+        nucl_map = {
+            r.gene_id: r
+            for r in session.query(NucleotideScore).filter_by(region_type="promoter").all()
+        }
+        # PhyloConservationScore
+        phylo_map = {r.gene_id: r for r in session.query(PhyloConservationScore).all()}
+        # Pre-fetch existing CandidateScore rows for this trait to avoid per-gene SELECT
+        cs_map = {
+            r.gene_id: r
+            for r in session.query(CandidateScore).filter_by(trait_id=tid).all()
+        }
+
         for gene in genes:
-            ev = session.get(EvolutionScore, gene.id)
-            ann = session.get(DiseaseAnnotation, gene.id)
-            dt = session.get(DrugTarget, gene.id)
-            sf = session.get(SafetyFlag, gene.id)
+            ev  = ev_map.get(gene.id)
+            ann = ann_map.get(gene.id)
+            dt  = dt_map.get(gene.id)
+            sf  = sf_map.get(gene.id)
 
             conv_score = convergence_score(
                 ev.convergence_count if ev else 0,
@@ -419,14 +447,38 @@ def run_scoring(phase: str = "phase1", trait_id: Optional[str] = None) -> None:
                 relax_k=ev.relax_k if ev else None,
                 relax_pvalue=ev.relax_pvalue if ev else None,
             )
-            expr_score = expression_score_from_db(gene.id, session)
+            expr_score = expr_map.get(gene.id, 0.0)
             dis_score = disease_score(ann) if weights.get("disease", 0) > 0 else 0.0
             drug_score = druggability_score(dt) if weights.get("druggability", 0) > 0 else 0.0
             safe_score = safety_score(sf) if weights.get("safety", 0) > 0 else 1.0
             if weights.get("regulatory", 0) > 0:
-                alpha_score = regulatory_score(gene.id, session)
-                nucl_score  = nucleotide_divergence_score(gene.id, session)
-                # Blend: 60% AlphaGenome + 40% nucleotide (nucleotide is 0 when step3c hasn't run)
+                # Regulatory score from pre-fetched maps
+                reg_rows_gene = reg_map.get(gene.id, [])
+                if reg_rows_gene:
+                    effects = [r.regulatory_score for r in reg_rows_gene if r.regulatory_score is not None]
+                    lineage_count = max((r.lineage_count or 0) for r in reg_rows_gene)
+                    alpha_score = round(min(max(effects) + 0.05 * lineage_count, 1.0), 4) if effects else 0.0
+                else:
+                    alpha_score = 0.0
+                # Nucleotide divergence score from pre-fetched maps
+                ns = nucl_map.get(gene.id)
+                if ns is not None:
+                    cons = ns.conservation_score or 0.0
+                    promoter_divergence = round(1.0 - min(cons, 1.0), 4)
+                    div_component = round(min((ns.regulatory_divergence_count or 0) / 10.0, 1.0), 4)
+                    conv_bonus = round(min((ns.regulatory_convergence_count or 0) / 5.0, 0.2), 4)
+                    pcs = phylo_map.get(gene.id)
+                    phylo_component = 0.0
+                    if pcs is not None and pcs.promoter_phylo_score is not None:
+                        pps = pcs.promoter_phylo_score
+                        if pps < 0:
+                            phylo_component = round(min(-pps / 3.0, 1.0), 4)
+                    nucl_score = round(min(
+                        0.4 * promoter_divergence + 0.3 * div_component
+                        + 0.2 * phylo_component + conv_bonus, 1.0
+                    ), 4)
+                else:
+                    nucl_score = 0.0
                 reg_score = round(0.6 * alpha_score + 0.4 * nucl_score, 4)
             else:
                 reg_score = 0.0
@@ -445,10 +497,11 @@ def run_scoring(phase: str = "phase1", trait_id: Optional[str] = None) -> None:
             hg_score = human_genetics_score_from_disease(ann)
             tier = assign_tier(comp, tier_thresholds, human_genetics_score=hg_score)
 
-            cs = session.query(CandidateScore).filter_by(gene_id=gene.id, trait_id=tid).first()
+            cs = cs_map.get(gene.id)
             if cs is None:
                 cs = CandidateScore(gene_id=gene.id, trait_id=tid)
                 session.add(cs)
+                cs_map[gene.id] = cs
 
             cs.convergence_score = conv_score
             cs.selection_score = sel_score

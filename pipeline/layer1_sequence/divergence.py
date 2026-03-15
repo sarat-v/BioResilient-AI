@@ -16,6 +16,8 @@ from typing import Optional
 
 import numpy as np
 
+from sqlalchemy import or_, tuple_
+
 from db.models import DivergentMotif, Ortholog
 from db.session import get_session
 from pipeline.config import get_thresholds
@@ -186,7 +188,6 @@ def load_motifs_to_db(
     unique_pairs = {(m["species_id"], m["protein_id"]) for m in motifs}
     log.info("  Loading %d motifs (%d unique orthologs) to DB...", len(motifs), len(unique_pairs))
 
-    from sqlalchemy import or_, tuple_
     ortholog_lookup: dict[tuple, int] = {}  # (species_id, protein_id) → ortholog.id
     identity_lookup: dict[int, float] = {}  # ortholog.id → sequence_identity_pct
 
@@ -195,13 +196,11 @@ def load_motifs_to_db(
     with get_session() as session:
         for i in range(0, len(pairs), chunk_size):
             chunk = pairs[i: i + chunk_size]
-            conditions = [
-                (Ortholog.species_id == sid) & (Ortholog.protein_id == pid)
-                for sid, pid in chunk
-            ]
             rows = session.query(
                 Ortholog.id, Ortholog.species_id, Ortholog.protein_id, Ortholog.sequence_identity_pct
-            ).filter(or_(*conditions)).all()
+            ).filter(
+                tuple_(Ortholog.species_id, Ortholog.protein_id).in_(chunk)
+            ).all()
             for r in rows:
                 ortholog_lookup[(r.species_id, r.protein_id)] = r.id
                 identity_lookup[r.id] = r.sequence_identity_pct
@@ -232,6 +231,9 @@ def load_motifs_to_db(
                 session.bulk_insert_mappings(DivergentMotif, batch)
                 inserted += len(batch)
                 batch = []
+                if inserted % 200_000 == 0:
+                    session.flush()
+                    log.info("  Motif insert progress: %d rows committed...", inserted)
         if batch:
             session.bulk_insert_mappings(DivergentMotif, batch)
             inserted += len(batch)
@@ -343,13 +345,10 @@ def update_sequence_identities(aligned_orthogroups: dict[str, dict[str, str]]) -
     with get_session() as session:
         for i in range(0, len(keys), chunk_size):
             chunk = keys[i: i + chunk_size]
-            # Fetch all matching orthologs in one query
-            conditions = [
-                (Ortholog.species_id == sid) & (Ortholog.protein_id == pid)
-                for sid, pid in chunk
-            ]
-            from sqlalchemy import or_
-            orthologs = session.query(Ortholog).filter(or_(*conditions)).all()
+            # Fetch all matching orthologs in one query using tuple_ (faster than OR expansion)
+            orthologs = session.query(Ortholog).filter(
+                tuple_(Ortholog.species_id, Ortholog.protein_id).in_(chunk)
+            ).all()
             for o in orthologs:
                 key = (o.species_id, o.protein_id)
                 if key in identity_map:
