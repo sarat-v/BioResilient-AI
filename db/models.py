@@ -17,6 +17,7 @@ from sqlalchemy import (
     DateTime,
     Float,
     ForeignKey,
+    Index,
     Integer,
     String,
     Text,
@@ -86,6 +87,7 @@ class Ortholog(Base):
     __tablename__ = "ortholog"
     __table_args__ = (
         UniqueConstraint("gene_id", "species_id", name="uq_ortholog_gene_species"),
+        Index("idx_ortholog_species_protein", "species_id", "protein_id"),
     )
 
     id = Column(String, primary_key=True, default=_uuid)
