@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
 # BioResilient Cancer Resistance — Stepwise Interactive Pipeline Runner
+PYTHON=$(command -v python3 || command -v python)
 #
 # Runs each step (or step group) sequentially, pausing after each one to:
 #   1. Show a rich cached report (step_cache/<step>.md)
@@ -106,7 +107,7 @@ run_step() {
     IFS=',' read -ra STEP_LIST <<< "$steps"
     for step in "${STEP_LIST[@]}"; do
         echo -e "${DIM}   → $step${RESET}"
-        python pipeline/orchestrator.py \
+        $PYTHON pipeline/orchestrator.py \
             --steps "$step" \
             --phenotype "$PHENOTYPE" \
             $DRY_RUN_FLAG \
@@ -124,7 +125,7 @@ write_and_show_report() {
     # Write JSON+MD report and show validation result. Sets VALIDATION_STATUS.
     local step="$1"
     echo -e "${DIM}   Writing report for ${step}...${RESET}"
-    python pipeline/step_reporter.py --step "$step" 2>&1
+    $PYTHON pipeline/step_reporter.py --step "$step" 2>&1
     VALIDATION_STATUS=$?    # 0 = PASS/WARN, 1 = FAIL
     return 0
 }
