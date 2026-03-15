@@ -25,8 +25,6 @@ from pipeline.config import get_local_storage_root, get_tool_config
 
 log = logging.getLogger(__name__)
 
-log = logging.getLogger(__name__)
-
 
 def _alignments_dir() -> Path:
     root = Path(get_local_storage_root())

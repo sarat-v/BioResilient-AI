@@ -40,6 +40,29 @@ def get_db_url() -> str:
     return os.path.expandvars(url_template)
 
 
+def get_psycopg2_conn():
+    """Return a raw psycopg2 connection, correctly handling sslmode from the URL.
+
+    psycopg2 supports ?sslmode=require in the DSN string, but using
+    psycopg2.connect(url) can silently hang on SSL handshake with some RDS
+    configurations. This helper strips the sslmode param from the URL and
+    passes it as an explicit keyword argument to guarantee it is applied.
+    """
+    import psycopg2
+    from urllib.parse import urlparse, parse_qs, urlencode, urlunparse
+
+    url = get_db_url()
+    parsed = urlparse(url)
+    params = parse_qs(parsed.query)
+
+    # Extract sslmode before passing to psycopg2
+    sslmode = params.pop("sslmode", ["require"])[0]
+    clean_query = urlencode({k: v[0] for k, v in params.items()})
+    clean_url = urlunparse(parsed._replace(query=clean_query))
+
+    return psycopg2.connect(clean_url, sslmode=sslmode, connect_timeout=30)
+
+
 def get_storage_root() -> str:
     cfg = get_config()
     deployment = get_deployment()

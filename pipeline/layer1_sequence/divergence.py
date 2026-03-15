@@ -240,8 +240,7 @@ def load_motifs_to_db(
     # Use PostgreSQL COPY for maximum throughput — ~10-50x faster than bulk_insert_mappings
     # COPY streams all data over a single connection with no per-row overhead
     import io
-    import psycopg2
-    from pipeline.config import get_db_url
+    from pipeline.config import get_psycopg2_conn
 
     total_to_insert = len(rows_to_insert)
     log.info("  Inserting %d motif rows via COPY (streaming)...", total_to_insert)
@@ -249,7 +248,7 @@ def load_motifs_to_db(
 
     inserted = 0
     chunk_size = 500_000
-    conn = psycopg2.connect(get_db_url())
+    conn = get_psycopg2_conn()
     try:
         cur = conn.cursor()
         for chunk_start in range(0, total_to_insert, chunk_size):
@@ -382,14 +381,13 @@ def update_sequence_identities(aligned_orthogroups: dict[str, dict[str, str]]) -
 
     import io
     import time
-    import psycopg2
-    from pipeline.config import get_db_url
+    from pipeline.config import get_psycopg2_conn
 
     t0 = time.time()
     log.info("  Bulk-updating %d sequence identity rows via COPY+temp table...", len(identity_map))
 
     items = list(identity_map.items())
-    conn = psycopg2.connect(get_db_url())
+    conn = get_psycopg2_conn()
     try:
         cur = conn.cursor()
         cur.execute("""
