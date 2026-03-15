@@ -207,11 +207,22 @@ def load_motifs_to_db(
         log.info("  Ortholog lookup built: %d entries in %.1fs.", len(ortholog_lookup), time.time() - t0)
 
     # Pre-build the full insert list in memory (filter first, then insert in committed chunks)
-    log.info("  Pre-filtering motifs against identity threshold (max_identity=%.2f)...", max_identity)
+    # Keep only the top-N highest-divergence motifs per ortholog to cap DB volume.
+    # 8M+ motifs at ~1400 rows/s over RDS takes hours; top-3 per ortholog gives
+    # ~500k rows (the most biologically informative windows) and finishes in minutes.
+    TOP_N_PER_ORTHOLOG = 3
+    log.info(
+        "  Pre-filtering motifs (max_identity=%.2f, top-%d per ortholog)...",
+        max_identity, TOP_N_PER_ORTHOLOG,
+    )
     t1 = time.time()
-    rows_to_insert = []
+
+    # Group by ortholog, keep top-N by divergence score
+    from collections import defaultdict
+    motifs_by_ortholog: dict[str, list] = defaultdict(list)
     skipped_no_ortholog = 0
     skipped_identity = 0
+
     for m in motifs:
         key = (m["species_id"], m["protein_id"])
         oid = ortholog_lookup.get(key)
@@ -222,21 +233,26 @@ def load_motifs_to_db(
         if pct is not None and pct / 100.0 > max_identity:
             skipped_identity += 1
             continue
-        rows_to_insert.append({
-            "id": str(_uuid.uuid4()),
-            "ortholog_id": oid,
-            "start_pos": m["start_pos"],
-            "end_pos": m["end_pos"],
-            "animal_seq": m["animal_seq"],
-            "human_seq": m["human_seq"],
-            "divergence_score": m["divergence_score"],
-            "esm_distance": m.get("esm_distance"),
-        })
+        motifs_by_ortholog[oid].append(m)
+
+    rows_to_insert = []
+    for oid, omotifs in motifs_by_ortholog.items():
+        top = sorted(omotifs, key=lambda x: x["divergence_score"], reverse=True)[:TOP_N_PER_ORTHOLOG]
+        for m in top:
+            rows_to_insert.append({
+                "id": str(_uuid.uuid4()),
+                "ortholog_id": oid,
+                "start_pos": m["start_pos"],
+                "end_pos": m["end_pos"],
+                "animal_seq": m["animal_seq"],
+                "human_seq": m["human_seq"],
+                "divergence_score": m["divergence_score"],
+                "esm_distance": m.get("esm_distance"),
+            })
     log.info(
         "  Pre-filter done in %.1fs: %d to insert, %d skipped (no ortholog), %d skipped (identity).",
         time.time() - t1, len(rows_to_insert), skipped_no_ortholog, skipped_identity,
     )
-
     # Use PostgreSQL COPY for maximum throughput — ~10-50x faster than bulk_insert_mappings
     # COPY streams all data over a single connection with no per-row overhead
     import io
