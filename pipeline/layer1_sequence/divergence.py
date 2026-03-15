@@ -191,7 +191,7 @@ def load_motifs_to_db(
     ortholog_lookup: dict[tuple, int] = {}  # (species_id, protein_id) → ortholog.id
     identity_lookup: dict[int, float] = {}  # ortholog.id → sequence_identity_pct
 
-    chunk_size = 500
+    chunk_size = 2000
     pairs = list(unique_pairs)
     with get_session() as session:
         for i in range(0, len(pairs), chunk_size):
@@ -231,9 +231,9 @@ def load_motifs_to_db(
                 session.bulk_insert_mappings(DivergentMotif, batch)
                 inserted += len(batch)
                 batch = []
-                if inserted % 200_000 == 0:
+                if inserted % 50_000 == 0:
                     session.flush()
-                    log.info("  Motif insert progress: %d rows committed...", inserted)
+                    log.info("  Motif insert progress: %d / ~%d rows...", inserted, len(motifs))
         if batch:
             session.bulk_insert_mappings(DivergentMotif, batch)
             inserted += len(batch)
