@@ -380,40 +380,44 @@ def update_sequence_identities(aligned_orthogroups: dict[str, dict[str, str]]) -
     if not identity_map:
         return
 
+    import io
     import time
+    from db.session import get_engine
+
     t0 = time.time()
-    log.info("  Bulk-updating %d sequence identity rows via temp table...", len(identity_map))
+    log.info("  Bulk-updating %d sequence identity rows via COPY+temp table...", len(identity_map))
 
     items = list(identity_map.items())
-    with get_session() as session:
-        # 1. Create a temp table for the update values
-        session.execute(text("""
+    raw_conn = get_engine().raw_connection()
+    try:
+        cur = raw_conn.cursor()
+        # 1. Create temp table
+        cur.execute("""
             CREATE TEMP TABLE _identity_update (
                 species_id TEXT,
                 protein_id TEXT,
                 pct        REAL
-            ) ON COMMIT DROP
-        """))
-
-        # 2. Insert all values in chunks (no network round-trip per row — just data transfer)
-        chunk_size = 10000
-        for i in range(0, len(items), chunk_size):
-            chunk = items[i: i + chunk_size]
-            values_sql = ", ".join(
-                f"('{sid}', '{pid}', {pct})"
-                for (sid, pid), pct in chunk
             )
-            session.execute(text(f"INSERT INTO _identity_update VALUES {values_sql}"))
-
-        # 3. Single UPDATE join — one query to update all 184k rows
-        result = session.execute(text("""
+        """)
+        # 2. Stream all rows via COPY (fastest possible load — no per-row overhead)
+        buf = io.StringIO()
+        for (sid, pid), pct in items:
+            buf.write(f"{sid}\t{pid}\t{pct}\n")
+        buf.seek(0)
+        cur.copy_from(buf, "_identity_update", columns=("species_id", "protein_id", "pct"))
+        # 3. Single UPDATE join
+        cur.execute("""
             UPDATE ortholog AS o
             SET sequence_identity_pct = u.pct
             FROM _identity_update AS u
             WHERE o.species_id = u.species_id
               AND o.protein_id = u.protein_id
-        """))
-        updated = result.rowcount
-        session.commit()
+        """)
+        updated = cur.rowcount
+        cur.execute("DROP TABLE _identity_update")
+        raw_conn.commit()
+        cur.close()
+    finally:
+        raw_conn.close()
 
     log.info("Sequence identities updated: %d rows in %.1fs.", updated, time.time() - t0)
