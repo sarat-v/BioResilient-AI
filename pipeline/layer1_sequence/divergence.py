@@ -237,25 +237,48 @@ def load_motifs_to_db(
         time.time() - t1, len(rows_to_insert), skipped_no_ortholog, skipped_identity,
     )
 
-    # Bulk insert with explicit commit every 100k rows so progress is visible in psql
-    inserted = 0
-    bulk_chunk = 5000
-    commit_every = 100_000
+    # Use PostgreSQL COPY for maximum throughput — ~10-50x faster than bulk_insert_mappings
+    # COPY streams all data over a single connection with no per-row overhead
+    import io
+    from db.session import get_engine
+
+    total_to_insert = len(rows_to_insert)
+    log.info("  Inserting %d motif rows via COPY (streaming)...", total_to_insert)
     t2 = time.time()
-    with get_session() as session:
-        for i in range(0, len(rows_to_insert), bulk_chunk):
-            batch = rows_to_insert[i: i + bulk_chunk]
-            session.bulk_insert_mappings(DivergentMotif, batch)
-            inserted += len(batch)
-            if inserted % commit_every == 0:
-                session.commit()
-                elapsed = time.time() - t2
-                rate = inserted / elapsed if elapsed > 0 else 0
-                log.info(
-                    "  Motif insert: %d / %d rows committed (%.0f rows/s, ETA ~%.0f min).",
-                    inserted, len(rows_to_insert), rate,
-                    (len(rows_to_insert) - inserted) / rate / 60 if rate > 0 else 0,
+
+    # Write rows as TSV into an in-memory buffer, flushing every 500k rows to cap memory
+    inserted = 0
+    chunk_size = 500_000
+    raw_conn = get_engine().raw_connection()
+    try:
+        cur = raw_conn.cursor()
+        for chunk_start in range(0, total_to_insert, chunk_size):
+            chunk = rows_to_insert[chunk_start: chunk_start + chunk_size]
+            buf = io.StringIO()
+            for r in chunk:
+                esm = r["esm_distance"] if r["esm_distance"] is not None else "\\N"
+                buf.write(
+                    f"{r['id']}\t{r['ortholog_id']}\t{r['start_pos']}\t{r['end_pos']}\t"
+                    f"{r['animal_seq']}\t{r['human_seq']}\t{r['divergence_score']}\t{esm}\n"
                 )
+            buf.seek(0)
+            cur.copy_from(
+                buf, "divergent_motif",
+                columns=("id", "ortholog_id", "start_pos", "end_pos",
+                         "animal_seq", "human_seq", "divergence_score", "esm_distance"),
+            )
+            raw_conn.commit()
+            inserted += len(chunk)
+            elapsed = time.time() - t2
+            rate = inserted / elapsed if elapsed > 0 else 0
+            log.info(
+                "  Motif insert: %d / %d rows copied (%.0f rows/s, ETA ~%.0f min).",
+                inserted, total_to_insert, rate,
+                (total_to_insert - inserted) / rate / 60 if rate > 0 else 0,
+            )
+        cur.close()
+    finally:
+        raw_conn.close()
 
     log.info("  Inserted %d divergent motif rows in %.1fs.", inserted, time.time() - t2)
     return inserted
