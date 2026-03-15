@@ -355,12 +355,12 @@ def run_divergence_pipeline(
 def update_sequence_identities(aligned_orthogroups: dict[str, dict[str, str]]) -> None:
     """Update Ortholog.sequence_identity_pct in the database from alignment data.
 
-    Uses a bulk UPDATE via a single pass: compute all identities in memory,
-    then batch-update in chunks to avoid N+1 queries.
+    Strategy: fetch all ortholog (id, species_id, protein_id) in one SELECT,
+    resolve identity values in Python, then COPY (id, pct) into a temp table
+    and UPDATE by primary key — avoids full table scan on (species_id, protein_id).
     """
     from pipeline.layer1_sequence.alignment import calculate_sequence_identity
 
-    # Build {(species_id, protein_id): identity} map in memory first
     log.info("  Computing sequence identities for %d orthogroups...", len(aligned_orthogroups))
     identity_map: dict[tuple[str, str], float] = {}
     for og_id, aligned_seqs in aligned_orthogroups.items():
@@ -384,30 +384,44 @@ def update_sequence_identities(aligned_orthogroups: dict[str, dict[str, str]]) -
     from pipeline.config import get_psycopg2_conn
 
     t0 = time.time()
-    log.info("  Bulk-updating %d sequence identity rows via COPY+temp table...", len(identity_map))
 
-    items = list(identity_map.items())
+    # Resolve (species_id, protein_id) → ortholog.id in a single SELECT
+    # Then COPY (id, pct) and UPDATE by primary key — uses PK index, no table scan
     conn = get_psycopg2_conn()
     try:
         cur = conn.cursor()
+
+        log.info("  Fetching ortholog id map from DB (single SELECT)...")
+        cur.execute("SELECT id, species_id, protein_id FROM ortholog")
+        id_rows = cur.fetchall()  # ~184k rows, fast over RDS
+        log.info("  Fetched %d ortholog rows in %.1fs.", len(id_rows), time.time() - t0)
+
+        # Resolve to (ortholog_id, pct) pairs in Python
+        updates: list[tuple[str, float]] = []
+        for oid, sid, pid in id_rows:
+            pct = identity_map.get((sid, pid))
+            if pct is not None:
+                updates.append((oid, pct))
+        log.info("  Resolved %d id→pct pairs. Bulk-updating via COPY+PK join...", len(updates))
+
         cur.execute("""
             CREATE TEMP TABLE _identity_update (
-                species_id TEXT,
-                protein_id TEXT,
-                pct        REAL
+                ortholog_id TEXT,
+                pct         REAL
             )
         """)
         buf = io.StringIO()
-        for (sid, pid), pct in items:
-            buf.write(f"{sid}\t{pid}\t{pct}\n")
+        for oid, pct in updates:
+            buf.write(f"{oid}\t{pct}\n")
         buf.seek(0)
-        cur.copy_from(buf, "_identity_update", columns=("species_id", "protein_id", "pct"))
+        cur.copy_from(buf, "_identity_update", columns=("ortholog_id", "pct"))
+
+        # UPDATE by primary key — instant with PK index
         cur.execute("""
             UPDATE ortholog AS o
             SET sequence_identity_pct = u.pct
             FROM _identity_update AS u
-            WHERE o.species_id = u.species_id
-              AND o.protein_id = u.protein_id
+            WHERE o.id = u.ortholog_id
         """)
         updated = cur.rowcount
         conn.commit()
@@ -415,4 +429,4 @@ def update_sequence_identities(aligned_orthogroups: dict[str, dict[str, str]]) -
     finally:
         conn.close()
 
-    log.info("Sequence identities updated: %d rows in %.1fs.", updated, time.time() - t0)
+    log.info("  Sequence identities updated: %d rows in %.1fs.", updated, time.time() - t0)
