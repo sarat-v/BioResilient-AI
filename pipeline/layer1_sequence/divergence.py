@@ -178,6 +178,9 @@ def load_motifs_to_db(
     Returns:
         Number of rows inserted.
     """
+    import time
+    import uuid as _uuid
+
     if not motifs:
         return 0
 
@@ -185,10 +188,10 @@ def load_motifs_to_db(
     max_identity = thresholds.get("divergence_identity_max", 0.85)
 
     # Build lookup by fetching all orthologs in a single query — faster than chunked IN()
-    # The ortholog table has ~200k rows which fits comfortably in memory
     unique_pairs = {(m["species_id"], m["protein_id"]) for m in motifs}
     log.info("  Loading %d motifs (%d unique orthologs) to DB...", len(motifs), len(unique_pairs))
-    log.info("  Building ortholog lookup (fetching all %d ortholog rows)...", len(unique_pairs))
+    log.info("  Building ortholog lookup (single full-table scan)...")
+    t0 = time.time()
 
     ortholog_lookup: dict[tuple, str] = {}  # (species_id, protein_id) → ortholog.id
     identity_lookup: dict[str, float] = {}  # ortholog.id → sequence_identity_pct
@@ -201,42 +204,60 @@ def load_motifs_to_db(
             if (r.species_id, r.protein_id) in unique_pairs:
                 ortholog_lookup[(r.species_id, r.protein_id)] = r.id
                 identity_lookup[r.id] = r.sequence_identity_pct
-        log.info("  Ortholog lookup built: %d entries.", len(ortholog_lookup))
+        log.info("  Ortholog lookup built: %d entries in %.1fs.", len(ortholog_lookup), time.time() - t0)
 
-        # Bulk insert in chunks
-        inserted = 0
-        bulk_chunk = 2000
-        batch = []
-        for m in motifs:
-            key = (m["species_id"], m["protein_id"])
-            oid = ortholog_lookup.get(key)
-            if oid is None:
-                continue
-            pct = identity_lookup.get(oid)
-            if pct is not None and pct / 100.0 > max_identity:
-                continue
-            batch.append({
-                "id": str(__import__("uuid").uuid4()),
-                "ortholog_id": oid,
-                "start_pos": m["start_pos"],
-                "end_pos": m["end_pos"],
-                "animal_seq": m["animal_seq"],
-                "human_seq": m["human_seq"],
-                "divergence_score": m["divergence_score"],
-                "esm_distance": m.get("esm_distance"),
-            })
-            if len(batch) >= bulk_chunk:
-                session.bulk_insert_mappings(DivergentMotif, batch)
-                inserted += len(batch)
-                batch = []
-                if inserted % 50_000 == 0:
-                    session.flush()
-                    log.info("  Motif insert progress: %d / ~%d rows...", inserted, len(motifs))
-        if batch:
+    # Pre-build the full insert list in memory (filter first, then insert in committed chunks)
+    log.info("  Pre-filtering motifs against identity threshold (max_identity=%.2f)...", max_identity)
+    t1 = time.time()
+    rows_to_insert = []
+    skipped_no_ortholog = 0
+    skipped_identity = 0
+    for m in motifs:
+        key = (m["species_id"], m["protein_id"])
+        oid = ortholog_lookup.get(key)
+        if oid is None:
+            skipped_no_ortholog += 1
+            continue
+        pct = identity_lookup.get(oid)
+        if pct is not None and pct / 100.0 > max_identity:
+            skipped_identity += 1
+            continue
+        rows_to_insert.append({
+            "id": str(_uuid.uuid4()),
+            "ortholog_id": oid,
+            "start_pos": m["start_pos"],
+            "end_pos": m["end_pos"],
+            "animal_seq": m["animal_seq"],
+            "human_seq": m["human_seq"],
+            "divergence_score": m["divergence_score"],
+            "esm_distance": m.get("esm_distance"),
+        })
+    log.info(
+        "  Pre-filter done in %.1fs: %d to insert, %d skipped (no ortholog), %d skipped (identity).",
+        time.time() - t1, len(rows_to_insert), skipped_no_ortholog, skipped_identity,
+    )
+
+    # Bulk insert with explicit commit every 100k rows so progress is visible in psql
+    inserted = 0
+    bulk_chunk = 5000
+    commit_every = 100_000
+    t2 = time.time()
+    with get_session() as session:
+        for i in range(0, len(rows_to_insert), bulk_chunk):
+            batch = rows_to_insert[i: i + bulk_chunk]
             session.bulk_insert_mappings(DivergentMotif, batch)
             inserted += len(batch)
+            if inserted % commit_every == 0:
+                session.commit()
+                elapsed = time.time() - t2
+                rate = inserted / elapsed if elapsed > 0 else 0
+                log.info(
+                    "  Motif insert: %d / %d rows committed (%.0f rows/s, ETA ~%.0f min).",
+                    inserted, len(rows_to_insert), rate,
+                    (len(rows_to_insert) - inserted) / rate / 60 if rate > 0 else 0,
+                )
 
-    log.info("  Inserted %d divergent motif rows.", inserted)
+    log.info("  Inserted %d divergent motif rows in %.1fs.", inserted, time.time() - t2)
     return inserted
 
 
