@@ -271,6 +271,22 @@ is_step_active() {
 mkdir -p "$CACHE_DIR"
 touch "$LOG_FILE"
 
+# Guard against duplicate instances — only one pipeline may run at a time.
+LOCKFILE="/tmp/bioresilient_pipeline.lock"
+if [[ -f "$LOCKFILE" ]]; then
+    existing_pid=$(cat "$LOCKFILE" 2>/dev/null)
+    if [[ -n "$existing_pid" ]] && kill -0 "$existing_pid" 2>/dev/null; then
+        echo -e "${RED}ERROR: Pipeline already running (PID $existing_pid). Kill it first:${RESET}"
+        echo -e "  kill $existing_pid"
+        exit 1
+    else
+        echo -e "${YELLOW}Stale lock found (PID $existing_pid gone) — removing.${RESET}"
+        rm -f "$LOCKFILE"
+    fi
+fi
+echo $$ > "$LOCKFILE"
+trap 'rm -f "$LOCKFILE"' EXIT INT TERM
+
 banner "BioResilient Cancer Resistance — Stepwise Pipeline"
 echo -e "  Phenotype  : ${BOLD}${PHENOTYPE}${RESET}"
 echo -e "  Repo       : ${REPO_ROOT}"
