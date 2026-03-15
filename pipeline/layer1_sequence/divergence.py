@@ -51,7 +51,7 @@ def score_window(animal_window: str, human_window: str) -> float:
 def extract_divergent_motifs(
     og_id: str,
     aligned_seqs: dict[str, str],
-    min_divergence: float = 0.15,
+    min_divergence: float = 0.30,
 ) -> list[dict]:
     """Slide a window over each animal sequence vs. the human sequence.
 
@@ -247,7 +247,7 @@ def load_motifs_to_db(
     t2 = time.time()
 
     inserted = 0
-    chunk_size = 500_000
+    chunk_size = 100_000
     conn = get_psycopg2_conn()
     try:
         cur = conn.cursor()
