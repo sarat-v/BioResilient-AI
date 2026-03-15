@@ -199,7 +199,7 @@ def load_motifs_to_db(
     with get_session() as session:
         all_orthologs = session.query(
             Ortholog.id, Ortholog.species_id, Ortholog.protein_id, Ortholog.sequence_identity_pct
-        ).all()
+        ).yield_per(10000)
         for r in all_orthologs:
             if (r.species_id, r.protein_id) in unique_pairs:
                 ortholog_lookup[(r.species_id, r.protein_id)] = r.id
