@@ -357,29 +357,40 @@ def update_sequence_identities(aligned_orthogroups: dict[str, dict[str, str]]) -
     if not identity_map:
         return
 
-    # Single-pass UPDATE using a VALUES literal — avoids all round-trips
-    log.info("  Bulk-updating %d sequence identity rows (single SQL statement)...", len(identity_map))
+    import time
+    t0 = time.time()
+    log.info("  Bulk-updating %d sequence identity rows via temp table...", len(identity_map))
+
     items = list(identity_map.items())
-    chunk_size = 5000
-    updated = 0
     with get_session() as session:
+        # 1. Create a temp table for the update values
+        session.execute(text("""
+            CREATE TEMP TABLE _identity_update (
+                species_id TEXT,
+                protein_id TEXT,
+                pct        REAL
+            ) ON COMMIT DROP
+        """))
+
+        # 2. Insert all values in chunks (no network round-trip per row — just data transfer)
+        chunk_size = 10000
         for i in range(0, len(items), chunk_size):
             chunk = items[i: i + chunk_size]
-            # Build a single UPDATE ... FROM (VALUES ...) statement
             values_sql = ", ".join(
                 f"('{sid}', '{pid}', {pct})"
                 for (sid, pid), pct in chunk
             )
-            result = session.execute(text(f"""
-                UPDATE ortholog AS o
-                SET sequence_identity_pct = v.pct
-                FROM (VALUES {values_sql}) AS v(species_id, protein_id, pct)
-                WHERE o.species_id = v.species_id
-                  AND o.protein_id = v.protein_id
-            """))
-            updated += result.rowcount
-            session.flush()
-            if i > 0:
-                log.info("  Sequence identity update: %d / %d pairs processed.", min(i + chunk_size, len(items)), len(items))
+            session.execute(text(f"INSERT INTO _identity_update VALUES {values_sql}"))
 
-    log.info("Sequence identities updated: %d rows.", updated)
+        # 3. Single UPDATE join — one query to update all 184k rows
+        result = session.execute(text("""
+            UPDATE ortholog AS o
+            SET sequence_identity_pct = u.pct
+            FROM _identity_update AS u
+            WHERE o.species_id = u.species_id
+              AND o.protein_id = u.protein_id
+        """))
+        updated = result.rowcount
+        session.commit()
+
+    log.info("Sequence identities updated: %d rows in %.1fs.", updated, time.time() - t0)
