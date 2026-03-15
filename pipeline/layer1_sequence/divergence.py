@@ -16,7 +16,7 @@ from typing import Optional
 
 import numpy as np
 
-from sqlalchemy import or_, tuple_
+from sqlalchemy import text
 
 from db.models import DivergentMotif, Ortholog
 from db.session import get_session
@@ -184,26 +184,24 @@ def load_motifs_to_db(
     thresholds = get_thresholds()
     max_identity = thresholds.get("divergence_identity_max", 0.85)
 
-    # Build lookup: (species_id, protein_id) → ortholog in one query per unique pair
+    # Build lookup by fetching all orthologs in a single query — faster than chunked IN()
+    # The ortholog table has ~200k rows which fits comfortably in memory
     unique_pairs = {(m["species_id"], m["protein_id"]) for m in motifs}
     log.info("  Loading %d motifs (%d unique orthologs) to DB...", len(motifs), len(unique_pairs))
+    log.info("  Building ortholog lookup (fetching all %d ortholog rows)...", len(unique_pairs))
 
-    ortholog_lookup: dict[tuple, int] = {}  # (species_id, protein_id) → ortholog.id
-    identity_lookup: dict[int, float] = {}  # ortholog.id → sequence_identity_pct
+    ortholog_lookup: dict[tuple, str] = {}  # (species_id, protein_id) → ortholog.id
+    identity_lookup: dict[str, float] = {}  # ortholog.id → sequence_identity_pct
 
-    chunk_size = 2000
-    pairs = list(unique_pairs)
     with get_session() as session:
-        for i in range(0, len(pairs), chunk_size):
-            chunk = pairs[i: i + chunk_size]
-            rows = session.query(
-                Ortholog.id, Ortholog.species_id, Ortholog.protein_id, Ortholog.sequence_identity_pct
-            ).filter(
-                tuple_(Ortholog.species_id, Ortholog.protein_id).in_(chunk)
-            ).all()
-            for r in rows:
+        all_orthologs = session.query(
+            Ortholog.id, Ortholog.species_id, Ortholog.protein_id, Ortholog.sequence_identity_pct
+        ).all()
+        for r in all_orthologs:
+            if (r.species_id, r.protein_id) in unique_pairs:
                 ortholog_lookup[(r.species_id, r.protein_id)] = r.id
                 identity_lookup[r.id] = r.sequence_identity_pct
+        log.info("  Ortholog lookup built: %d entries.", len(ortholog_lookup))
 
         # Bulk insert in chunks
         inserted = 0
@@ -339,8 +337,6 @@ def update_sequence_identities(aligned_orthogroups: dict[str, dict[str, str]]) -
         return
 
     # Single-pass UPDATE using a VALUES literal — avoids all round-trips
-    from sqlalchemy import text
-
     log.info("  Bulk-updating %d sequence identity rows (single SQL statement)...", len(identity_map))
     items = list(identity_map.items())
     chunk_size = 5000
