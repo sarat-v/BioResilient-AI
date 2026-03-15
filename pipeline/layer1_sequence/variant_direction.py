@@ -1,22 +1,33 @@
-"""Variant direction inference: GoF / LoF / neutral classification per divergent motif.
+"""Variant direction inference: GoF / LoF / functional_shift / neutral per divergent motif.
 
 Combines three existing signals that are already computed and stored on DivergentMotif:
-  - AlphaMissense consequence_score  (0 = benign, 1 = pathogenic)
+  - AlphaMissense consequence_score  (0 = benign, 1 = pathogenic in human)
   - ESM-1v LLR score                  (negative = destabilising, positive = neutral/gain)
   - LOEUF from gnomAD                 (fetched once per human gene; low = LoF intolerant)
 
 Classification logic:
-  ┌──────────────────────────────────────────────────────────────────────────┐
-  │ destabilising (ESM-1v LLR < -2)  + high AM score (> 0.6)               │
-  │   + LoF-tolerant LOEUF > 0.5     → loss_of_function (protective LoF)   │
-  │ destabilising                    + LoF-intolerant LOEUF ≤ 0.5          │
-  │                                   → likely_pathogenic (filter out)      │
-  │ neutral/stabilising ESM-1v        + high AM  → gain_of_function         │
-  │ all other                          → neutral                             │
-  └──────────────────────────────────────────────────────────────────────────┘
+  ┌──────────────────────────────────────────────────────────────────────────────────┐
+  │ destabilising (ESM-1v LLR < -2)  + high AM score (> 0.6)                       │
+  │   + LoF-tolerant LOEUF > 0.5     → loss_of_function (protective LoF)           │
+  │ destabilising                    + LoF-intolerant LOEUF ≤ 0.5                  │
+  │                                   → functional_shift (hypothesis only — human   │
+  │                                     ML tools flag this as pathogenic but the    │
+  │                                     variant is fixed in a resilient species;    │
+  │                                     may represent adaptive functional change)   │
+  │ neutral/stabilising ESM-1v        + high AM  → gain_of_function                 │
+  │ all other                          → neutral                                     │
+  └──────────────────────────────────────────────────────────────────────────────────┘
+
+IMPORTANT: AlphaMissense and ESM-1v were trained on human clinical variants.
+They assume the human reference is optimal and flag deviations as harmful.
+In cross-species evolutionary analysis the opposite may be true — a variant fixed
+in a long-lived, cancer-resistant species is likely adaptive, not pathogenic.
+All direction labels are *hypotheses for experimental validation*, not definitive
+mechanism calls. The 'functional_shift' label in particular should be read as
+"function likely altered; direction unclear given human-centric model training".
 
 Result stored as DivergentMotif.motif_direction (string enum: 'gain_of_function',
-'loss_of_function', 'likely_pathogenic', 'neutral').
+'loss_of_function', 'functional_shift', 'neutral').
 """
 
 import logging
@@ -92,12 +103,17 @@ def classify_motif_direction(
     consequence_score: Optional[float],
     loeuf: Optional[float],
 ) -> str:
-    """Return 'gain_of_function', 'loss_of_function', 'likely_pathogenic', or 'neutral'.
+    """Return 'gain_of_function', 'loss_of_function', 'functional_shift', or 'neutral'.
 
     Args:
         esm1v_score: ESM-1v log-likelihood ratio (negative = destabilising)
-        consequence_score: AlphaMissense score in [0,1] (high = pathogenic)
-        loeuf: gnomAD LOEUF value (low = LoF intolerant)
+        consequence_score: AlphaMissense score in [0,1] (high = pathogenic in human)
+        loeuf: gnomAD LOEUF value (low = LoF intolerant in human population)
+
+    Note: These scores are derived from human-centric ML models. A variant
+    flagged as 'functional_shift' (previously 'likely_pathogenic') may actually
+    represent successful adaptation in a resilient species. Treat all labels as
+    hypotheses, not conclusions.
     """
     am_high = (consequence_score is not None and consequence_score > 0.6)
     esm_destab = (esm1v_score is not None and esm1v_score < -2.0)
@@ -107,7 +123,7 @@ def classify_motif_direction(
         if lof_tolerant:
             return "loss_of_function"
         else:
-            return "likely_pathogenic"
+            return "functional_shift"
     elif am_high and not esm_destab:
         return "gain_of_function"
     else:
@@ -170,7 +186,7 @@ def annotate_variant_directions(gene_ids: Optional[list[str]] = None) -> int:
         session.commit()
 
     dist: dict[str, int] = {}
-    for v in ["gain_of_function", "loss_of_function", "likely_pathogenic", "neutral"]:
+    for v in ["gain_of_function", "loss_of_function", "functional_shift", "neutral"]:
         dist[v] = 0
     for motif in motifs:
         dist[getattr(motif, "motif_direction", "neutral")] = dist.get(

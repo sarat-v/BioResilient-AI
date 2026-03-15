@@ -350,7 +350,11 @@ def step4_alignment_and_divergence(
     update_sequence_identities(aligned)
 
     motifs_by_og_raw = run_divergence_pipeline(aligned)
-    species_to_lineage = {s["id"]: s.get("lineage_group", "Other") for s in species_list}
+    species_to_lineage = {
+        s["id"]: s.get("lineage_group", "Other")
+        for s in species_list
+        if not s.get("is_control", False) and "baseline" not in s.get("phenotype", [])
+    }
     min_lineages = int(thresholds.get("convergence_min_lineages", 2))
     motifs_by_og = filter_by_independent_lineages(
         motifs_by_og_raw,

@@ -679,6 +679,9 @@ def _collect_step4d() -> dict:
             data[f"top10_{direction}"] = [
                 {"gene": sym.get(gid, gid), "motif_count": n} for gid, n in top
             ]
+        # functional_shift count (previously 'likely_pathogenic' — renamed to clarify
+        # these are hypothesis labels from human-centric ML models, not hard filters)
+        data["functional_shift_count"] = direction_counts.get("functional_shift", 0)
     return data
 
 

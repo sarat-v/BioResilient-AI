@@ -7,10 +7,13 @@ For each aligned orthogroup:
   4. Load DivergentMotif records into the database.
 
 Threshold: a motif is flagged if sequence identity < 85% in ≥ 2 protective species.
+All thresholds are read from config/environment.yml at runtime — no hardcoded values.
 """
 
 import logging
 import os
+import statistics
+from collections import defaultdict
 from pathlib import Path
 from typing import Optional
 
@@ -23,9 +26,6 @@ from db.session import get_session
 from pipeline.config import get_thresholds
 
 log = logging.getLogger(__name__)
-
-WINDOW_SIZE = 15
-WINDOW_STEP = 5
 
 
 def score_window(animal_window: str, human_window: str) -> float:
@@ -51,20 +51,28 @@ def score_window(animal_window: str, human_window: str) -> float:
 def extract_divergent_motifs(
     og_id: str,
     aligned_seqs: dict[str, str],
-    min_divergence: float = 0.30,
+    min_divergence: float = None,
 ) -> list[dict]:
     """Slide a window over each animal sequence vs. the human sequence.
 
     Args:
         og_id: OrthoGroup identifier.
         aligned_seqs: {label: aligned_sequence} — output from MAFFT.
-        min_divergence: Minimum divergence score to flag a window.
+        min_divergence: Minimum divergence score to flag a window. Reads from
+            config (divergence_min_score) when None.
 
     Returns:
         List of motif dicts with keys:
           species_id, protein_id, start_pos, end_pos,
           animal_seq, human_seq, divergence_score.
     """
+    thresholds = get_thresholds()
+    if min_divergence is None:
+        min_divergence = float(thresholds.get("divergence_min_score", 0.15))
+    window_size = int(thresholds.get("divergence_window_size", 15))
+    window_step = int(thresholds.get("divergence_window_step", 5))
+    min_species_per_window = int(thresholds.get("divergence_min_species_per_window", 2))
+
     human_seq = _get_human_sequence(aligned_seqs)
     if human_seq is None:
         return []
@@ -72,21 +80,32 @@ def extract_divergent_motifs(
     alignment_len = len(human_seq)
     motifs = []
 
-    for label, animal_seq in aligned_seqs.items():
-        if "human" in label:
-            continue
-        if len(animal_seq) != alignment_len:
-            continue
+    # Pre-compute which non-human sequences are valid (correct length)
+    non_human_seqs = {
+        label: seq for label, seq in aligned_seqs.items()
+        if "human" not in label and len(seq) == alignment_len
+    }
 
+    for label, animal_seq in non_human_seqs.items():
         species_id, protein_id = _parse_label(label)
 
-        for start in range(0, alignment_len - WINDOW_SIZE + 1, WINDOW_STEP):
-            end = start + WINDOW_SIZE
+        for start in range(0, alignment_len - window_size + 1, window_step):
+            end = start + window_size
             animal_window = animal_seq[start:end]
             human_window = human_seq[start:end]
 
-            # Skip windows that are mostly gaps
-            if animal_window.count("-") > WINDOW_SIZE * 0.5:
+            # Skip windows that are mostly gaps in this species
+            if animal_window.count("-") > window_size * 0.5:
+                continue
+
+            # Species coverage guard: require min_species_per_window to have
+            # valid (non-gappy) sequence at this position to avoid alignment
+            # artifact signals where only 1 species has residues.
+            valid_species_at_window = sum(
+                1 for seq in non_human_seqs.values()
+                if seq[start:end].count("-") <= window_size * 0.5
+            )
+            if valid_species_at_window < min_species_per_window:
                 continue
 
             div_score = score_window(animal_window, human_window)
@@ -208,9 +227,9 @@ def load_motifs_to_db(
 
     # Pre-build the full insert list in memory (filter first, then insert in committed chunks)
     # Keep only the top-N highest-divergence motifs per ortholog to cap DB volume.
-    # 8M+ motifs at ~1400 rows/s over RDS takes hours; top-3 per ortholog gives
-    # ~500k rows (the most biologically informative windows) and finishes in minutes.
-    TOP_N_PER_ORTHOLOG = 3
+    # Value is read from config (divergence_top_n_per_ortholog, default 8).
+    thresholds = get_thresholds()
+    TOP_N_PER_ORTHOLOG = int(thresholds.get("divergence_top_n_per_ortholog", 8))
     log.info(
         "  Pre-filtering motifs (max_identity=%.2f, top-%d per ortholog)...",
         max_identity, TOP_N_PER_ORTHOLOG,
@@ -218,7 +237,6 @@ def load_motifs_to_db(
     t1 = time.time()
 
     # Group by ortholog, keep top-N by divergence score
-    from collections import defaultdict
     motifs_by_ortholog: dict[str, list] = defaultdict(list)
     skipped_no_ortholog = 0
     skipped_identity = 0
@@ -365,6 +383,17 @@ def run_divergence_pipeline(
             log.info("  Divergence: %d / %d orthogroups (%.0f%%).", done, total, 100 * done / total)
 
     log.info("Divergence scan: %d motifs across %d orthogroups.", motif_total, len(all_motifs))
+
+    # Step4 QC report — helps detect pipeline drift across runs
+    if all_motifs:
+        counts = [len(v) for v in all_motifs.values()]
+        log.info(
+            "Step4 QC: motifs_raw=%d, orthogroups_with_motifs=%d, "
+            "median_per_og=%.1f, max_per_og=%d, min_per_og=%d",
+            motif_total, len(all_motifs),
+            statistics.median(counts), max(counts), min(counts),
+        )
+
     return all_motifs
 
 
