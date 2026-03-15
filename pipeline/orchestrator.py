@@ -357,8 +357,8 @@ def step4_alignment_and_divergence(
         species_to_lineage,
         min_lineages=min_lineages,
     )
-    for og_id, motifs in motifs_by_og.items():
-        load_motifs_to_db(motifs, {})
+    all_motifs_flat = [m for motifs in motifs_by_og.values() for m in motifs]
+    load_motifs_to_db(all_motifs_flat, {})
 
     aligned_for_hyphy = {og: aligned[og] for og in motifs_by_og}
     log.info("  After Gate 2: %d orthogroups for HyPhy.", len(aligned_for_hyphy))

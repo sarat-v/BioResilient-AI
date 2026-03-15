@@ -168,7 +168,7 @@ def load_motifs_to_db(
     motifs: list[dict],
     ortholog_map: dict = None,  # unused, kept for backwards compatibility
 ) -> int:
-    """Insert DivergentMotif rows into the database.
+    """Insert DivergentMotif rows into the database using bulk inserts.
 
     Args:
         motifs: Output from extract_divergent_motifs().
@@ -176,37 +176,67 @@ def load_motifs_to_db(
     Returns:
         Number of rows inserted.
     """
+    if not motifs:
+        return 0
+
     thresholds = get_thresholds()
     max_identity = thresholds.get("divergence_identity_max", 0.85)
 
-    inserted = 0
+    # Build lookup: (species_id, protein_id) → ortholog in one query per unique pair
+    unique_pairs = {(m["species_id"], m["protein_id"]) for m in motifs}
+    log.info("  Loading %d motifs (%d unique orthologs) to DB...", len(motifs), len(unique_pairs))
+
+    from sqlalchemy import or_, tuple_
+    ortholog_lookup: dict[tuple, int] = {}  # (species_id, protein_id) → ortholog.id
+    identity_lookup: dict[int, float] = {}  # ortholog.id → sequence_identity_pct
+
+    chunk_size = 500
+    pairs = list(unique_pairs)
     with get_session() as session:
+        for i in range(0, len(pairs), chunk_size):
+            chunk = pairs[i: i + chunk_size]
+            conditions = [
+                (Ortholog.species_id == sid) & (Ortholog.protein_id == pid)
+                for sid, pid in chunk
+            ]
+            rows = session.query(
+                Ortholog.id, Ortholog.species_id, Ortholog.protein_id, Ortholog.sequence_identity_pct
+            ).filter(or_(*conditions)).all()
+            for r in rows:
+                ortholog_lookup[(r.species_id, r.protein_id)] = r.id
+                identity_lookup[r.id] = r.sequence_identity_pct
+
+        # Bulk insert in chunks
+        inserted = 0
+        bulk_chunk = 2000
+        batch = []
         for m in motifs:
-            # Look up ortholog by species_id + protein_id
-            ortholog = (
-                session.query(Ortholog)
-                .filter_by(species_id=m["species_id"], protein_id=m["protein_id"])
-                .first()
-            )
-            if ortholog is None:
+            key = (m["species_id"], m["protein_id"])
+            oid = ortholog_lookup.get(key)
+            if oid is None:
                 continue
-
-            # Only keep motifs from species with low overall identity (divergent enough)
-            if ortholog.sequence_identity_pct and ortholog.sequence_identity_pct / 100.0 > max_identity:
+            pct = identity_lookup.get(oid)
+            if pct is not None and pct / 100.0 > max_identity:
                 continue
+            batch.append({
+                "id": str(__import__("uuid").uuid4()),
+                "ortholog_id": oid,
+                "start_pos": m["start_pos"],
+                "end_pos": m["end_pos"],
+                "animal_seq": m["animal_seq"],
+                "human_seq": m["human_seq"],
+                "divergence_score": m["divergence_score"],
+                "esm_distance": m.get("esm_distance"),
+            })
+            if len(batch) >= bulk_chunk:
+                session.bulk_insert_mappings(DivergentMotif, batch)
+                inserted += len(batch)
+                batch = []
+        if batch:
+            session.bulk_insert_mappings(DivergentMotif, batch)
+            inserted += len(batch)
 
-            motif = DivergentMotif(
-                ortholog_id=ortholog.id,
-                start_pos=m["start_pos"],
-                end_pos=m["end_pos"],
-                animal_seq=m["animal_seq"],
-                human_seq=m["human_seq"],
-                divergence_score=m["divergence_score"],
-                esm_distance=m.get("esm_distance"),
-            )
-            session.add(motif)
-            inserted += 1
-
+    log.info("  Inserted %d divergent motif rows.", inserted)
     return inserted
 
 
