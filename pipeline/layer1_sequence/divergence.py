@@ -338,22 +338,31 @@ def update_sequence_identities(aligned_orthogroups: dict[str, dict[str, str]]) -
     if not identity_map:
         return
 
-    # Bulk update in chunks of 1000
-    chunk_size = 1000
-    keys = list(identity_map.keys())
+    # Single-pass UPDATE using a VALUES literal — avoids all round-trips
+    from sqlalchemy import text
+
+    log.info("  Bulk-updating %d sequence identity rows (single SQL statement)...", len(identity_map))
+    items = list(identity_map.items())
+    chunk_size = 5000
     updated = 0
     with get_session() as session:
-        for i in range(0, len(keys), chunk_size):
-            chunk = keys[i: i + chunk_size]
-            # Fetch all matching orthologs in one query using tuple_ (faster than OR expansion)
-            orthologs = session.query(Ortholog).filter(
-                tuple_(Ortholog.species_id, Ortholog.protein_id).in_(chunk)
-            ).all()
-            for o in orthologs:
-                key = (o.species_id, o.protein_id)
-                if key in identity_map:
-                    o.sequence_identity_pct = identity_map[key]
-                    updated += 1
+        for i in range(0, len(items), chunk_size):
+            chunk = items[i: i + chunk_size]
+            # Build a single UPDATE ... FROM (VALUES ...) statement
+            values_sql = ", ".join(
+                f"('{sid}', '{pid}', {pct})"
+                for (sid, pid), pct in chunk
+            )
+            result = session.execute(text(f"""
+                UPDATE ortholog AS o
+                SET sequence_identity_pct = v.pct
+                FROM (VALUES {values_sql}) AS v(species_id, protein_id, pct)
+                WHERE o.species_id = v.species_id
+                  AND o.protein_id = v.protein_id
+            """))
+            updated += result.rowcount
             session.flush()
+            if i > 0:
+                log.info("  Sequence identity update: %d / %d pairs processed.", min(i + chunk_size, len(items)), len(items))
 
     log.info("Sequence identities updated: %d rows.", updated)
