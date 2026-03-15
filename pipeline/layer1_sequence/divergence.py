@@ -240,18 +240,18 @@ def load_motifs_to_db(
     # Use PostgreSQL COPY for maximum throughput — ~10-50x faster than bulk_insert_mappings
     # COPY streams all data over a single connection with no per-row overhead
     import io
-    from db.session import get_engine
+    import psycopg2
+    from pipeline.config import get_db_url
 
     total_to_insert = len(rows_to_insert)
     log.info("  Inserting %d motif rows via COPY (streaming)...", total_to_insert)
     t2 = time.time()
 
-    # Write rows as TSV into an in-memory buffer, flushing every 500k rows to cap memory
     inserted = 0
     chunk_size = 500_000
-    raw_conn = get_engine().raw_connection()
+    conn = psycopg2.connect(get_db_url())
     try:
-        cur = raw_conn.cursor()
+        cur = conn.cursor()
         for chunk_start in range(0, total_to_insert, chunk_size):
             chunk = rows_to_insert[chunk_start: chunk_start + chunk_size]
             buf = io.StringIO()
@@ -267,7 +267,7 @@ def load_motifs_to_db(
                 columns=("id", "ortholog_id", "start_pos", "end_pos",
                          "animal_seq", "human_seq", "divergence_score", "esm_distance"),
             )
-            raw_conn.commit()
+            conn.commit()
             inserted += len(chunk)
             elapsed = time.time() - t2
             rate = inserted / elapsed if elapsed > 0 else 0
@@ -278,7 +278,7 @@ def load_motifs_to_db(
             )
         cur.close()
     finally:
-        raw_conn.close()
+        conn.close()
 
     log.info("  Inserted %d divergent motif rows in %.1fs.", inserted, time.time() - t2)
     return inserted
@@ -382,16 +382,16 @@ def update_sequence_identities(aligned_orthogroups: dict[str, dict[str, str]]) -
 
     import io
     import time
-    from db.session import get_engine
+    import psycopg2
+    from pipeline.config import get_db_url
 
     t0 = time.time()
     log.info("  Bulk-updating %d sequence identity rows via COPY+temp table...", len(identity_map))
 
     items = list(identity_map.items())
-    raw_conn = get_engine().raw_connection()
+    conn = psycopg2.connect(get_db_url())
     try:
-        cur = raw_conn.cursor()
-        # 1. Create temp table
+        cur = conn.cursor()
         cur.execute("""
             CREATE TEMP TABLE _identity_update (
                 species_id TEXT,
@@ -399,13 +399,11 @@ def update_sequence_identities(aligned_orthogroups: dict[str, dict[str, str]]) -
                 pct        REAL
             )
         """)
-        # 2. Stream all rows via COPY (fastest possible load — no per-row overhead)
         buf = io.StringIO()
         for (sid, pid), pct in items:
             buf.write(f"{sid}\t{pid}\t{pct}\n")
         buf.seek(0)
         cur.copy_from(buf, "_identity_update", columns=("species_id", "protein_id", "pct"))
-        # 3. Single UPDATE join
         cur.execute("""
             UPDATE ortholog AS o
             SET sequence_identity_pct = u.pct
@@ -414,10 +412,9 @@ def update_sequence_identities(aligned_orthogroups: dict[str, dict[str, str]]) -
               AND o.protein_id = u.protein_id
         """)
         updated = cur.rowcount
-        cur.execute("DROP TABLE _identity_update")
-        raw_conn.commit()
+        conn.commit()
         cur.close()
     finally:
-        raw_conn.close()
+        conn.close()
 
     log.info("Sequence identities updated: %d rows in %.1fs.", updated, time.time() - t0)
