@@ -487,8 +487,12 @@ def _collect_step4() -> dict:
     data: dict[str, Any] = {"step": "step4", "timestamp": _now()}
     with get_session() as s:
         data["motif_count"] = s.query(func.count(DivergentMotif.id)).scalar() or 0
+
+        # genes_with_motifs: count distinct genes via ortholog join
         data["genes_with_motifs"] = (
-            s.query(func.count(func.distinct(DivergentMotif.gene_id))).scalar() or 0
+            s.query(func.count(func.distinct(Ortholog.gene_id)))
+            .join(DivergentMotif, DivergentMotif.ortholog_id == Ortholog.id)
+            .scalar() or 0
         )
 
         # Per-species motif coverage via ortholog join
@@ -500,9 +504,9 @@ def _collect_step4() -> dict:
         )
         data["motifs_per_species"] = dict(coverage_q)
 
-        # Lineage coverage
+        # Lineage coverage — distinct genes per lineage
         lineage_q = (
-            s.query(Species.lineage_group, func.count(func.distinct(DivergentMotif.gene_id)))
+            s.query(Species.lineage_group, func.count(func.distinct(Ortholog.gene_id)))
             .join(Ortholog, Ortholog.species_id == Species.id)
             .join(DivergentMotif, DivergentMotif.ortholog_id == Ortholog.id)
             .group_by(Species.lineage_group)
@@ -510,15 +514,15 @@ def _collect_step4() -> dict:
         )
         data["lineage_motif_coverage"] = dict(lineage_q)
 
-        # Top 20 genes by motif count
+        # Top 20 genes by motif count via ortholog join
         top_genes = (
-            s.query(DivergentMotif.gene_id, func.count(DivergentMotif.id))
-            .group_by(DivergentMotif.gene_id)
+            s.query(Ortholog.gene_id, func.count(DivergentMotif.id))
+            .join(DivergentMotif, DivergentMotif.ortholog_id == Ortholog.id)
+            .group_by(Ortholog.gene_id)
             .order_by(func.count(DivergentMotif.id).desc())
             .limit(20)
             .all()
         )
-        # Resolve gene symbols
         gene_ids = [r[0] for r in top_genes]
         gene_symbols = dict(s.query(Gene.id, Gene.gene_symbol).filter(Gene.id.in_(gene_ids)).all())
         data["top20_genes_by_motifs"] = [
@@ -572,8 +576,9 @@ def _collect_step4b() -> dict:
 
         # Top 10 highest AM score motifs with gene symbol
         top_am = (
-            s.query(DivergentMotif.gene_id, DivergentMotif.consequence_score,
+            s.query(Ortholog.gene_id, DivergentMotif.consequence_score,
                     DivergentMotif.domain_name)
+            .join(Ortholog, DivergentMotif.ortholog_id == Ortholog.id)
             .filter(DivergentMotif.consequence_score != None)
             .order_by(DivergentMotif.consequence_score.desc())
             .limit(10)
@@ -627,8 +632,9 @@ def _collect_step4c() -> dict:
 
         # Top 10 most negative LLR (most unusual substitutions)
         top_unusual = (
-            s.query(DivergentMotif.gene_id, DivergentMotif.esm1v_score,
+            s.query(Ortholog.gene_id, DivergentMotif.esm1v_score,
                     DivergentMotif.start_pos, DivergentMotif.human_seq, DivergentMotif.animal_seq)
+            .join(Ortholog, DivergentMotif.ortholog_id == Ortholog.id)
             .filter(DivergentMotif.esm1v_score != None)
             .order_by(DivergentMotif.esm1v_score.asc())
             .limit(10)
@@ -646,7 +652,7 @@ def _collect_step4c() -> dict:
 
 def _collect_step4d() -> dict:
     from db.session import get_session
-    from db.models import DivergentMotif, Gene
+    from db.models import DivergentMotif, Ortholog, Gene
     from sqlalchemy import func
 
     data: dict[str, Any] = {"step": "step4d", "timestamp": _now()}
@@ -660,9 +666,10 @@ def _collect_step4d() -> dict:
 
         for direction in ("gain_of_function", "loss_of_function"):
             top = (
-                s.query(DivergentMotif.gene_id, func.count(DivergentMotif.id))
+                s.query(Ortholog.gene_id, func.count(DivergentMotif.id))
+                .join(Ortholog, DivergentMotif.ortholog_id == Ortholog.id)
                 .filter(DivergentMotif.motif_direction == direction)
-                .group_by(DivergentMotif.gene_id)
+                .group_by(Ortholog.gene_id)
                 .order_by(func.count(DivergentMotif.id).desc())
                 .limit(10)
                 .all()
@@ -893,8 +900,9 @@ def _collect_step7b() -> dict:
             .filter(DivergentMotif.convergent_aa_count >= 2).scalar() or 0
         )
         top = (
-            s.query(DivergentMotif.gene_id, DivergentMotif.convergent_aa_count,
+            s.query(Ortholog.gene_id, DivergentMotif.convergent_aa_count,
                     DivergentMotif.start_pos, DivergentMotif.human_seq, DivergentMotif.animal_seq)
+            .join(Ortholog, DivergentMotif.ortholog_id == Ortholog.id)
             .filter(DivergentMotif.convergent_aa_count >= 2)
             .order_by(DivergentMotif.convergent_aa_count.desc())
             .limit(20)
