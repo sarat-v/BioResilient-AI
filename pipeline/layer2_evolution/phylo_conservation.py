@@ -221,6 +221,34 @@ def _parse_phastcons_output(stdout: str) -> Optional[float]:
     return round(sum(scores) / len(scores), 4)
 
 
+def _prune_newick_ete3(newick: str, keep: set[str]) -> Optional[str]:
+    """Prune Newick using ETE3. Returns pruned string or None if ETE3 unavailable."""
+    try:
+        from ete3 import Tree  # type: ignore
+        t = Tree(newick, format=1)
+        t.prune(list(keep), preserve_branch_length=True)
+        return t.write(format=1)
+    except Exception:
+        return None
+
+
+def _prune_newick_tree_doctor(newick: str, keep: list[str]) -> Optional[str]:
+    """Prune Newick using PHAST's tree_doctor (bundled with phyloP/phastCons)."""
+    if not shutil.which("tree_doctor"):
+        return None
+    try:
+        # tree_doctor reads from stdin when given - as input
+        result = subprocess.run(
+            ["tree_doctor", "--prune-all-but", ",".join(keep), "-"],
+            input=newick, capture_output=True, text=True, timeout=30,
+        )
+        if result.returncode == 0 and result.stdout.strip():
+            return result.stdout.strip()
+    except Exception:
+        pass
+    return None
+
+
 def _pruned_mod(mod_path: Path, species_in_msa: list[str]) -> Optional[Path]:
     """Write a copy of the .mod file with the TREE pruned to only species_in_msa.
 
@@ -228,28 +256,27 @@ def _pruned_mod(mod_path: Path, species_in_msa: list[str]) -> Optional[Path]:
     contains a subset of species but the model tree has all 18 leaves.  We must
     prune the tree in the .mod file to exactly the species present in the MSA.
 
-    Uses ETE3 to prune if available; falls back to phyloFit --prune-tree flag.
-    Returns path to the temp .mod file, or None on failure.
+    Tries (in order): ETE3 → tree_doctor (PHAST) → returns None.
     """
     try:
         mod_text = mod_path.read_text()
         tree_match = re.search(r"^TREE:\s*(.+)$", mod_text, re.MULTILINE)
         if not tree_match:
             return None
-        newick = tree_match.group(1).strip()
 
-        try:
-            from ete3 import Tree  # type: ignore
-            t = Tree(newick, format=1)
-            leaves_to_keep = set(species_in_msa)
-            t.prune(leaves_to_keep, preserve_branch_length=True)
-            pruned_newick = t.write(format=1)
-        except Exception:
-            # Fallback: use re-based pruning isn't reliable for Newick,
-            # so just return None and let phyloP fail gracefully
+        newick = tree_match.group(1).strip()
+        keep = set(species_in_msa)
+
+        pruned_newick: Optional[str] = _prune_newick_ete3(newick, keep)
+        if pruned_newick is None:
+            pruned_newick = _prune_newick_tree_doctor(newick, species_in_msa)
+        if pruned_newick is None:
+            log.debug("_pruned_mod: no pruner available (ETE3/tree_doctor both failed) for %d species", len(species_in_msa))
             return None
 
-        pruned_mod = mod_text[:tree_match.start(1)] + pruned_newick + mod_text[tree_match.end(1):]
+        pruned_mod = (mod_text[:tree_match.start(1)]
+                      + pruned_newick
+                      + mod_text[tree_match.end(1):])
         tmp = tempfile.NamedTemporaryFile(suffix=".mod", delete=False, mode="w")
         tmp.write(pruned_mod)
         tmp.close()
