@@ -87,56 +87,123 @@ def download_alphamissense(force: bool = False) -> Path:
     return path
 
 
-def _get_target_accessions() -> set[str]:
+def _extract_uniprot_accession(raw: str) -> Optional[str]:
+    """Extract a bare UniProt accession from various formats.
+
+    Handles:
+      - "human|P12345"          → "P12345"    (reheadered FASTA, accession preserved)
+      - "human|BRCA1_HUMAN"     → None        (reheadered FASTA with mnemonic — not an accession)
+      - "sp|P12345|BRCA1_HUMAN" → "P12345"    (raw UniProt FASTA header)
+      - "P12345"                → "P12345"    (bare accession)
+      - "P12345-2"              → "P12345"    (isoform)
+
+    UniProt accessions match the pattern: [OPQ][0-9][A-Z0-9]{3}[0-9]
+    or [A-NR-Z][0-9]([A-Z][A-Z0-9]{2}[0-9]){1,2}
+    A simpler heuristic: 6–10 uppercase alphanumeric chars with no underscore.
+    Mnemonics look like GENE_SPECIES (contains underscore).
+
+    Returns None if no valid accession can be extracted.
+    """
+    if not raw:
+        return None
+
+    # Split on pipe and examine all parts
+    parts = raw.strip().split("|")
+
+    # "sp|P12345|BRCA1_HUMAN" → check index 1 first (standard UniProt format)
+    if len(parts) >= 3:
+        candidate = parts[1].split("-")[0].strip()
+        if re.match(r"^[A-Z][A-Z0-9]{4,9}$", candidate) and "_" not in candidate:
+            return candidate.upper()
+
+    # Try each part: take the first one that looks like an accession (no underscore, 5-10 chars)
+    for part in parts:
+        candidate = part.split("-")[0].strip()
+        if re.match(r"^[A-Z][A-Z0-9]{4,9}$", candidate) and "_" not in candidate:
+            return candidate.upper()
+
+    return None
+
+
+def _get_target_accessions() -> Optional[set[str]]:
     """Return the set of UniProt accessions present in our Gene table.
 
     Used to filter the AlphaMissense TSV during index build so we only keep
     entries for proteins we actually have motifs for, instead of loading all
     ~20 000 human proteins into memory.
-    """
-    from db.models import Gene
-    from db.session import get_session
 
+    Returns None if accessions cannot be reliably extracted (e.g. Gene table
+    stores mnemonics instead of accessions), which signals build_am_index to
+    load the full unfiltered index instead of silently returning empty results.
+    """
     accessions: set[str] = set()
+    mnemonic_count = 0
+
     with get_session() as session:
         for gene in session.query(Gene).all():
-            acc = gene.human_protein
-            if not acc:
+            raw = gene.human_protein
+            if not raw:
                 continue
-            if "|" in acc:
-                acc = acc.split("|")[-1]
-            acc = acc.split("-")[0].strip()  # strip isoform suffix
+            acc = _extract_uniprot_accession(raw)
             if acc:
-                accessions.add(acc.upper())
+                accessions.add(acc)
+            else:
+                mnemonic_count += 1
+
+    if not accessions:
+        log.warning(
+            "Could not extract UniProt accessions from Gene.human_protein "
+            "(all %d values appear to be mnemonics or non-standard IDs). "
+            "Loading full AlphaMissense index without filtering.",
+            mnemonic_count,
+        )
+        return None
+
+    if mnemonic_count > len(accessions) * 0.5:
+        log.warning(
+            "Only %d / %d Gene rows yielded a valid UniProt accession "
+            "(%d appear to be mnemonics). Filtering may miss many proteins.",
+            len(accessions), len(accessions) + mnemonic_count, mnemonic_count,
+        )
+
     return accessions
+
+
+_UNSET = object()  # sentinel — distinct from None which means "load all variants"
 
 
 def build_am_index(
     tsv_gz_path: Path,
-    target_accessions: Optional[set[str]] = None,
+    target_accessions: Optional[set[str]] = _UNSET,  # type: ignore[assignment]
 ) -> dict[str, dict[int, dict[str, float]]]:
     """Build an in-memory index: {uniprot_id: {position: {alt_aa: score}}}.
 
     Args:
         tsv_gz_path: Path to AlphaMissense_hg38.tsv.gz.
-        target_accessions: Optional set of UniProt IDs to keep. When provided,
-            only variants for those proteins are loaded — reducing RAM from ~3 GB
+        target_accessions: Set of UniProt IDs to keep. When provided, only
+            variants for those proteins are loaded — reducing RAM from ~3 GB
             to typically <100 MB and cutting parse time from ~5 min to ~30 s.
-            If None, all ~216 M variants are loaded (legacy behaviour).
+            Pass None explicitly to load all ~216 M variants.
+            When omitted (default), calls _get_target_accessions() which may
+            return None if IDs cannot be reliably extracted, triggering the
+            full load.
 
     Returns empty dict if file does not exist.
     """
     if not tsv_gz_path.exists():
         return {}
 
-    if target_accessions is None:
-        target_accessions = _get_target_accessions()
+    if target_accessions is _UNSET:
+        target_accessions = _get_target_accessions()  # may return None → load all
 
-    n_target = len(target_accessions)
-    log.info(
-        "Building AlphaMissense index for %d target proteins from %s...",
-        n_target, tsv_gz_path,
-    )
+    if target_accessions is not None:
+        n_target = len(target_accessions)
+        log.info(
+            "Building AlphaMissense index for %d target proteins (filtered) from %s...",
+            n_target, tsv_gz_path,
+        )
+    else:
+        log.info("Building AlphaMissense index (full, unfiltered) from %s...", tsv_gz_path)
     index: dict[str, dict[int, dict[str, float]]] = defaultdict(lambda: defaultdict(dict))
     n_loaded = 0
     n_skipped = 0
@@ -241,14 +308,16 @@ def annotate_motif_consequences(
         log.info("Scoring AlphaMissense consequences for %d genes...", len(genes))
 
         for gene in genes:
-            accession = gene.human_protein
-            if not accession:
+            raw_protein = gene.human_protein
+            if not raw_protein:
                 continue
-            # Normalize identically to _get_target_accessions() and build_am_index():
-            # strip pipe-delimited header prefix, isoform suffix, whitespace, uppercase.
-            if "|" in accession:
-                accession = accession.split("|")[-1]
-            accession = accession.split("-")[0].strip().upper()
+            # Try to extract a bare UniProt accession (handles "human|P12345",
+            # "sp|P12345|GENE_HUMAN", "P12345", "P12345-2").
+            accession = _extract_uniprot_accession(raw_protein)
+            if not accession:
+                # Fallback: strip isoform suffix + uppercase the whole raw value
+                # in case it's already a bare accession or unrecognised format.
+                accession = raw_protein.split("-")[0].strip().upper()
             if not accession:
                 continue
 

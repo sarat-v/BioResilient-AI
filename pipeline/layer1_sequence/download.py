@@ -195,8 +195,20 @@ def reheader_fasta(path: Path, species_id: str, out_path: Optional[Path] = None)
 
     records = []
     for rec in SeqIO.parse(str(path), "fasta"):
-        # Take only the first word of the current ID
-        clean_id = rec.id.split()[0].split("|")[-1]
+        # UniProt FASTA IDs are formatted as "sp|ACCESSION|MNEMONIC_SPECIES".
+        # We want the accession (index 1), not the mnemonic (index -1), so that
+        # downstream tools (AlphaMissense, Pfam) can match protein accessions.
+        # Non-UniProt IDs (NCBI, Ensembl) don't contain "|" — use as-is.
+        raw_id = rec.id.split()[0]
+        parts = raw_id.split("|")
+        if len(parts) >= 3 and re.match(r"^[A-Z][A-Z0-9]{4,9}$", parts[1]):
+            # Standard UniProt: sp|P12345|BRCA1_HUMAN → use accession P12345
+            clean_id = parts[1]
+        elif len(parts) >= 2:
+            # "human|P12345" or similar — take last non-empty part
+            clean_id = parts[-1]
+        else:
+            clean_id = raw_id
         rec.id = f"{species_id}|{clean_id}"
         rec.description = ""
         records.append(rec)

@@ -22,8 +22,8 @@ only labels motifs to allow downstream filtering for functional significance.
 
 import json
 import logging
+import re
 import time
-import urllib.parse
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Optional
@@ -137,23 +137,23 @@ def _parse_uniprot_features(entry: dict) -> list[dict]:
 
 
 def _fetch_uniprot_batch(accessions: list[str]) -> dict[str, list[dict]]:
-    """Fetch domains for a batch of UniProt accessions in a single request.
+    """Fetch domains for a batch of UniProt accessions in a single POST request.
 
+    Uses POST to avoid URL-length limits that cause HTTP 400 with large batches.
     Returns {accession: [domain, ...]} for every accession in the batch.
     Accessions not found in UniProt map to an empty list.
     """
     query = " OR ".join(f"accession:{acc}" for acc in accessions)
-    params = {
+    data = {
         "query": query,
         "fields": _UNIPROT_FIELDS,
         "format": "json",
         "size": len(accessions),
     }
-    url = f"{UNIPROT_API}?{urllib.parse.urlencode(params)}"
 
     for attempt in range(4):
         try:
-            r = requests.get(url, timeout=REQUEST_TIMEOUT)
+            r = requests.post(UNIPROT_API, data=data, timeout=REQUEST_TIMEOUT)
             if r.status_code == 200:
                 break
             if r.status_code == 429:
@@ -163,7 +163,8 @@ def _fetch_uniprot_batch(accessions: list[str]) -> dict[str, list[dict]]:
             elif r.status_code >= 500:
                 time.sleep(RETRY_DELAY * (attempt + 1))
             else:
-                log.warning("UniProt returned HTTP %d for batch of %d", r.status_code, len(accessions))
+                log.warning("UniProt returned HTTP %d for batch of %d — response: %s",
+                            r.status_code, len(accessions), r.text[:200])
                 break
         except requests.RequestException as exc:
             log.debug("UniProt request error (attempt %d): %s", attempt + 1, exc)
@@ -389,14 +390,23 @@ def annotate_motif_domains(gene_ids: Optional[list[str]] = None) -> int:
     log.info("Annotating domains for %d genes with motifs (strategy=%s)...",
              len(genes), _STRATEGY)
 
-    # Build accession list (strip isoform suffixes and pipe-delimited headers)
+    # Build accession list — extract the bare UniProt accession from whatever
+    # format gene.human_protein was stored in (reheadered FASTA gives either
+    # "human|P12345" or "human|BRCA1_HUMAN" depending on the source FASTA).
     def _clean_accession(raw: str) -> str:
-        acc = raw.strip()
-        if "|" in acc:
-            acc = acc.split("|")[-1]
-        # Strip isoform suffix e.g. P12345-2 → P12345
-        acc = acc.split("-")[0]
-        return acc.upper()
+        parts = raw.strip().split("|")
+        # "sp|P12345|BRCA1_HUMAN" → index 1 is the accession
+        if len(parts) >= 3:
+            candidate = parts[1].split("-")[0].strip()
+            if re.match(r"^[A-Z][A-Z0-9]{4,9}$", candidate) and "_" not in candidate:
+                return candidate.upper()
+        # Try each part: first one with no underscore and 5-10 chars is the accession
+        for part in parts:
+            candidate = part.split("-")[0].strip()
+            if re.match(r"^[A-Z][A-Z0-9]{4,9}$", candidate) and "_" not in candidate:
+                return candidate.upper()
+        # Last resort: strip isoform suffix from the whole value
+        return parts[-1].split("-")[0].strip().upper()
 
     fetch_args: list[tuple[str, str]] = []
     for gene in genes:
