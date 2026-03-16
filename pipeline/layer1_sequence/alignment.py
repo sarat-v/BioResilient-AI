@@ -233,7 +233,7 @@ def align_all_orthogroups(
             pool.submit(_align_worker, (og_id, seqs, mafft_threads_per_worker)): og_id
             for og_id, seqs in items
         }
-        for future in as_completed(futures, timeout=600):
+        for future in as_completed(futures):
             try:
                 og_id, result = future.result(timeout=120)
             except Exception as exc:
