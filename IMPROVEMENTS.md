@@ -189,4 +189,30 @@ When running on GPU:
 
 ---
 
-*Last updated: 2026-03-11*
+## Step 5 — IQ-TREE rebuild time
+
+**Current runtime**: ~3.5 hours wall-clock for 500 OGs × 18 species with 1000 ultrafast
+bootstrap replicates.
+
+**This is a one-time cost** — the tree is cached to `/tmp/bioresilient/phylo/species.treefile`
+and S3, and all subsequent pipeline runs skip IQ-TREE automatically. A rebuild is only
+needed when adding/removing species or significantly changing proteome data.
+
+**If a rebuild is ever needed**, reduce bootstrap replicates from 1000 → 100 in
+`environment.yml`:
+
+```yaml
+tools:
+  cloud:
+    iqtree_bootstrap: 100   # was 1000; 100 is sufficient for 18-species topology
+```
+
+This cuts runtime from ~3.5 hours to ~1 hour with no meaningful loss in topological
+confidence at this species count. The branch support values may be slightly less precise
+but the tree topology will be identical.
+
+**Do not change the default now** — the current tree is high quality and cached.
+
+---
+
+*Last updated: 2026-03-16*
