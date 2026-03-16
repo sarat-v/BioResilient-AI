@@ -136,6 +136,10 @@ def run_iqtree(concat_alignment: dict[str, str]) -> Path:
     cfg = get_tool_config()
     threads = cfg.get("iqtree_threads", "AUTO")
     bootstrap = cfg.get("iqtree_bootstrap", 1000)
+    # Default model: Q.INSECT+F+I+G4 — best BIC on empirical 18-species panel
+    # (vertebrates + invertebrates). Skipping ModelFinder saves ~30 min per run.
+    # Override via iqtree_model in environment.yml if needed.
+    model = cfg.get("iqtree_model", "Q.INSECT+F+I+G4")
 
     # IQ-TREE's AUTO thread detection runs a memory-intensive benchmarking phase
     # that can OOM on large alignments. Pin to a safe default when AUTO is set.
@@ -163,7 +167,7 @@ def run_iqtree(concat_alignment: dict[str, str]) -> Path:
     cmd = [
         iqtree_bin,
         "-s", str(fasta_path),
-        "-m", "TEST",
+        "-m", model,
         "-T", str(threads),
         "--mem", "20G",       # hard cap to avoid OOM on 30GB instances
         "-o", "human",
