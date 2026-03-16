@@ -892,6 +892,21 @@ def run_pipeline(
     # If resuming past step4, recover aligned_orthogroups from disk cache
     if resume_from not in ("step1","step2","step3","step3b","step4"):
         _pkl_path = Path(get_local_storage_root()) / "aligned_orthogroups.pkl"
+
+        # Auto-sync from S3 if missing locally — happens after instance stop/start
+        if not _pkl_path.exists():
+            _s3_key = "cache/aligned_orthogroups.pkl"
+            log.info(
+                "aligned_orthogroups.pkl not found locally — attempting S3 sync from %s ...",
+                _s3_key,
+            )
+            try:
+                from pipeline.config import sync_from_s3
+                sync_from_s3(_s3_key, _pkl_path)
+                log.info("Synced aligned_orthogroups.pkl from S3 (%s)", _pkl_path)
+            except Exception as _sync_err:
+                log.warning("Could not sync aligned_orthogroups.pkl from S3: %s", _sync_err)
+
         if _pkl_path.exists():
             try:
                 with open(_pkl_path, "rb") as _f:
@@ -901,7 +916,9 @@ def run_pipeline(
                 log.info("Recovered %d aligned orthogroups from disk cache", len(aligned_orthogroups))
             except Exception as _e:
                 log.warning("Could not load aligned orthogroups cache: %s", _e)
-        else:
+
+        if not aligned_orthogroups:
+            # Last resort: reconstruct from DB (sequences only, no alignment gaps)
             try:
                 from db.models import Ortholog
                 from db.session import get_session as _gs
