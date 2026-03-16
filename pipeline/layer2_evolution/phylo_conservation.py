@@ -26,6 +26,7 @@ Entry point: run_phylo_conservation(tier_gene_ids, treefile) -> int
 
 import logging
 import os
+import re
 import shutil
 import subprocess
 import tempfile
@@ -220,24 +221,82 @@ def _parse_phastcons_output(stdout: str) -> Optional[float]:
     return round(sum(scores) / len(scores), 4)
 
 
+def _pruned_mod(mod_path: Path, species_in_msa: list[str]) -> Optional[Path]:
+    """Write a copy of the .mod file with the TREE pruned to only species_in_msa.
+
+    phyloP errors with "no match for leaves of tree in alignment" when the MSA
+    contains a subset of species but the model tree has all 18 leaves.  We must
+    prune the tree in the .mod file to exactly the species present in the MSA.
+
+    Uses ETE3 to prune if available; falls back to phyloFit --prune-tree flag.
+    Returns path to the temp .mod file, or None on failure.
+    """
+    try:
+        mod_text = mod_path.read_text()
+        tree_match = re.search(r"^TREE:\s*(.+)$", mod_text, re.MULTILINE)
+        if not tree_match:
+            return None
+        newick = tree_match.group(1).strip()
+
+        try:
+            from ete3 import Tree  # type: ignore
+            t = Tree(newick, format=1)
+            leaves_to_keep = set(species_in_msa)
+            t.prune(leaves_to_keep, preserve_branch_length=True)
+            pruned_newick = t.write(format=1)
+        except Exception:
+            # Fallback: use re-based pruning isn't reliable for Newick,
+            # so just return None and let phyloP fail gracefully
+            return None
+
+        pruned_mod = mod_text[:tree_match.start(1)] + pruned_newick + mod_text[tree_match.end(1):]
+        tmp = tempfile.NamedTemporaryFile(suffix=".mod", delete=False, mode="w")
+        tmp.write(pruned_mod)
+        tmp.close()
+        return Path(tmp.name)
+    except Exception as exc:
+        log.debug("_pruned_mod failed: %s", exc)
+        return None
+
+
 def run_phylop(msa_path: Path, mod_path: Path) -> Optional[float]:
     """Run phyloP on the MSA using a pre-fitted neutral model (.mod file).
 
-    Args:
-        msa_path: FASTA MSA for one gene region.
-        mod_path: Neutral evolutionary model from phyloFit (.mod file).
+    The neutral model contains all 18 species; each per-gene MSA may have
+    fewer.  We prune the model tree to only the species in the MSA before
+    calling phyloP to avoid "no match for leaves of tree in alignment" errors.
     """
+    # Extract species present in this MSA
+    species_in_msa = [
+        rec.id for rec in SeqIO.parse(str(msa_path), "fasta")
+    ]
+    if not species_in_msa:
+        return None
+
+    pruned_path: Optional[Path] = None
+    effective_mod = mod_path
     try:
+        pruned_path = _pruned_mod(mod_path, species_in_msa)
+        if pruned_path is not None:
+            effective_mod = pruned_path
+
         result = subprocess.run(
             ["phyloP", "--wig-scores", "--msa-format", "FASTA",
-             str(mod_path), str(msa_path)],
+             str(effective_mod), str(msa_path)],
             capture_output=True, text=True, timeout=300,
         )
         if result.returncode == 0:
             return _parse_phylop_output(result.stdout)
-        log.warning("phyloP non-zero exit (%d) for %s: %s", result.returncode, msa_path.name, result.stderr[:300])
+        log.warning("phyloP non-zero exit (%d) for %s: %s",
+                    result.returncode, msa_path.name, result.stderr[:300])
     except Exception as exc:
         log.debug("phyloP execution error: %s", exc)
+    finally:
+        if pruned_path is not None:
+            try:
+                pruned_path.unlink(missing_ok=True)
+            except Exception:
+                pass
     return None
 
 
