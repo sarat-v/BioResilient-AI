@@ -43,6 +43,12 @@ tools:
   iqtree_threads: AUTO            # IQ-TREE auto-detects best thread count
   iqtree_bootstrap: 1000
   hyphy_threads: 4
+  # API concurrency — capped by external service rate limits, not CPU count.
+  # Increase carefully; exceeding limits causes 429 errors and backoff delays.
+  uniprot_batch_workers: 4        # Parallel HTTP requests to UniProt batch API
+  ncbi_workers: 8                 # Parallel NCBI esearch/esummary calls (≤ 10/s with API key)
+  gnomad_workers: 20              # Parallel gnomAD GraphQL calls
+  bgee_workers: 10                # Parallel Bgee expression API calls
 
 # Weights and tier thresholds: edit config/scoring_weights.json (not this file).
 

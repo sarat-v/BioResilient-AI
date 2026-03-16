@@ -32,7 +32,7 @@ import requests
 
 from db.models import DivergentMotif, Gene, Ortholog
 from db.session import get_session
-from pipeline.config import get_storage_root
+from pipeline.config import get_storage_root, get_tool_config
 
 log = logging.getLogger(__name__)
 
@@ -53,16 +53,30 @@ RETRY_DELAY = 2.0
 # UniProt strategy constants
 # --------------------------------------------------------------------------- #
 UNIPROT_API = "https://rest.uniprot.org/uniprotkb/search"
-_UNIPROT_BATCH_SIZE = 200          # max accessions per single request
+# UniProt accepts up to 200 accessions per request; this is a protocol limit,
+# not a tuning parameter — do not raise above 200.
+_UNIPROT_BATCH_SIZE = 200
 _UNIPROT_FIELDS = "accession,ft_domain,ft_repeat"
 # Feature types from UniProt that correspond to functional domains
 _UNIPROT_DOMAIN_TYPES = {"domain", "repeat"}
+
+
+def _uniprot_batch_workers() -> int:
+    """Return number of parallel UniProt batch workers from config (default 4)."""
+    return int(get_tool_config().get("uniprot_batch_workers", 4))
+
 
 # --------------------------------------------------------------------------- #
 # InterPro strategy constants
 # --------------------------------------------------------------------------- #
 INTERPRO_API = "https://www.ebi.ac.uk/interpro/api"
-_FETCH_WORKERS = 50
+
+
+def _interpro_fetch_workers() -> int:
+    """Return number of parallel InterPro workers from config (default 50)."""
+    return int(get_tool_config().get("interpro_fetch_workers", 50))
+
+
 # InterPro entry types treated as functional regions
 _INTERPRO_DOMAIN_TYPES = {"domain", "family", "homologous_superfamily", "repeat"}
 
@@ -311,7 +325,7 @@ def fetch_domains_interpro(fetch_args: list[tuple[str, str]]) -> dict[str, list[
     done = 0
     total = len(fetch_args)
 
-    with ThreadPoolExecutor(max_workers=_FETCH_WORKERS) as pool:
+    with ThreadPoolExecutor(max_workers=_interpro_fetch_workers()) as pool:
         futures = {pool.submit(_fetch_worker, args): args for args in fetch_args}
         for future in as_completed(futures):
             try:

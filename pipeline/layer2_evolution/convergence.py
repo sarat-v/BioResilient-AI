@@ -24,7 +24,7 @@ import requests
 
 from db.models import DivergentMotif, EvolutionScore, Gene, Ortholog, Species
 from db.session import get_session
-from pipeline.config import get_ncbi_api_key, get_ncbi_email, get_storage_root, get_thresholds
+from pipeline.config import get_ncbi_api_key, get_ncbi_email, get_storage_root, get_thresholds, get_tool_config
 
 log = logging.getLogger(__name__)
 
@@ -410,7 +410,14 @@ def run_convergence_pipeline() -> None:
 
 NCBI_ESEARCH = "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/esearch.fcgi"
 NCBI_ESUMMARY = "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/esummary.fcgi"
-_NCBI_WORKERS = 8   # NCBI allows 10 req/s with API key; keep a safe margin
+
+
+def _ncbi_workers() -> int:
+    """Return number of parallel NCBI workers from config (default 8).
+
+    NCBI allows 10 req/s with an API key; 8 keeps a comfortable margin.
+    """
+    return int(get_tool_config().get("ncbi_workers", 8))
 
 
 def _resolve_gene_chrom(gene, params_base: dict) -> tuple[str, Optional[tuple[str, int]]]:
@@ -498,10 +505,11 @@ def build_chrom_map(gene_ids: Optional[list[str]] = None) -> dict[str, tuple[str
     chrom_map: dict[str, tuple[str, int]] = {}
     total = len(genes)
     done = 0
+    workers = _ncbi_workers()
 
-    log.info("Building hg38 chrom map for %d genes (%d workers)...", total, _NCBI_WORKERS)
+    log.info("Building hg38 chrom map for %d genes (%d workers)...", total, workers)
 
-    with ThreadPoolExecutor(max_workers=_NCBI_WORKERS) as pool:
+    with ThreadPoolExecutor(max_workers=workers) as pool:
         futures = {pool.submit(_resolve_gene_chrom, gene, params_base): gene.id for gene in genes}
         for future in as_completed(futures):
             gene_id, loc = future.result()

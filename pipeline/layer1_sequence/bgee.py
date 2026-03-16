@@ -29,12 +29,17 @@ import requests
 
 from db.models import CandidateScore, ExpressionResult, Gene, Ortholog, Species
 from db.session import get_session
+from pipeline.config import get_tool_config
 
 log = logging.getLogger(__name__)
 
 BGEE_API = "https://www.bgee.org/api"
 REQUEST_TIMEOUT = 20
-_BGEE_WORKERS = 10   # Bgee rate-limits at ~10–15 concurrent connections
+
+
+def _bgee_workers() -> int:
+    """Return number of parallel Bgee API workers from config (default 10)."""
+    return int(get_tool_config().get("bgee_workers", 10))
 
 # Tissues relevant for each trait (mapped to Uberon or Bgee tissue names)
 TRAIT_TISSUES: dict[str, list[str]] = {
@@ -211,13 +216,13 @@ def run_bgee_pipeline(
         genes = session.query(Gene).filter(Gene.id.in_(gene_ids)).all()
 
     log.info("Querying Bgee for %d genes (trait_id=%r, %d workers)...",
-             len(genes), trait_id, _BGEE_WORKERS)
+             len(genes), trait_id, _bgee_workers())
 
     all_rows: list[dict] = []
     done = 0
     total = len(genes)
 
-    with ThreadPoolExecutor(max_workers=_BGEE_WORKERS) as pool:
+    with ThreadPoolExecutor(max_workers=_bgee_workers()) as pool:
         futures = {pool.submit(_query_bgee_for_gene, gene, trait_tissues): gene.id
                    for gene in genes}
         for future in as_completed(futures):

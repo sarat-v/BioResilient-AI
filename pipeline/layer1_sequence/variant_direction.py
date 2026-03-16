@@ -39,6 +39,7 @@ import requests
 
 from db.models import DivergentMotif, Gene, Ortholog
 from db.session import get_session
+from pipeline.config import get_tool_config
 
 log = logging.getLogger(__name__)
 
@@ -66,8 +67,10 @@ _GNOMAD_RATE_LIMIT_SLEEP = 0.25  # seconds between gnomAD API requests
 
 _loeuf_cache: dict[str, Optional[float]] = {}
 
-# Parallel fetch workers — gnomAD GraphQL tolerates ~20 concurrent connections.
-_LOEUF_WORKERS = 20
+
+def _gnomad_workers() -> int:
+    """Return number of parallel gnomAD API workers from config (default 20)."""
+    return int(get_tool_config().get("gnomad_workers", 20))
 
 
 def _fetch_loeuf(gene_symbol: str) -> Optional[float]:
@@ -124,15 +127,16 @@ def _fetch_loeuf_bulk(gene_symbols: set[str]) -> dict[str, Optional[float]]:
     if not to_fetch:
         return result
 
+    workers = _gnomad_workers()
     log.info("  Fetching gnomAD LOEUF for %d unique gene symbols (%d workers)...",
-             len(to_fetch), _LOEUF_WORKERS)
+             len(to_fetch), workers)
 
     def _worker(gs: str) -> tuple[str, Optional[float]]:
         return gs, _fetch_loeuf(gs)
 
     done = 0
     total = len(to_fetch)
-    with ThreadPoolExecutor(max_workers=_LOEUF_WORKERS) as pool:
+    with ThreadPoolExecutor(max_workers=workers) as pool:
         futures = {pool.submit(_worker, gs): gs for gs in to_fetch}
         for future in as_completed(futures):
             gs, loeuf = future.result()

@@ -37,8 +37,11 @@ GPU throughput optimisation (step 4c):
   supplement, Table S2). For our use case (hypothesis generation, not clinical
   pathogenicity calls) the difference is negligible.
 
-  When --device cuda is available, sequences are processed in batches of
-  ESM_CHUNK_SIZE tokens (from config) to saturate GPU memory.
+  When --device cuda is available, sequences are processed one at a time
+  (ESM-1v has a small per-protein VRAM footprint) but the single-pass
+  approach still amortises GPU invocations dramatically.  The
+  `gpu.esm_chunk_size` config key controls how large a protein can be
+  before it is truncated (default 1022 = ESM-1v's hard limit).
 
 Requirements:
   - `esm` Python package (Meta's ESM library): pip install fair-esm
@@ -54,17 +57,11 @@ from typing import Optional
 
 from db.models import DivergentMotif, Gene, Ortholog
 from db.session import get_session
-from pipeline.config import get_storage_root
+from pipeline.config import get_config, get_deployment, get_storage_root
 
 log = logging.getLogger(__name__)
 
 _ESM1V_MODEL_CACHE = None  # lazy-loaded
-
-# Maximum number of proteins to process in one GPU batch.
-# Each protein becomes one tensor of shape [1, L+2, vocab].
-# ESM-1v with a 1024-aa protein uses ~1.5 GB VRAM; a g4dn.xlarge has 16 GB.
-# Keep this low enough to avoid OOM for long proteins.
-_GPU_BATCH_SIZE = 8
 
 
 def _load_esm1v_model():
@@ -113,9 +110,11 @@ def _compute_logprobs_for_protein(
 
         model, alphabet, batch_converter, device = model_tuple
 
-        # ESM-1v has a max token length of 1022 residues (1024 with CLS/EOS).
-        # Truncate long proteins and score only the first 1022 AAs.
-        seq = human_protein_seq[:1022]
+        # ESM-1v has a hard max token length of 1022 residues (1024 with CLS/EOS).
+        # Respect esm_chunk_size from config but never exceed 1022.
+        cfg_gpu = get_config().get("gpu", {})
+        max_len = min(int(cfg_gpu.get("esm_chunk_size", 1022)), 1022)
+        seq = human_protein_seq[:max_len]
         data = [("protein", seq)]
         _, _, batch_tokens = batch_converter(data)
         batch_tokens = batch_tokens.to(device)
