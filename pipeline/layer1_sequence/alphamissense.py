@@ -183,9 +183,10 @@ def _get_target_accessions() -> Optional[set[str]]:
 
 _UNSET = object()  # sentinel — distinct from None which means "load all variants"
 
+UNIPROT_SEARCH_API = "https://rest.uniprot.org/uniprotkb/search"
 UNIPROT_ACCESSIONS_API = "https://rest.uniprot.org/uniprotkb/accessions"
 _MNEMONIC_CACHE_FILE = "mnemonic_to_accession.json"
-_MNEMONIC_BATCH = 200
+_MNEMONIC_BATCH = 50   # /search with OR queries; keep batches small to stay under URL limits
 _MNEMONIC_TIMEOUT = 30
 
 
@@ -198,8 +199,8 @@ def _mnemonic_cache_path() -> Path:
 def resolve_mnemonics_to_accessions(mnemonics: list[str]) -> dict[str, str]:
     """Resolve UniProt mnemonics (e.g. 'BRCA1_HUMAN') to accessions ('P38398').
 
-    Uses the UniProt /accessions endpoint with mnemonic IDs (UniProt accepts
-    both accessions and mnemonic IDs in the ?accessions= parameter).
+    Uses the UniProt /search endpoint with id: queries
+    (e.g. id:BRCA1_HUMAN OR id:TP53_HUMAN) — the correct API for mnemonic lookup.
     Results are cached on disk so subsequent calls are free.
 
     Returns {mnemonic: accession} for every mnemonic that could be resolved.
@@ -221,15 +222,21 @@ def resolve_mnemonics_to_accessions(mnemonics: list[str]) -> dict[str, str]:
              len(to_fetch), len(mnemonics) - len(to_fetch))
 
     def _fetch_batch(batch: list[str]) -> list[tuple[str, str]]:
-        """Returns [(mnemonic, accession), ...] for the batch."""
+        """Returns [(mnemonic, accession), ...] for the batch.
+
+        Uses /search?query=id:BRCA1_HUMAN OR id:TP53_HUMAN&fields=accession,id
+        which is the correct UniProt endpoint for mnemonic lookup.
+        """
+        query = " OR ".join(f"id:{m}" for m in batch)
         params = {
-            "accessions": ",".join(batch),
-            "fields": "accession,id",   # id = mnemonic
+            "query": query,
+            "fields": "accession,id",
             "format": "json",
+            "size": len(batch),
         }
         for attempt in range(3):
             try:
-                r = requests.get(UNIPROT_ACCESSIONS_API, params=params,
+                r = requests.get(UNIPROT_SEARCH_API, params=params,
                                  timeout=_MNEMONIC_TIMEOUT)
                 if r.status_code == 200:
                     pairs = []
