@@ -235,7 +235,7 @@ def run_phylop(msa_path: Path, mod_path: Path) -> Optional[float]:
         )
         if result.returncode == 0:
             return _parse_phylop_output(result.stdout)
-        log.debug("phyloP non-zero exit (%d): %s", result.returncode, result.stderr[:200])
+        log.warning("phyloP non-zero exit (%d) for %s: %s", result.returncode, msa_path.name, result.stderr[:300])
     except Exception as exc:
         log.debug("phyloP execution error: %s", exc)
     return None
