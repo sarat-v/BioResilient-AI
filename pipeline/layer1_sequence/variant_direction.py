@@ -35,11 +35,12 @@ import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Optional
 
+import psycopg2
 import requests
 
 from db.models import DivergentMotif, Gene, Ortholog
 from db.session import get_session
-from pipeline.config import get_tool_config
+from pipeline.config import get_db_url, get_tool_config
 
 log = logging.getLogger(__name__)
 
@@ -193,8 +194,14 @@ def classify_motif_direction(
 # Pipeline entry point
 # ---------------------------------------------------------------------------
 
+_CLASSIFY_BATCH_SIZE = 50_000  # rows per DB commit — keeps transaction size manageable
+
+
 def annotate_variant_directions(gene_ids: Optional[list[str]] = None) -> int:
     """Classify each DivergentMotif and store motif_direction.
+
+    Processes motifs in streaming batches to avoid loading ~1M ORM objects into
+    memory at once and to keep individual DB transactions small.
 
     Args:
         gene_ids: Optional list of gene IDs to limit processing.
@@ -202,58 +209,92 @@ def annotate_variant_directions(gene_ids: Optional[list[str]] = None) -> int:
     Returns:
         Number of motifs annotated.
     """
-    updated = 0
+    # ------------------------------------------------------------------
+    # 1. Determine which gene symbols we need LOEUF for.
+    #    Use a lightweight query — just the join keys + gene_symbol.
+    # ------------------------------------------------------------------
     with get_session() as session:
         q = (
-            session.query(DivergentMotif)
-            .join(Ortholog, DivergentMotif.ortholog_id == Ortholog.id)
-            .join(Gene, Ortholog.gene_id == Gene.id)
+            session.query(Gene.gene_symbol)
+            .join(Ortholog, Ortholog.gene_id == Gene.id)
+            .join(DivergentMotif, DivergentMotif.ortholog_id == Ortholog.id)
+            .distinct()
         )
         if gene_ids:
             q = q.filter(Gene.id.in_(gene_ids))
+        gene_symbols_needed: set[str] = {row[0] for row in q if row[0]}
 
-        motifs = q.all()
-        log.info("Classifying variant direction for %d motifs...", len(motifs))
+    symbol_map: dict[str, Optional[float]] = _fetch_loeuf_bulk(gene_symbols_needed)
 
-        # Pre-fetch LOEUF values per gene symbol before the session closes
-        gene_symbols_needed: set[str] = set()
-        for motif in motifs:
-            gs = motif.ortholog.gene.gene_symbol if motif.ortholog and motif.ortholog.gene else None
-            if gs:
-                gene_symbols_needed.add(gs)
+    # ------------------------------------------------------------------
+    # 2. Build a {motif_id → direction} map entirely in Python, loading
+    #    only the columns we need (no full ORM hydration of 1M objects).
+    # ------------------------------------------------------------------
+    log.info("Classifying variant directions (batch size %d)...", _CLASSIFY_BATCH_SIZE)
 
-        symbol_map: dict[str, Optional[float]] = _fetch_loeuf_bulk(gene_symbols_needed)
+    conn = psycopg2.connect(get_db_url())
+    try:
+        with conn.cursor() as cur:
+            # Fetch only the columns needed for classification + the gene symbol
+            sql = """
+                SELECT dm.id,
+                       dm.esm1v_score,
+                       dm.consequence_score,
+                       g.gene_symbol
+                FROM   divergent_motif dm
+                JOIN   ortholog o  ON o.id = dm.ortholog_id
+                JOIN   gene     g  ON g.id = o.gene_id
+            """
+            params: list = []
+            if gene_ids:
+                sql += " WHERE g.id = ANY(%s)"
+                params.append(gene_ids)
 
-        for motif in motifs:
-            gs = (motif.ortholog.gene.gene_symbol
-                  if motif.ortholog and motif.ortholog.gene else None)
-            loeuf = symbol_map.get(gs) if gs else None
-            direction = classify_motif_direction(
-                esm1v_score=getattr(motif, "esm1v_score", None),
-                consequence_score=getattr(motif, "consequence_score", None),
-                loeuf=loeuf,
-            )
-            motif.motif_direction = direction
-            updated += 1
+            cur.execute(sql, params or None)
+            rows = cur.fetchall()
 
-        session.commit()
+        log.info("Classifying variant direction for %d motifs...", len(rows))
 
-        # Read distribution from committed values while session is still open
         dist: dict[str, int] = {
             "gain_of_function": 0,
             "loss_of_function": 0,
             "functional_shift": 0,
             "neutral": 0,
         }
-        for motif in motifs:
-            key = motif.motif_direction or "neutral"
-            if key in dist:
-                dist[key] += 1
-            else:
-                dist[key] = 1
+
+        updates: list[tuple[str, str]] = []  # (direction, motif_id)
+        for motif_id, esm1v_score, consequence_score, gene_symbol in rows:
+            loeuf = symbol_map.get(gene_symbol) if gene_symbol else None
+            direction = classify_motif_direction(
+                esm1v_score=esm1v_score,
+                consequence_score=consequence_score,
+                loeuf=loeuf,
+            )
+            updates.append((direction, str(motif_id)))
+            dist[direction] = dist.get(direction, 0) + 1
+
+        # ------------------------------------------------------------------
+        # 3. Write back in batches so no single transaction holds 1M rows.
+        # ------------------------------------------------------------------
+        total = len(updates)
+        committed = 0
+        with conn.cursor() as cur:
+            for i in range(0, total, _CLASSIFY_BATCH_SIZE):
+                batch = updates[i : i + _CLASSIFY_BATCH_SIZE]
+                cur.executemany(
+                    "UPDATE divergent_motif SET motif_direction = %s WHERE id = %s::uuid",
+                    batch,
+                )
+                conn.commit()
+                committed += len(batch)
+                log.info("  Variant direction: %d / %d motifs written (%.0f%%).",
+                         committed, total, 100 * committed / total)
+
+    finally:
+        conn.close()
 
     log.info("Variant direction distribution: %s", dist)
-    return updated
+    return len(updates)
 
 
 def run_variant_direction_pipeline(gene_ids: Optional[list[str]] = None) -> int:
