@@ -377,9 +377,14 @@ def run_phylo_conservation(
 
     n_workers = int(get_tool_config().get("phylop_workers", min(60, max(1, (os.cpu_count() or 4) * 4))))
     work_items = [(gid, str(mod_path), tool) for gid in gene_ids]
-    all_results: dict[str, dict[str, Optional[float]]] = {}
     done = 0
     total = len(work_items)
+
+    _DB_FLUSH_INTERVAL = 1000  # write to DB every N genes to show incremental progress
+
+    genes_scored = 0
+    errors = 0
+    pending: dict[str, dict[str, Optional[float]]] = {}
 
     # ThreadPoolExecutor: phyloP/phastCons are external subprocesses — they
     # release the GIL and are I/O-bound, so threads outperform processes here.
@@ -388,21 +393,37 @@ def run_phylo_conservation(
     with ThreadPoolExecutor(max_workers=n_workers) as pool:
         futures = {pool.submit(_score_gene_worker, item): item[0] for item in work_items}
         for future in as_completed(futures):
-            gene_id, region_scores = future.result()
-            if any(v is not None for v in region_scores.values()):
-                all_results[gene_id] = region_scores
+            try:
+                gene_id, region_scores = future.result()
+                if any(v is not None for v in region_scores.values()):
+                    pending[gene_id] = region_scores
+            except Exception as exc:
+                errors += 1
+                gid = futures[future]
+                log.debug("  phylo_conservation: worker error for gene %s: %s", gid, exc)
             done += 1
             if done % 100 == 0 or done == total:
-                log.info("  phylo_conservation: %d / %d genes (%.0f%%).",
-                         done, total, 100 * done / total)
+                log.info("  phylo_conservation: %d / %d genes (%.0f%%) — %d scored, %d errors.",
+                         done, total, 100 * done / total, genes_scored + len(pending), errors)
+            # Flush pending results to DB periodically
+            if len(pending) >= _DB_FLUSH_INTERVAL:
+                with get_session() as session:
+                    for gid, region_scores in pending.items():
+                        _upsert_phylo_score(session, gid, region_scores)
+                    session.commit()
+                genes_scored += len(pending)
+                pending.clear()
 
-    # Write all results in a single session
-    genes_scored = 0
-    with get_session() as session:
-        for gene_id, region_scores in all_results.items():
-            _upsert_phylo_score(session, gene_id, region_scores)
-            genes_scored += 1
-        session.commit()
+    # Final flush
+    if pending:
+        with get_session() as session:
+            for gid, region_scores in pending.items():
+                _upsert_phylo_score(session, gid, region_scores)
+            session.commit()
+        genes_scored += len(pending)
+        pending.clear()
 
+    if errors:
+        log.warning("  phylo_conservation: %d genes failed scoring (logged at DEBUG level).", errors)
     log.info("Phylogenetic conservation scoring complete: %d genes scored", genes_scored)
     return genes_scored
