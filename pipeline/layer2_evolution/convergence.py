@@ -16,12 +16,13 @@ import math
 import re
 import time
 from collections import defaultdict
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Optional
 
 import requests
 
-from db.models import EvolutionScore, Gene, Ortholog, Species
+from db.models import DivergentMotif, EvolutionScore, Gene, Ortholog, Species
 from db.session import get_session
 from pipeline.config import get_ncbi_api_key, get_ncbi_email, get_storage_root, get_thresholds
 
@@ -230,6 +231,33 @@ def count_convergent_lineages(motif_species: list[str]) -> int:
     return len(lineages)
 
 
+def _build_gene_window_species_map(gene_ids: list[str]) -> dict[str, dict[tuple, list[str]]]:
+    """Bulk-load all ortholog+motif rows for the given genes in a single query.
+
+    Returns {gene_id: {(start_pos, end_pos): [species_id, ...]}} without opening
+    one DB session per gene.
+    """
+    gene_window_species: dict[str, dict[tuple, list[str]]] = defaultdict(lambda: defaultdict(list))
+
+    with get_session() as session:
+        rows = (
+            session.query(
+                Ortholog.gene_id,
+                Ortholog.species_id,
+                DivergentMotif.start_pos,
+                DivergentMotif.end_pos,
+            )
+            .join(DivergentMotif, DivergentMotif.ortholog_id == Ortholog.id)
+            .filter(Ortholog.gene_id.in_(gene_ids))
+            .all()
+        )
+
+    for gene_id, species_id, start_pos, end_pos in rows:
+        gene_window_species[gene_id][(start_pos, end_pos)].append(species_id)
+
+    return gene_window_species
+
+
 def compute_convergence_for_gene(gene_id: str) -> dict:
     """Compute convergence score for one gene.
 
@@ -282,13 +310,35 @@ def compute_convergence_for_gene(gene_id: str) -> dict:
     }
 
 
+def _compute_convergence_from_window_map(window_species: dict[tuple, list[str]]) -> dict:
+    """Pure-Python convergence computation from a pre-loaded window→species map."""
+    if not window_species:
+        return {"convergence_count": 0, "convergence_weight": 0.0, "phylop_score": None, "lineages": []}
+
+    best_window = max(window_species, key=lambda w: count_convergent_lineages(window_species[w]))
+    best_species = window_species[best_window]
+    max_lineages = count_convergent_lineages(best_species)
+    lineage_names = list({LINEAGE_MAP.get(s) for s in best_species} - {None, "Primates"})
+    weight = phylogenetic_convergence_weight(lineage_names)
+    return {
+        "convergence_count": max_lineages,
+        "convergence_weight": round(weight, 4),
+        "phylop_score": None,
+        "lineages": lineage_names,
+    }
+
+
 def run_convergence_pipeline() -> None:
-    """Compute and store convergence scores for all genes in EvolutionScore."""
+    """Compute and store convergence scores for all genes in EvolutionScore.
+
+    Bulk-loads all ortholog+motif rows in a single query, then processes
+    every gene in pure Python before writing back to the DB — avoids opening
+    one DB session per gene (previously ~12 000 sessions for 12 000 genes).
+    """
     thresholds = get_thresholds()
     min_lineages = thresholds.get("convergence_min_lineages", 3)
 
     # Auto-adjust min_lineages if we have fewer distinct non-human lineages than the threshold.
-    # This happens in small test runs (e.g. Human + NMR + Elephant = 2 lineages).
     with get_session() as session:
         all_species_ids = [sp.id for sp in session.query(Species).all()]
     available_lineages = {
@@ -311,7 +361,6 @@ def run_convergence_pipeline() -> None:
         gene_ids = [ev.gene_id for ev in session.query(EvolutionScore).all()]
 
     if not gene_ids:
-        # Fall back to all genes with motifs
         with get_session() as session:
             gene_ids = list({
                 o.gene_id
@@ -320,21 +369,29 @@ def run_convergence_pipeline() -> None:
                 .all()
             })
 
-    log.info("Computing convergence for %d genes...", len(gene_ids))
+    log.info("Computing convergence for %d genes (bulk motif load)...", len(gene_ids))
 
+    # Single bulk query: all motifs for all genes at once
+    gene_window_map = _build_gene_window_species_map(gene_ids)
+
+    # Compute results in memory — no DB per gene
+    results: dict[str, dict] = {}
+    for gene_id in gene_ids:
+        window_species = gene_window_map.get(gene_id, {})
+        results[gene_id] = _compute_convergence_from_window_map(window_species)
+
+    # Write all results back in a single session
     with get_session() as session:
-        for gene_id in gene_ids:
-            result = compute_convergence_for_gene(gene_id)
+        ev_map = {ev.gene_id: ev for ev in session.query(EvolutionScore).all()}
 
-            ev = session.get(EvolutionScore, gene_id)
+        for gene_id, result in results.items():
+            ev = ev_map.get(gene_id)
             if ev is None:
                 ev = EvolutionScore(gene_id=gene_id)
                 session.add(ev)
 
             ev.convergence_count = result["convergence_count"]
             if result.get("convergence_weight") is not None:
-                # Store phylogenetic weight in phylop_score field as proxy
-                # until a dedicated DB column is added in a migration
                 if ev.phylop_score is None:
                     ev.phylop_score = result["convergence_weight"]
             if result["phylop_score"] is not None:
@@ -346,11 +403,72 @@ def run_convergence_pipeline() -> None:
                          result.get("convergence_weight", 0),
                          ", ".join(result["lineages"]))
 
+        session.commit()
+
     log.info("Convergence computation complete.")
 
 
 NCBI_ESEARCH = "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/esearch.fcgi"
 NCBI_ESUMMARY = "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/esummary.fcgi"
+_NCBI_WORKERS = 8   # NCBI allows 10 req/s with API key; keep a safe margin
+
+
+def _resolve_gene_chrom(gene, params_base: dict) -> tuple[str, Optional[tuple[str, int]]]:
+    """Resolve a single Gene to (gene_id, (chrom, start)) via NCBI.
+
+    Returns (gene_id, None) if the gene cannot be mapped.
+    """
+    ncbi_gene_id = None
+    if gene.human_gene_id and re.match(r"^\d+$", str(gene.human_gene_id)):
+        ncbi_gene_id = gene.human_gene_id
+
+    if not ncbi_gene_id and gene.gene_symbol:
+        try:
+            r = requests.get(
+                NCBI_ESEARCH,
+                params={
+                    **params_base,
+                    "db": "gene",
+                    "term": f"{gene.gene_symbol}[Gene Name] AND 9606[Taxonomy ID]",
+                    "retmax": 1,
+                    "retmode": "json",
+                },
+                timeout=15,
+            )
+            if r.status_code == 200:
+                id_list = r.json().get("esearchresult", {}).get("idlist", [])
+                if id_list:
+                    ncbi_gene_id = id_list[0]
+        except Exception as exc:
+            log.debug("NCBI esearch for %s: %s", gene.gene_symbol, exc)
+
+    if not ncbi_gene_id:
+        return gene.id, None
+
+    try:
+        r = requests.get(
+            NCBI_ESUMMARY,
+            params={
+                **params_base,
+                "db": "gene",
+                "id": ncbi_gene_id,
+                "retmode": "json",
+            },
+            timeout=15,
+        )
+        if r.status_code != 200:
+            return gene.id, None
+        data = r.json()
+        result = data.get("result", {}).get(ncbi_gene_id, {})
+        chrom = result.get("chromosome")
+        genomicinfo = result.get("genomicinfo", [{}])
+        start = genomicinfo[0].get("chrstart") if genomicinfo else None
+        if chrom is not None and start is not None:
+            return gene.id, (str(chrom), int(start))
+    except Exception as exc:
+        log.debug("NCBI esummary for gene %s: %s", ncbi_gene_id, exc)
+
+    return gene.id, None
 
 
 def build_chrom_map(gene_ids: Optional[list[str]] = None) -> dict[str, tuple[str, int]]:
@@ -372,62 +490,27 @@ def build_chrom_map(gene_ids: Optional[list[str]] = None) -> dict[str, tuple[str
                 ids = [r[0] for r in session.query(Gene.id).all()]
             genes = session.query(Gene).filter(Gene.id.in_(ids)).all()
 
-    chrom_map: dict[str, tuple[str, int]] = {}
     params_base = {
         "api_key": get_ncbi_api_key(),
         "email": get_ncbi_email(),
     }
 
-    for gene in genes:
-        ncbi_gene_id = None
-        if gene.human_gene_id and re.match(r"^\d+$", str(gene.human_gene_id)):
-            ncbi_gene_id = gene.human_gene_id
-        if not ncbi_gene_id and gene.gene_symbol:
-            try:
-                r = requests.get(
-                    NCBI_ESEARCH,
-                    params={
-                        **params_base,
-                        "db": "gene",
-                        "term": f"{gene.gene_symbol}[Gene Name] AND 9606[Taxonomy ID]",
-                        "retmax": 1,
-                        "retmode": "json",
-                    },
-                    timeout=15,
-                )
-                if r.status_code == 200:
-                    data = r.json()
-                    id_list = data.get("esearchresult", {}).get("idlist", [])
-                    if id_list:
-                        ncbi_gene_id = id_list[0]
-            except Exception as exc:
-                log.debug("NCBI esearch for %s: %s", gene.gene_symbol, exc)
-            time.sleep(0.12)
+    chrom_map: dict[str, tuple[str, int]] = {}
+    total = len(genes)
+    done = 0
 
-        if not ncbi_gene_id:
-            continue
-        try:
-            r = requests.get(
-                NCBI_ESUMMARY,
-                params={
-                    **params_base,
-                    "db": "gene",
-                    "id": ncbi_gene_id,
-                    "retmode": "json",
-                },
-                timeout=15,
-            )
-            if r.status_code != 200:
-                continue
-            data = r.json()
-            result = data.get("result", {}).get(ncbi_gene_id, {})
-            chrom = result.get("chromosome")
-            start = result.get("genomicinfo", [{}])[0].get("chrstart") if result.get("genomicinfo") else None
-            if chrom is not None and start is not None:
-                chrom_map[gene.id] = (str(chrom), int(start))
-        except Exception as exc:
-            log.debug("NCBI esummary for gene %s: %s", ncbi_gene_id, exc)
-        time.sleep(0.12)
+    log.info("Building hg38 chrom map for %d genes (%d workers)...", total, _NCBI_WORKERS)
+
+    with ThreadPoolExecutor(max_workers=_NCBI_WORKERS) as pool:
+        futures = {pool.submit(_resolve_gene_chrom, gene, params_base): gene.id for gene in genes}
+        for future in as_completed(futures):
+            gene_id, loc = future.result()
+            if loc is not None:
+                chrom_map[gene_id] = loc
+            done += 1
+            if done % 500 == 0 or done == total:
+                log.info("  NCBI chrom map: %d / %d genes resolved (%.0f%%).",
+                         done, total, 100 * done / total)
 
     log.info("Built chrom_map for %d genes (hg38).", len(chrom_map))
     return chrom_map

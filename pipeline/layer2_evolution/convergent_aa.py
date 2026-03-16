@@ -144,6 +144,9 @@ def compute_convergent_aa_count(
 def annotate_convergent_aa(gene_ids: Optional[list[str]] = None) -> int:
     """Annotate all DivergentMotif rows with convergent_aa_count.
 
+    Bulk-loads all motif rows in a single query, computes convergence in
+    memory per gene, then writes results back in a single session commit.
+
     Args:
         gene_ids: Optional list of gene IDs to process (default: all genes).
 
@@ -160,21 +163,44 @@ def annotate_convergent_aa(gene_ids: Optional[list[str]] = None) -> int:
             for s in session.query(Species).all()
         }
 
-    log.info(
-        "Computing convergent amino acid substitutions for %d genes...",
-        len(gene_ids),
-    )
-    truly_convergent = 0
+        # Bulk-load all motif rows for all target genes in a single query
+        rows = (
+            session.query(DivergentMotif, Ortholog.gene_id, Ortholog.species_id)
+            .join(Ortholog, DivergentMotif.ortholog_id == Ortholog.id)
+            .filter(Ortholog.gene_id.in_(gene_ids))
+            .all()
+        )
 
+    log.info(
+        "Computing convergent amino acid substitutions for %d genes (%d total motif rows)...",
+        len(gene_ids),
+        len(rows),
+    )
+
+    # Group rows by gene_id in memory
+    gene_motifs: dict[str, list[tuple]] = defaultdict(list)
+    for motif, gene_id, species_id in rows:
+        gene_motifs[gene_id].append((motif, species_id))
+
+    # Compute convergence counts purely in memory — no DB per gene
+    motif_counts: dict[str, int] = {}
+    for gene_id in gene_ids:
+        gene_rows = gene_motifs.get(gene_id, [])
+        if not gene_rows:
+            continue
+        # Re-use existing computation logic with in-memory data
+        counts = _compute_from_rows(gene_rows, species_lineage_map)
+        motif_counts.update(counts)
+
+    # Single bulk write back to DB
+    truly_convergent = 0
     with get_session() as session:
-        for gene_id in gene_ids:
-            counts = compute_convergent_aa_count(gene_id, species_lineage_map)
-            for motif_id, count in counts.items():
-                motif = session.get(DivergentMotif, motif_id)
-                if motif:
-                    motif.convergent_aa_count = count
-                    if count >= 2:
-                        truly_convergent += 1
+        for motif_id, count in motif_counts.items():
+            motif = session.get(DivergentMotif, motif_id)
+            if motif:
+                motif.convergent_aa_count = count
+                if count >= 2:
+                    truly_convergent += 1
         session.commit()
 
     log.info(
@@ -182,6 +208,64 @@ def annotate_convergent_aa(gene_ids: Optional[list[str]] = None) -> int:
         truly_convergent,
     )
     return truly_convergent
+
+
+def _compute_from_rows(
+    rows: list[tuple],
+    species_lineage_map: dict[str, str],
+) -> dict[str, int]:
+    """Compute convergent_aa_count for one gene from pre-loaded (motif, species_id) tuples.
+
+    Mirrors compute_convergent_aa_count() but works entirely on in-memory objects
+    rather than opening a DB session.
+
+    Returns {motif_id: convergent_aa_count}.
+    """
+    position_subs: dict[int, list[tuple[str, str, str]]] = defaultdict(list)
+    motif_obj_by_id: dict[str, object] = {}
+
+    for motif, species_id in rows:
+        motif_obj_by_id[motif.id] = motif
+        lineage = species_lineage_map.get(species_id, "Other")
+        if lineage in ("Primates", "Other") or species_id == "human":
+            continue
+
+        for i, (h_aa, a_aa) in enumerate(zip(motif.human_seq, motif.animal_seq)):
+            if h_aa == "-" or a_aa == "-" or h_aa == a_aa:
+                continue
+            abs_pos = motif.start_pos + i
+            position_subs[abs_pos].append((lineage, h_aa, a_aa))
+
+    motif_conv_counts: dict[str, int] = {}
+
+    for motif_id, motif in motif_obj_by_id.items():
+        max_lineage_conv = 0
+
+        for i in range(len(motif.human_seq)):
+            abs_pos = motif.start_pos + i
+            subs = position_subs.get(abs_pos, [])
+            if len(subs) < 2:
+                continue
+
+            lineage_seen: dict[str, str] = {}
+            for lineage, h_aa, a_aa in subs:
+                if lineage not in lineage_seen:
+                    lineage_seen[lineage] = a_aa
+
+            best_count = 0
+            lineage_alts = list(lineage_seen.values())
+            for j, aa_ref in enumerate(lineage_alts):
+                count = sum(
+                    1 for aa_other in lineage_alts
+                    if _same_biochemical_change(aa_ref, aa_other)
+                )
+                best_count = max(best_count, count)
+
+            max_lineage_conv = max(max_lineage_conv, best_count)
+
+        motif_conv_counts[motif_id] = max_lineage_conv
+
+    return motif_conv_counts
 
 
 def run_convergent_aa_pipeline(gene_ids: Optional[list[str]] = None) -> int:

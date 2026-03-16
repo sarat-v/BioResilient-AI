@@ -22,6 +22,7 @@ Bgee data is tagged with a "bgee:" prefix on geo_accession for traceability.
 
 import logging
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Optional
 
 import requests
@@ -33,6 +34,7 @@ log = logging.getLogger(__name__)
 
 BGEE_API = "https://www.bgee.org/api"
 REQUEST_TIMEOUT = 20
+_BGEE_WORKERS = 10   # Bgee rate-limits at ~10–15 concurrent connections
 
 # Tissues relevant for each trait (mapped to Uberon or Bgee tissue names)
 TRAIT_TISSUES: dict[str, list[str]] = {
@@ -108,15 +110,78 @@ def _is_relevant_tissue(tissue_name: str, trait_tissues: list[str]) -> bool:
     return any(t in tissue_lower for t in trait_tissues)
 
 
+def _query_bgee_for_gene(
+    gene: Gene,
+    trait_tissues: list[str],
+) -> tuple[str, list[dict]]:
+    """Query Bgee for all supported species for one gene.
+
+    Returns (gene_id, [ExpressionResult-kwargs, ...]) — does NOT write to DB.
+    Each dict is passed directly to ExpressionResult(**kwargs).
+    """
+    if not gene.gene_symbol:
+        return gene.id, []
+
+    bgee_human_id = _bgee_gene_search(gene.gene_symbol, species_taxid=9606)
+    if not bgee_human_id:
+        log.debug("  Bgee: no result for %s", gene.gene_symbol)
+        return gene.id, []
+
+    time.sleep(0.1)  # small per-gene courtesy pause
+
+    expression_rows: list[dict] = []
+    present_species: list[str] = []
+
+    for taxid, species_id in BGEE_SUPPORTED_TAXIDS.items():
+        if species_id == "human":
+            continue
+
+        bgee_species_id = _bgee_gene_search(gene.gene_symbol, species_taxid=taxid)
+        if not bgee_species_id:
+            continue
+
+        calls = _bgee_expression_calls(bgee_species_id, taxid)
+        time.sleep(0.05)
+
+        for call in calls:
+            tissue = ""
+            anat = call.get("anatEntity") or {}
+            if isinstance(anat, dict):
+                tissue = anat.get("anatEntityName", "")
+            elif isinstance(anat, str):
+                tissue = anat
+
+            call_type = (call.get("expressionState") or "").lower()
+            if call_type in ("expressed", "present"):
+                if not trait_tissues or _is_relevant_tissue(tissue, trait_tissues):
+                    present_species.append(species_id)
+                    expression_rows.append({
+                        "gene_id": gene.id,
+                        "geo_accession": f"bgee:{bgee_species_id}",
+                        "comparison": species_id,
+                        "log2fc": None,
+                        "padj": None,
+                        "n_samples": None,
+                    })
+                    break
+
+    if len(present_species) >= 2:
+        log.debug(
+            "  Bgee: %s expressed in %d species (%s)",
+            gene.gene_symbol, len(present_species), ", ".join(present_species[:4]),
+        )
+
+    return gene.id, expression_rows
+
+
 def run_bgee_pipeline(
     gene_ids: Optional[list[str]] = None,
     trait_id: str = "",
 ) -> int:
     """Query Bgee for cross-species expression data for candidate genes.
 
-    For each gene, resolves the human gene symbol to a Bgee ID, then queries
-    expression across supported species. Stores results as ExpressionResult rows
-    with geo_accession prefixed with "bgee:".
+    Fetches all genes in parallel (thread pool), then writes results to DB
+    in a single session commit.
 
     Args:
         gene_ids: Optional list of gene IDs to process (default: Tier1+Tier2).
@@ -145,70 +210,32 @@ def run_bgee_pipeline(
 
         genes = session.query(Gene).filter(Gene.id.in_(gene_ids)).all()
 
-    log.info("Querying Bgee for %d genes (trait_id=%r)...", len(genes), trait_id)
+    log.info("Querying Bgee for %d genes (trait_id=%r, %d workers)...",
+             len(genes), trait_id, _BGEE_WORKERS)
+
+    all_rows: list[dict] = []
+    done = 0
+    total = len(genes)
+
+    with ThreadPoolExecutor(max_workers=_BGEE_WORKERS) as pool:
+        futures = {pool.submit(_query_bgee_for_gene, gene, trait_tissues): gene.id
+                   for gene in genes}
+        for future in as_completed(futures):
+            _gid, rows = future.result()
+            all_rows.extend(rows)
+            done += 1
+            if done % 50 == 0 or done == total:
+                log.info("  Bgee: %d / %d genes processed (%.0f%%).",
+                         done, total, 100 * done / total)
+
+    # Single session write for all results
     written = 0
-
-    for gene in genes:
-        if not gene.gene_symbol:
-            continue
-
-        # Resolve human gene to Bgee ID
-        bgee_human_id = _bgee_gene_search(gene.gene_symbol, species_taxid=9606)
-        if not bgee_human_id:
-            log.debug("  Bgee: no result for %s", gene.gene_symbol)
-            continue
-
-        time.sleep(0.2)  # Respect Bgee rate limits
-
-        # Query each supported species
-        present_species: list[str] = []
-
-        for taxid, species_id in BGEE_SUPPORTED_TAXIDS.items():
-            if species_id == "human":
-                continue
-
-            bgee_species_id = _bgee_gene_search(gene.gene_symbol, species_taxid=taxid)
-            if not bgee_species_id:
-                continue
-
-            calls = _bgee_expression_calls(bgee_species_id, taxid)
-            time.sleep(0.1)
-
-            # Check for "present" call in any relevant tissue
-            for call in calls:
-                tissue = ""
-                anat = call.get("anatEntity") or {}
-                if isinstance(anat, dict):
-                    tissue = anat.get("anatEntityName", "")
-                elif isinstance(anat, str):
-                    tissue = anat
-
-                call_type = (call.get("expressionState") or "").lower()
-                if call_type == "expressed" or call_type == "present":
-                    if not trait_tissues or _is_relevant_tissue(tissue, trait_tissues):
-                        present_species.append(species_id)
-                        break
-
-            # Write an ExpressionResult row for this species
-            if present_species and present_species[-1] == species_id:
-                with get_session() as session:
-                    er = ExpressionResult(
-                        gene_id=gene.id,
-                        geo_accession=f"bgee:{bgee_species_id}",
-                        comparison=species_id,
-                        log2fc=None,     # Bgee provides presence/absence, not log2FC
-                        padj=None,
-                        n_samples=None,
-                    )
-                    session.add(er)
-                    session.commit()
-                    written += 1
-
-        if len(present_species) >= 2:
-            log.debug(
-                "  Bgee: %s expressed in %d species (%s)",
-                gene.gene_symbol, len(present_species), ", ".join(present_species[:4]),
-            )
+    if all_rows:
+        with get_session() as session:
+            for kwargs in all_rows:
+                session.add(ExpressionResult(**kwargs))
+            session.commit()
+            written = len(all_rows)
 
     log.info("Bgee supplement complete: %d expression rows written.", written)
     return written

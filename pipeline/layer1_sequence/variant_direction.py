@@ -32,6 +32,7 @@ Result stored as DivergentMotif.motif_direction (string enum: 'gain_of_function'
 
 import logging
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Optional
 
 import requests
@@ -64,6 +65,9 @@ _GNOMAD_RATE_LIMIT_SLEEP = 0.25  # seconds between gnomAD API requests
 # ---------------------------------------------------------------------------
 
 _loeuf_cache: dict[str, Optional[float]] = {}
+
+# Parallel fetch workers — gnomAD GraphQL tolerates ~20 concurrent connections.
+_LOEUF_WORKERS = 20
 
 
 def _fetch_loeuf(gene_symbol: str) -> Optional[float]:
@@ -102,6 +106,43 @@ def _fetch_loeuf(gene_symbol: str) -> Optional[float]:
 
     _loeuf_cache[gene_symbol] = None
     return None
+
+
+def _fetch_loeuf_bulk(gene_symbols: set[str]) -> dict[str, Optional[float]]:
+    """Fetch LOEUF for many gene symbols in parallel using a thread pool.
+
+    Returns {gene_symbol: loeuf_or_None} for every input symbol.
+    Already-cached symbols are returned immediately without a network call.
+    """
+    result: dict[str, Optional[float]] = {}
+    to_fetch = [gs for gs in gene_symbols if gs not in _loeuf_cache]
+    # Return cached hits immediately
+    for gs in gene_symbols:
+        if gs in _loeuf_cache:
+            result[gs] = _loeuf_cache[gs]
+
+    if not to_fetch:
+        return result
+
+    log.info("  Fetching gnomAD LOEUF for %d unique gene symbols (%d workers)...",
+             len(to_fetch), _LOEUF_WORKERS)
+
+    def _worker(gs: str) -> tuple[str, Optional[float]]:
+        return gs, _fetch_loeuf(gs)
+
+    done = 0
+    total = len(to_fetch)
+    with ThreadPoolExecutor(max_workers=_LOEUF_WORKERS) as pool:
+        futures = {pool.submit(_worker, gs): gs for gs in to_fetch}
+        for future in as_completed(futures):
+            gs, loeuf = future.result()
+            result[gs] = loeuf
+            done += 1
+            if done % 500 == 0 or done == total:
+                log.info("  gnomAD LOEUF: %d / %d symbols fetched (%.0f%%).",
+                         done, total, 100 * done / total)
+
+    return result
 
 
 # ---------------------------------------------------------------------------
@@ -177,10 +218,7 @@ def annotate_variant_directions(gene_ids: Optional[list[str]] = None) -> int:
             if gs:
                 gene_symbols_needed.add(gs)
 
-        symbol_map: dict[str, Optional[float]] = {}
-        for gs in gene_symbols_needed:
-            symbol_map[gs] = _fetch_loeuf(gs)
-            time.sleep(_GNOMAD_RATE_LIMIT_SLEEP)
+        symbol_map: dict[str, Optional[float]] = _fetch_loeuf_bulk(gene_symbols_needed)
 
         for motif in motifs:
             gs = (motif.ortholog.gene.gene_symbol
