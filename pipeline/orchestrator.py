@@ -889,8 +889,16 @@ def run_pipeline(
     if _existing is not None:
         results_dir = _existing
 
-    # If resuming past step4, recover aligned_orthogroups from disk cache
-    if resume_from not in ("step1","step2","step3","step3b","step4"):
+    # If resuming past step4, recover aligned_orthogroups from disk cache.
+    # This triggers when:
+    #   - resume_from is a step after step4 (e.g. --resume-from step5), OR
+    #   - only_steps contains a step that needs aligned_orthogroups (step5, step6, step7...)
+    _EARLY_STEPS = {"step1", "step2", "step3", "step3b", "step4", "step4b", "step4c", "step4d"}
+    _needs_pkl = (
+        resume_from not in _EARLY_STEPS
+        or (only_steps and not set(only_steps).issubset(_EARLY_STEPS))
+    )
+    if _needs_pkl:
         _pkl_path = Path(get_local_storage_root()) / "aligned_orthogroups.pkl"
 
         # Auto-sync from S3 if missing locally — happens after instance stop/start
