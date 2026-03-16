@@ -15,6 +15,7 @@ only labels motifs to allow downstream filtering for functional significance.
 import json
 import logging
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Optional
 
@@ -29,6 +30,8 @@ log = logging.getLogger(__name__)
 INTERPRO_API = "https://www.ebi.ac.uk/interpro/api"
 REQUEST_TIMEOUT = 20
 RETRY_DELAY = 2.0
+# InterPro allows ~20 concurrent connections without triggering rate limits
+_FETCH_WORKERS = 20
 
 
 def _cache_path(accession: str) -> Path:
@@ -54,19 +57,21 @@ def fetch_domains_for_protein(accession: str) -> list[dict]:
             pass
 
     domains: list[dict] = []
-    # Query all entries (Pfam, PANTHER, TIGRFAM, etc.) for this protein
     url = f"{INTERPRO_API}/entry/all/protein/UniProt/{accession}/?page_size=200"
 
     for attempt in range(3):
         try:
             r = requests.get(url, timeout=REQUEST_TIMEOUT)
             if r.status_code == 404:
-                # No domains found — cache empty list
                 cache.write_text(json.dumps([]))
                 return []
             if r.status_code == 200:
                 break
-            time.sleep(RETRY_DELAY * (attempt + 1))
+            if r.status_code == 429:
+                # Rate limited — back off longer
+                time.sleep(RETRY_DELAY * (attempt + 2) * 2)
+            else:
+                time.sleep(RETRY_DELAY * (attempt + 1))
         except requests.RequestException as exc:
             log.debug("InterPro request failed (attempt %d): %s", attempt + 1, exc)
             time.sleep(RETRY_DELAY)
@@ -82,7 +87,6 @@ def fetch_domains_for_protein(accession: str) -> list[dict]:
             name = entry_meta.get("name", "") or entry_meta.get("accession", "")
             entry_type = entry_meta.get("type", "")
 
-            # Only keep domain-type entries (skip sites, homologous superfamilies, etc.)
             if entry_type.lower() not in ("domain", "family", "homologous_superfamily", "repeat"):
                 continue
 
@@ -94,7 +98,7 @@ def fetch_domains_for_protein(accession: str) -> list[dict]:
                     for fragment in location.get("fragments", []):
                         start = fragment.get("start")
                         end_ = fragment.get("end")
-                        if start and end_:
+                        if start is not None and end_ is not None:
                             domains.append({
                                 "name": name,
                                 "start": int(start),
@@ -130,43 +134,72 @@ def _motif_overlaps_domain(motif_start: int, motif_end: int, domain: dict) -> bo
     m_end = motif_end + 1
     d_start = domain["start"]
     d_end = domain["end"]
-    # Overlap: not (m_end < d_start or m_start > d_end)
     return not (m_end < d_start or m_start > d_end)
+
+
+def _fetch_worker(args: tuple) -> tuple[str, str, list[dict]]:
+    """Fetch domains for one gene in a thread. Returns (gene_id, accession, domains)."""
+    gene_id, accession = args
+    domains = fetch_domains_for_protein(accession)
+    return gene_id, accession, domains
 
 
 def annotate_motif_domains(gene_ids: Optional[list[str]] = None) -> int:
     """Annotate DivergentMotif rows with Pfam/InterPro domain information.
 
-    For each gene (optionally restricted to gene_ids), fetches domain
-    annotations for the human protein accession, then marks each DivergentMotif
-    with domain_name and in_functional_domain.
+    Fetches InterPro annotations in parallel (thread pool), then applies
+    domain overlaps and writes to DB in a single session commit.
 
     Returns number of motifs annotated as in_functional_domain=True.
     """
-    functional_count = 0
-
     with get_session() as session:
         q = session.query(Gene)
         if gene_ids:
             q = q.filter(Gene.id.in_(gene_ids))
         genes = q.all()
 
-        log.info("Annotating Pfam domains for %d genes...", len(genes))
+    log.info("Annotating Pfam domains for %d genes (%d workers)...", len(genes), _FETCH_WORKERS)
 
+    # Build list of (gene_id, accession) to fetch
+    fetch_args = []
+    for gene in genes:
+        accession = gene.human_protein
+        if not accession:
+            continue
+        if "|" in accession:
+            accession = accession.split("|")[-1]
+        fetch_args.append((gene.id, accession))
+
+    # Parallel fetch — all I/O bound, safe to thread
+    domain_map: dict[str, list[dict]] = {}
+    done = 0
+    total = len(fetch_args)
+
+    with ThreadPoolExecutor(max_workers=_FETCH_WORKERS) as pool:
+        futures = {pool.submit(_fetch_worker, args): args for args in fetch_args}
+        for future in as_completed(futures):
+            try:
+                gene_id, accession, domains = future.result()
+                domain_map[gene_id] = domains
+            except Exception as exc:
+                gene_id = futures[future][0]
+                log.warning("Domain fetch failed for gene %s: %s", gene_id, exc)
+                domain_map[gene_id] = []
+            done += 1
+            if done % 500 == 0 or done == total:
+                log.info("  Fetched %d / %d gene domain annotations (%.0f%%).",
+                         done, total, 100 * done / total)
+
+    log.info("All domain annotations fetched. Applying to motifs and writing to DB...")
+
+    # Single session for all DB writes
+    functional_count = 0
+    with get_session() as session:
         for gene in genes:
-            accession = gene.human_protein
-            if not accession:
-                continue
-
-            # Strip species prefix if present
-            if "|" in accession:
-                accession = accession.split("|")[-1]
-
-            domains = fetch_domains_for_protein(accession)
+            domains = domain_map.get(gene.id, [])
             if not domains:
                 continue
 
-            # Get all motifs for this gene (via ortholog join)
             motifs = (
                 session.query(DivergentMotif)
                 .join(Ortholog, DivergentMotif.ortholog_id == Ortholog.id)
@@ -178,7 +211,6 @@ def annotate_motif_domains(gene_ids: Optional[list[str]] = None) -> int:
                 best_domain = None
                 for domain in domains:
                     if _motif_overlaps_domain(motif.start_pos, motif.end_pos, domain):
-                        # Prefer Pfam domain over others; take first match
                         if best_domain is None or domain["database"].lower() == "pfam":
                             best_domain = domain
 
@@ -191,10 +223,7 @@ def annotate_motif_domains(gene_ids: Optional[list[str]] = None) -> int:
 
         session.commit()
 
-    log.info(
-        "Pfam domain annotation complete: %d motifs in functional domains.",
-        functional_count,
-    )
+    log.info("Pfam domain annotation complete: %d motifs in functional domains.", functional_count)
     return functional_count
 
 
