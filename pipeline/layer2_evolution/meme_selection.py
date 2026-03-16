@@ -57,18 +57,26 @@ def _setup_entrez() -> None:
 def fetch_cds_for_protein(protein_accession: str) -> Optional[str]:
     """Fetch the CDS nucleotide sequence for a protein accession from NCBI.
 
-    Uses protein → nucleotide link to get the parent mRNA, then extracts
-    the CDS feature. Returns the nucleotide CDS string or None on failure.
+    Results are cached to disk at {storage_root}/cds/{accession}.fna so that
+    repeated runs of step6, 6b, and 6c never re-fetch the same accession.
 
-    Rate: respects NCBI's 10 req/sec limit with API key.
+    Rate: respects NCBI's 10 req/s limit with API key.
     """
     _setup_entrez()
-    # Strip species prefix if present (e.g. "human|human|NP_001234.1" → "NP_001234.1")
+    # Strip species prefix (e.g. "human|human|NP_001234.1" → "NP_001234.1")
     acc = protein_accession.split("|")[-1] if "|" in protein_accession else protein_accession
 
     # Skip non-NCBI accessions (UniProt style like ZN124_HUMAN)
     if re.match(r"^[A-Z0-9]+_[A-Z]+$", acc):
         return None
+
+    # Check disk cache first — avoids all network I/O on resume/re-run
+    cache_dir = Path(get_storage_root()) / "cds"
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    cache_file = cache_dir / f"{acc}.fna"
+    if cache_file.exists():
+        cds = cache_file.read_text().strip()
+        return cds if cds else None   # empty file = previously confirmed "no CDS"
 
     try:
         # Link protein → nucleotide
@@ -85,6 +93,7 @@ def fetch_cds_for_protein(protein_accession: str) -> Optional[str]:
                     break
 
         if not nuc_ids:
+            cache_file.write_text("")   # cache negative result
             return None
 
         # Fetch the first mRNA record
@@ -99,8 +108,10 @@ def fetch_cds_for_protein(protein_accession: str) -> Optional[str]:
                 cds_seq = str(feature.extract(record.seq))
                 # Validate: must be divisible by 3 and start with ATG
                 if len(cds_seq) % 3 == 0 and cds_seq.upper().startswith("ATG"):
+                    cache_file.write_text(cds_seq)   # persist for future runs
                     return cds_seq
 
+        cache_file.write_text("")   # CDS not found — cache to skip next time
         return None
 
     except Exception as exc:

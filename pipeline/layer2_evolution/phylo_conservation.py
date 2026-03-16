@@ -14,6 +14,10 @@ Tools (checked in order):
 Both tools require a species tree (the IQ-TREE2 treefile from step 5).
 If neither tool is installed, all scores are left NULL and a WARN is logged.
 
+Parallelisation: each gene's three regions (cds, promoter, downstream) are scored
+by independent subprocess invocations.  ProcessPoolExecutor runs multiple genes
+in parallel so all CPU cores are used simultaneously.
+
 Scope: restricted to genes in tier_gene_ids (Tier1 + Tier2 after step9).
        When called before step9 (run_pipeline order), all genes are scored.
 
@@ -21,10 +25,12 @@ Entry point: run_phylo_conservation(tier_gene_ids, treefile) -> int
 """
 
 import logging
+import os
 import shutil
 import subprocess
 import tempfile
 import uuid
+from concurrent.futures import ProcessPoolExecutor, as_completed
 from pathlib import Path
 from typing import Optional
 
@@ -216,6 +222,39 @@ def _upsert_phylo_score(session, gene_id: str, scores: dict[str, Optional[float]
             setattr(existing, field, value)
 
 
+def _score_gene_worker(args: tuple) -> tuple[str, dict[str, Optional[float]]]:
+    """Process-pool worker: build MSAs and run phyloP/phastCons for one gene.
+
+    Runs entirely in a subprocess-safe context: opens its own DB session,
+    writes to a private temp directory, and returns (gene_id, {field: score}).
+    """
+    gene_id, tree_path_str, tool = args
+    tree_path = Path(tree_path_str)
+
+    region_scores: dict[str, Optional[float]] = {}
+    tmp_files: list[Path] = []
+
+    try:
+        with get_session() as session:
+            for region_type in _REGION_TYPES:
+                msa_path = build_msa(gene_id, region_type, session)
+                if msa_path is None:
+                    continue
+                tmp_files.append(msa_path)
+
+                score = score_region(msa_path, tree_path, tool)
+                field = _REGION_TO_FIELD[region_type]
+                region_scores[field] = score
+    finally:
+        for f in tmp_files:
+            try:
+                f.unlink(missing_ok=True)
+            except Exception:
+                pass
+
+    return gene_id, region_scores
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Main entry point
 # ─────────────────────────────────────────────────────────────────────────────
@@ -225,6 +264,9 @@ def run_phylo_conservation(
     treefile: Path,
 ) -> int:
     """Build MSAs and score conservation with phyloP/phastCons for each gene.
+
+    Runs all gene-level subprocess invocations in parallel using
+    ProcessPoolExecutor so all CPU cores are utilised simultaneously.
 
     Args:
         tier_gene_ids: List of gene IDs to score. If None, all genes with
@@ -250,54 +292,48 @@ def run_phylo_conservation(
         log.warning("Could not prepare tree for phyloP — skipped.")
         return 0
 
-    log.info("Phylogenetic conservation scoring with %s...", tool)
-    genes_scored = 0
-    tmp_files: list[Path] = []
+    with get_session() as session:
+        if tier_gene_ids:
+            gene_ids = [g.id for g in session.query(Gene).filter(Gene.id.in_(tier_gene_ids)).all()]
+        else:
+            gene_ids = [
+                r[0] for r in session.query(NucleotideRegion.gene_id).distinct().all()
+            ]
+
+    log.info("Phylogenetic conservation scoring with %s for %d genes (parallel)...",
+             tool, len(gene_ids))
+
+    n_workers = max(1, (os.cpu_count() or 4) - 1)
+    work_items = [(gid, str(tree_path), tool) for gid in gene_ids]
+    all_results: dict[str, dict[str, Optional[float]]] = {}
+    done = 0
+    total = len(work_items)
 
     try:
-        with get_session() as session:
-            if tier_gene_ids:
-                genes = session.query(Gene).filter(Gene.id.in_(tier_gene_ids)).all()
-            else:
-                # Fall back to all genes that have NucleotideRegion data
-                gene_ids_with_regions = [
-                    r[0] for r in session.query(NucleotideRegion.gene_id).distinct().all()
-                ]
-                genes = session.query(Gene).filter(Gene.id.in_(gene_ids_with_regions)).all()
-
-            log.info("Scoring %d genes with %s...", len(genes), tool)
-
-            for gene in genes:
-                region_scores: dict[str, Optional[float]] = {}
-
-                for region_type in _REGION_TYPES:
-                    msa_path = build_msa(gene.id, region_type, session)
-                    if msa_path is None:
-                        continue
-                    tmp_files.append(msa_path)
-
-                    score = score_region(msa_path, tree_path, tool)
-                    field = _REGION_TO_FIELD[region_type]
-                    region_scores[field] = score
-
+        with ProcessPoolExecutor(max_workers=n_workers) as pool:
+            futures = {pool.submit(_score_gene_worker, item): item[0] for item in work_items}
+            for future in as_completed(futures):
+                gene_id, region_scores = future.result()
                 if any(v is not None for v in region_scores.values()):
-                    _upsert_phylo_score(session, gene.id, region_scores)
-                    genes_scored += 1
-
-            session.commit()
-
+                    all_results[gene_id] = region_scores
+                done += 1
+                if done % 500 == 0 or done == total:
+                    log.info("  phylo_conservation: %d / %d genes (%.0f%%).",
+                             done, total, 100 * done / total)
     finally:
-        # Clean up temporary MSA and tree files
-        for f in tmp_files:
-            try:
-                f.unlink(missing_ok=True)
-            except Exception:
-                pass
         if tree_path:
             try:
                 tree_path.unlink(missing_ok=True)
             except Exception:
                 pass
+
+    # Write all results in a single session
+    genes_scored = 0
+    with get_session() as session:
+        for gene_id, region_scores in all_results.items():
+            _upsert_phylo_score(session, gene_id, region_scores)
+            genes_scored += 1
+        session.commit()
 
     log.info("Phylogenetic conservation scoring complete: %d genes scored", genes_scored)
     return genes_scored
