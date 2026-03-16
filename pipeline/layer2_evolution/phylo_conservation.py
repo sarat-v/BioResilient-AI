@@ -40,6 +40,7 @@ from Bio.SeqRecord import SeqRecord
 
 from db.models import Gene, NucleotideRegion, PhyloConservationScore
 from db.session import get_session
+from pipeline.config import get_tool_config
 
 log = logging.getLogger(__name__)
 
