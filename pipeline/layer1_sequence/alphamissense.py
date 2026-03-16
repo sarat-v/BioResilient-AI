@@ -128,43 +128,40 @@ def _extract_uniprot_accession(raw: str) -> Optional[str]:
 def _get_target_accessions() -> Optional[set[str]]:
     """Return the set of UniProt accessions present in our Gene table.
 
-    Used to filter the AlphaMissense TSV during index build so we only keep
-    entries for proteins we actually have motifs for, instead of loading all
-    ~20 000 human proteins into memory.
+    Uses gene_symbol first (set by _build_human_gene_map as the bare accession),
+    then falls back to parsing human_protein.
 
-    Returns None if accessions cannot be reliably extracted (e.g. Gene table
-    stores mnemonics instead of accessions), which signals build_am_index to
-    load the full unfiltered index instead of silently returning empty results.
+    Returns None if no valid accessions can be extracted, which signals
+    build_am_index() to load the full unfiltered index.
     """
     accessions: set[str] = set()
-    mnemonic_count = 0
+    fallback_count = 0
 
     with get_session() as session:
         for gene in session.query(Gene).all():
-            raw = gene.human_protein
-            if not raw:
+            # gene_symbol is set to the bare accession by _build_human_gene_map
+            sym = (gene.gene_symbol or "").strip()
+            if sym and re.match(r"^[A-Z][A-Z0-9]{4,9}$", sym) and "_" not in sym:
+                accessions.add(sym.upper())
                 continue
-            acc = _extract_uniprot_accession(raw)
+            # Fallback: parse from human_protein
+            acc = _extract_uniprot_accession(gene.human_protein or "")
             if acc:
                 accessions.add(acc)
             else:
-                mnemonic_count += 1
+                fallback_count += 1
 
     if not accessions:
         log.warning(
-            "Could not extract UniProt accessions from Gene.human_protein "
-            "(all %d values appear to be mnemonics or non-standard IDs). "
+            "Could not extract UniProt accessions from Gene table "
+            "(%d rows with non-standard IDs). "
             "Loading full AlphaMissense index without filtering.",
-            mnemonic_count,
+            fallback_count,
         )
         return None
 
-    if mnemonic_count > len(accessions) * 0.5:
-        log.warning(
-            "Only %d / %d Gene rows yielded a valid UniProt accession "
-            "(%d appear to be mnemonics). Filtering may miss many proteins.",
-            len(accessions), len(accessions) + mnemonic_count, mnemonic_count,
-        )
+    log.info("Collected %d target UniProt accessions for AlphaMissense filtering.", len(accessions))
+    return accessions
 
     return accessions
 
@@ -308,16 +305,15 @@ def annotate_motif_consequences(
         log.info("Scoring AlphaMissense consequences for %d genes...", len(genes))
 
         for gene in genes:
-            raw_protein = gene.human_protein
-            if not raw_protein:
-                continue
-            # Try to extract a bare UniProt accession (handles "human|P12345",
-            # "sp|P12345|GENE_HUMAN", "P12345", "P12345-2").
-            accession = _extract_uniprot_accession(raw_protein)
-            if not accession:
-                # Fallback: strip isoform suffix + uppercase the whole raw value
-                # in case it's already a bare accession or unrecognised format.
-                accession = raw_protein.split("-")[0].strip().upper()
+            # Use gene_symbol (bare accession) as primary; fall back to parsing human_protein.
+            sym = (gene.gene_symbol or "").strip()
+            if sym and re.match(r"^[A-Z][A-Z0-9]{4,9}$", sym) and "_" not in sym:
+                accession = sym.upper()
+            else:
+                accession = _extract_uniprot_accession(gene.human_protein or "") or ""
+                if not accession:
+                    # Last resort bare strip
+                    accession = (gene.human_protein or "").split("-")[0].strip().upper()
             if not accession:
                 continue
 

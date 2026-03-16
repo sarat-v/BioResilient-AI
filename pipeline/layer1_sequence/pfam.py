@@ -390,30 +390,37 @@ def annotate_motif_domains(gene_ids: Optional[list[str]] = None) -> int:
     log.info("Annotating domains for %d genes with motifs (strategy=%s)...",
              len(genes), _STRATEGY)
 
-    # Build accession list — extract the bare UniProt accession from whatever
-    # format gene.human_protein was stored in (reheadered FASTA gives either
-    # "human|P12345" or "human|BRCA1_HUMAN" depending on the source FASTA).
-    def _clean_accession(raw: str) -> str:
-        parts = raw.strip().split("|")
-        # "sp|P12345|BRCA1_HUMAN" → index 1 is the accession
+    # Build accession list.
+    # gene.gene_symbol holds the bare UniProt accession (set by _build_human_gene_map
+    # as split("|")[-1] of the FASTA header, which for UniProt = "P12345").
+    # gene.human_protein holds the full FASTA protein_id (e.g. "human|BRCA1_HUMAN"
+    # for the old mnemonic-based reheader_fasta behaviour).
+    # We prefer gene_symbol as it is already the clean accession.
+    def _get_accession(gene) -> str:
+        # Primary: gene_symbol is set to the bare accession by _build_human_gene_map
+        sym = (gene.gene_symbol or "").strip()
+        if sym and re.match(r"^[A-Z][A-Z0-9]{4,9}$", sym) and "_" not in sym:
+            return sym.upper()
+        # Fallback: parse from human_protein
+        raw = (gene.human_protein or "").strip()
+        if not raw:
+            return ""
+        parts = raw.split("|")
         if len(parts) >= 3:
             candidate = parts[1].split("-")[0].strip()
             if re.match(r"^[A-Z][A-Z0-9]{4,9}$", candidate) and "_" not in candidate:
                 return candidate.upper()
-        # Try each part: first one with no underscore and 5-10 chars is the accession
         for part in parts:
             candidate = part.split("-")[0].strip()
             if re.match(r"^[A-Z][A-Z0-9]{4,9}$", candidate) and "_" not in candidate:
                 return candidate.upper()
-        # Last resort: strip isoform suffix from the whole value
         return parts[-1].split("-")[0].strip().upper()
 
     fetch_args: list[tuple[str, str]] = []
     for gene in genes:
-        if not gene.human_protein:
-            continue
-        acc = _clean_accession(gene.human_protein)
-        fetch_args.append((gene.id, acc))
+        acc = _get_accession(gene)
+        if acc:
+            fetch_args.append((gene.id, acc))
 
     # ------------------------------------------------------------------ #
     # Fetch domains
