@@ -31,6 +31,7 @@ import shutil
 import subprocess
 import tempfile
 import uuid
+from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Optional
@@ -101,6 +102,31 @@ def build_msa(gene_id: str, region_type: str, session) -> Optional[Path]:
         for sid, seq in records
     ]
 
+    tmp = tempfile.NamedTemporaryFile(
+        suffix=".fa", delete=False, mode="w", prefix=f"msa_{gene_id[:8]}_{region_type}_"
+    )
+    SeqIO.write(fasta_records, tmp, "fasta")
+    tmp.close()
+    return Path(tmp.name)
+
+
+def build_msa_from_records(
+    gene_id: str,
+    region_type: str,
+    records: list[tuple[str, str]],
+) -> Optional[Path]:
+    """Build a FASTA MSA from pre-fetched (species_id, sequence) tuples.
+
+    Used by workers to avoid opening a DB connection per-thread.
+    Returns path to a temporary FASTA file, or None if too few species.
+    """
+    if len(records) < _MIN_SPECIES_FOR_PHYLOP:
+        return None
+    max_len = max(len(seq) for _, seq in records)
+    fasta_records = [
+        SeqRecord(Seq(seq.ljust(max_len, "-")), id=sid, description="")
+        for sid, seq in records
+    ]
     tmp = tempfile.NamedTemporaryFile(
         suffix=".fa", delete=False, mode="w", prefix=f"msa_{gene_id[:8]}_{region_type}_"
     )
@@ -379,28 +405,29 @@ def _upsert_phylo_score(session, gene_id: str, scores: dict[str, Optional[float]
 
 
 def _score_gene_worker(args: tuple) -> tuple[str, dict[str, Optional[float]]]:
-    """Process-pool worker: build MSAs and run phyloP/phastCons for one gene.
+    """Thread worker: build MSAs from pre-fetched sequences and run phyloP/phastCons.
 
-    Runs entirely in a subprocess-safe context: opens its own DB session,
-    writes to a private temp directory, and returns (gene_id, {field: score}).
+    Accepts pre-fetched sequences to avoid DB connection pool exhaustion when
+    running 60 concurrent threads.  No DB access in this function.
+
+    args: (gene_id, {region_type: [(species_id, sequence), ...]}, mod_path_str, tool)
     """
-    gene_id, mod_path_str, tool = args
+    gene_id, region_seqs, mod_path_str, tool = args
     mod_path = Path(mod_path_str)
 
     region_scores: dict[str, Optional[float]] = {}
     tmp_files: list[Path] = []
 
     try:
-        with get_session() as session:
-            for region_type in _REGION_TYPES:
-                msa_path = build_msa(gene_id, region_type, session)
-                if msa_path is None:
-                    continue
-                tmp_files.append(msa_path)
-
-                score = score_region(msa_path, mod_path, tool)
-                field = _REGION_TO_FIELD[region_type]
-                region_scores[field] = score
+        for region_type in _REGION_TYPES:
+            records = region_seqs.get(region_type, [])
+            msa_path = build_msa_from_records(gene_id, region_type, records)
+            if msa_path is None:
+                continue
+            tmp_files.append(msa_path)
+            score = score_region(msa_path, mod_path, tool)
+            field = _REGION_TO_FIELD[region_type]
+            region_scores[field] = score
     finally:
         for f in tmp_files:
             try:
@@ -467,11 +494,34 @@ def run_phylo_conservation(
                 r[0] for r in session.query(NucleotideRegion.gene_id).distinct().all()
             ]
 
+        # Bulk-fetch all nucleotide sequences in one query — avoids opening a
+        # DB connection per worker thread (which exhausts the connection pool).
+        log.info("Pre-fetching nucleotide sequences for %d genes...", len(gene_ids))
+        rows = (
+            session.query(
+                NucleotideRegion.gene_id,
+                NucleotideRegion.region_type,
+                NucleotideRegion.species_id,
+                NucleotideRegion.sequence,
+            )
+            .filter(NucleotideRegion.gene_id.in_(gene_ids))
+            .filter(NucleotideRegion.sequence.isnot(None))
+            .all()
+        )
+
+        # Build {gene_id: {region_type: [(species_id, sequence)]}}
+        gene_region_seqs: dict[str, dict[str, list[tuple[str, str]]]] = defaultdict(lambda: defaultdict(list))
+    for gene_id, region_type, species_id, sequence in rows:
+        gene_region_seqs[gene_id][region_type].append((species_id, sequence))
+
     log.info("Phylogenetic conservation scoring with %s for %d genes (parallel)...",
              tool, len(gene_ids))
 
     n_workers = int(get_tool_config().get("phylop_workers", min(60, max(1, (os.cpu_count() or 4) * 4))))
-    work_items = [(gid, str(mod_path), tool) for gid in gene_ids]
+    work_items = [
+        (gid, dict(gene_region_seqs.get(gid, {})), str(mod_path), tool)
+        for gid in gene_ids
+    ]
     done = 0
     total = len(work_items)
 
@@ -483,8 +533,7 @@ def run_phylo_conservation(
 
     # ThreadPoolExecutor: phyloP/phastCons are external subprocesses — they
     # release the GIL and are I/O-bound, so threads outperform processes here.
-    # 60 threads on 16 cores runs ~4 concurrent subprocesses per core, which
-    # is efficient for subprocess-heavy workloads.
+    # No DB access in workers — sequences pre-fetched above.
     with ThreadPoolExecutor(max_workers=n_workers) as pool:
         futures = {pool.submit(_score_gene_worker, item): item[0] for item in work_items}
         for future in as_completed(futures):
@@ -495,7 +544,7 @@ def run_phylo_conservation(
             except Exception as exc:
                 errors += 1
                 gid = futures[future]
-                if errors <= 3:  # log first 3 errors at WARNING with traceback for diagnosis
+                if errors <= 3:
                     log.warning("  phylo_conservation: worker error for gene %s: %s",
                                 gid, exc, exc_info=True)
                 else:
