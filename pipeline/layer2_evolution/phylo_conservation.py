@@ -232,20 +232,30 @@ def _prune_newick_ete3(newick: str, keep: set[str]) -> Optional[str]:
         return None
 
 
-def _prune_newick_tree_doctor(newick: str, keep: list[str]) -> Optional[str]:
-    """Prune Newick using PHAST's tree_doctor (bundled with phyloP/phastCons)."""
+def _pruned_mod_via_tree_doctor(mod_path: Path, species_in_msa: list[str]) -> Optional[Path]:
+    """Use PHAST's tree_doctor to prune a .mod file to only species_in_msa.
+
+    tree_doctor accepts .mod files directly and outputs a pruned .mod — no
+    manual TREE line editing required.
+    """
     if not shutil.which("tree_doctor"):
         return None
     try:
-        # tree_doctor reads from stdin when given - as input
+        tmp = tempfile.NamedTemporaryFile(suffix=".mod", delete=False, mode="w")
+        tmp.close()
         result = subprocess.run(
-            ["tree_doctor", "--prune-all-but", ",".join(keep), "-"],
-            input=newick, capture_output=True, text=True, timeout=30,
+            ["tree_doctor",
+             "--prune-all-but", ",".join(species_in_msa),
+             "--out-file", tmp.name,
+             str(mod_path)],
+            capture_output=True, text=True, timeout=30,
         )
-        if result.returncode == 0 and result.stdout.strip():
-            return result.stdout.strip()
-    except Exception:
-        pass
+        if result.returncode == 0 and Path(tmp.name).stat().st_size > 0:
+            return Path(tmp.name)
+        log.debug("tree_doctor failed (exit %d): %s", result.returncode, result.stderr[:200])
+        Path(tmp.name).unlink(missing_ok=True)
+    except Exception as exc:
+        log.debug("tree_doctor error: %s", exc)
     return None
 
 
@@ -253,27 +263,27 @@ def _pruned_mod(mod_path: Path, species_in_msa: list[str]) -> Optional[Path]:
     """Write a copy of the .mod file with the TREE pruned to only species_in_msa.
 
     phyloP errors with "no match for leaves of tree in alignment" when the MSA
-    contains a subset of species but the model tree has all 18 leaves.  We must
-    prune the tree in the .mod file to exactly the species present in the MSA.
+    contains a subset of species but the model tree has all 18 leaves.
 
-    Tries (in order): ETE3 → tree_doctor (PHAST) → returns None.
+    Tries (in order): tree_doctor (PHAST, most reliable) → ETE3 + manual edit.
     """
+    # Preferred: tree_doctor handles .mod files natively
+    result = _pruned_mod_via_tree_doctor(mod_path, species_in_msa)
+    if result is not None:
+        return result
+
+    # Fallback: ETE3 + manual TREE line replacement
     try:
         mod_text = mod_path.read_text()
         tree_match = re.search(r"^TREE:\s*(.+)$", mod_text, re.MULTILINE)
         if not tree_match:
             return None
-
         newick = tree_match.group(1).strip()
         keep = set(species_in_msa)
-
-        pruned_newick: Optional[str] = _prune_newick_ete3(newick, keep)
+        pruned_newick = _prune_newick_ete3(newick, keep)
         if pruned_newick is None:
-            pruned_newick = _prune_newick_tree_doctor(newick, species_in_msa)
-        if pruned_newick is None:
-            log.debug("_pruned_mod: no pruner available (ETE3/tree_doctor both failed) for %d species", len(species_in_msa))
+            log.debug("_pruned_mod: both tree_doctor and ETE3 failed for %d species", len(species_in_msa))
             return None
-
         pruned_mod = (mod_text[:tree_match.start(1)]
                       + pruned_newick
                       + mod_text[tree_match.end(1):])
@@ -282,7 +292,7 @@ def _pruned_mod(mod_path: Path, species_in_msa: list[str]) -> Optional[Path]:
         tmp.close()
         return Path(tmp.name)
     except Exception as exc:
-        log.debug("_pruned_mod failed: %s", exc)
+        log.debug("_pruned_mod ETE3 fallback failed: %s", exc)
         return None
 
 
