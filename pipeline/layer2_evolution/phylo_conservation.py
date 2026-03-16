@@ -30,6 +30,7 @@ import re
 import shutil
 import subprocess
 import tempfile
+import threading
 import uuid
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -284,41 +285,58 @@ def _pruned_mod_via_tree_doctor(mod_path: Path, species_in_msa: list[str]) -> Op
     return None
 
 
+# Cache of pruned .mod file content keyed by frozenset of species names.
+# Most genes share the same species subset, so this eliminates ~99% of
+# tree_doctor subprocess calls (38K calls → ~50 unique species sets).
+_mod_cache: dict[frozenset, str] = {}
+_mod_cache_lock = threading.Lock()
+
+
 def _pruned_mod(mod_path: Path, species_in_msa: list[str]) -> Optional[Path]:
-    """Write a copy of the .mod file with the TREE pruned to only species_in_msa.
+    """Write a pruned copy of the .mod file for the given species subset.
 
-    phyloP errors with "no match for leaves of tree in alignment" when the MSA
-    contains a subset of species but the model tree has all 18 leaves.
-
-    Tries (in order): tree_doctor (PHAST, most reliable) → ETE3 + manual edit.
+    Results are cached in memory by species set — tree_doctor is only called
+    once per unique species combination across all 12K+ gene workers.
     """
-    # Preferred: tree_doctor handles .mod files natively
-    result = _pruned_mod_via_tree_doctor(mod_path, species_in_msa)
-    if result is not None:
-        return result
+    cache_key = frozenset(species_in_msa)
 
-    # Fallback: ETE3 + manual TREE line replacement
-    try:
-        mod_text = mod_path.read_text()
-        tree_match = re.search(r"^TREE:\s*(.+)$", mod_text, re.MULTILINE)
-        if not tree_match:
-            return None
-        newick = tree_match.group(1).strip()
-        keep = set(species_in_msa)
-        pruned_newick = _prune_newick_ete3(newick, keep)
-        if pruned_newick is None:
-            log.debug("_pruned_mod: both tree_doctor and ETE3 failed for %d species", len(species_in_msa))
-            return None
-        pruned_mod = (mod_text[:tree_match.start(1)]
-                      + pruned_newick
-                      + mod_text[tree_match.end(1):])
-        tmp = tempfile.NamedTemporaryFile(suffix=".mod", delete=False, mode="w")
-        tmp.write(pruned_mod)
-        tmp.close()
-        return Path(tmp.name)
-    except Exception as exc:
-        log.debug("_pruned_mod ETE3 fallback failed: %s", exc)
-        return None
+    # Check cache first (read with lock)
+    with _mod_cache_lock:
+        cached_content = _mod_cache.get(cache_key)
+
+    if cached_content is None:
+        # Cache miss — call tree_doctor once and store content
+        tmp_path = _pruned_mod_via_tree_doctor(mod_path, sorted(species_in_msa))
+        if tmp_path is None:
+            # Fallback: ETE3 + manual TREE line replacement
+            try:
+                mod_text = mod_path.read_text()
+                tree_match = re.search(r"^TREE:\s*(.+)$", mod_text, re.MULTILINE)
+                if tree_match:
+                    newick = tree_match.group(1).strip()
+                    pruned_newick = _prune_newick_ete3(newick, set(species_in_msa))
+                    if pruned_newick is not None:
+                        cached_content = (mod_text[:tree_match.start(1)]
+                                          + pruned_newick
+                                          + mod_text[tree_match.end(1):])
+            except Exception as exc:
+                log.debug("_pruned_mod ETE3 fallback failed: %s", exc)
+            if cached_content is None:
+                log.debug("_pruned_mod: both tree_doctor and ETE3 failed for %d species",
+                          len(species_in_msa))
+                return None
+        else:
+            cached_content = tmp_path.read_text()
+            tmp_path.unlink(missing_ok=True)
+
+        with _mod_cache_lock:
+            _mod_cache[cache_key] = cached_content
+
+    # Write cached content to a fresh temp file for this call
+    tmp = tempfile.NamedTemporaryFile(suffix=".mod", delete=False, mode="w")
+    tmp.write(cached_content)
+    tmp.close()
+    return Path(tmp.name)
 
 
 def run_phylop(msa_path: Path, mod_path: Path) -> Optional[float]:
