@@ -30,6 +30,8 @@ def build_concatenated_alignment(
 
     Args:
         aligned_orthogroups: {og_id: {label: aligned_sequence}}
+            Labels are in the format "species_id|species_id|protein_id"
+            (OrthoFinder reheadered format).
         single_copy_only: If True, only use orthogroups with exactly one protein per species.
 
     Returns:
@@ -37,25 +39,44 @@ def build_concatenated_alignment(
     """
     species_ids = _collect_species_ids(aligned_orthogroups)
     if not species_ids:
+        log.error("build_concatenated_alignment: no species found in aligned_orthogroups "
+                  "(dict has %d entries)", len(aligned_orthogroups))
         return None
+
+    n_species = len(species_ids)
+    min_coverage = n_species * 0.8
+
+    # Diagnostic counters
+    n_multi_copy = 0
+    n_low_coverage = 0
 
     valid_ogs = []
     for og_id, seqs in aligned_orthogroups.items():
-        present_species = set()
+        present_species: dict[str, int] = {}
         for label in seqs:
             sid = label.split("|")[0]
-            present_species.add(sid)
+            present_species[sid] = present_species.get(sid, 0) + 1
 
-        # Single-copy: every species appears once
-        if single_copy_only and len(present_species) != len(seqs):
+        # Single-copy: each species appears at most once
+        if single_copy_only and any(v > 1 for v in present_species.values()):
+            n_multi_copy += 1
             continue
-        if len(present_species) < len(species_ids) * 0.8:
-            # Skip if less than 80% of species represented
+
+        if len(present_species) < min_coverage:
+            n_low_coverage += 1
             continue
+
         valid_ogs.append(og_id)
 
+    log.info(
+        "OG filter: %d total, %d single-copy & ≥80%% coverage, "
+        "%d rejected (multi-copy), %d rejected (low coverage, need ≥%.0f / %d species).",
+        len(aligned_orthogroups), len(valid_ogs),
+        n_multi_copy, n_low_coverage, min_coverage, n_species,
+    )
+
     if len(valid_ogs) < 10:
-        log.warning("Only %d single-copy orthogroups found — tree may be unreliable.", len(valid_ogs))
+        log.warning("Only %d valid orthogroups found — tree may be unreliable.", len(valid_ogs))
         if len(valid_ogs) == 0:
             return None
 
