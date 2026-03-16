@@ -1112,6 +1112,9 @@ def run_pipeline(
                 _cache_path.write_text(json.dumps(existing_cache, indent=2))
             except Exception as exc:
                 log.warning("Could not write step cache file: %s", exc)
+
+    except Exception as exc:
+        log.error("Pipeline FAILED at %s: %s", step_name, exc, exc_info=True)
         _mark_step(state, step_name, "failed")
         state["status"] = "failed"
         state["failed_at"] = _now_iso()
