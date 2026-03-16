@@ -118,7 +118,9 @@ def _mark_step(state: dict, step_name: str, status: str, elapsed: float | None =
                     run.status = "running"
                     session.commit()
         except Exception as exc:
-            log.warning("Could not update PipelineRun %s in DB: %s", run_id, exc) so imports work from any working directory
+            log.warning("Could not update PipelineRun %s in DB: %s", run_id, exc)
+
+# Add repo root to sys.path so imports work from any working directory
 sys.path.insert(0, str(_REPO_ROOT))
 
 
