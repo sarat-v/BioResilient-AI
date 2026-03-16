@@ -30,9 +30,11 @@ Result stored as DivergentMotif.motif_direction (string enum: 'gain_of_function'
 'loss_of_function', 'functional_shift', 'neutral').
 """
 
+import csv
+import gzip
 import logging
-import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from pathlib import Path
 from typing import Optional
 
 import psycopg2
@@ -40,16 +42,26 @@ import requests
 
 from db.models import DivergentMotif, Gene, Ortholog
 from db.session import get_session
-from pipeline.config import get_db_url, get_tool_config
+from pipeline.config import get_db_url, get_local_storage_root, get_tool_config
 
 log = logging.getLogger(__name__)
 
-GNOMAD_API = "https://gnomad.broadinstitute.org/api"
-GNOMAD_GENE_QUERY = """
+# gnomAD v4.1 bulk constraint TSV — one download covers all ~20k genes, no API needed.
+# Amazon S3 mirror is used on AWS EC2 for zero-cost, high-speed transfer within us-east-1.
+_GNOMAD_TSV_URL_S3 = (
+    "https://gnomad-public-us-east-1.s3.amazonaws.com"
+    "/release/4.1/constraint/gnomad.v4.1.constraint_metrics.tsv"
+)
+_GNOMAD_TSV_URL_GCS = (
+    "https://storage.googleapis.com/gcp-public-data--gnomad"
+    "/release/4.1/constraint/gnomad.v4.1.constraint_metrics.tsv"
+)
+# GraphQL fallback for genes absent from the TSV (rare, e.g. very new gene symbols)
+_GNOMAD_API = "https://gnomad.broadinstitute.org/api"
+_GNOMAD_GENE_QUERY = """
 {
   gene(gene_symbol: "%s", reference_genome: GRCh38) {
     gnomad_constraint {
-      pLI
       oe_lof_upper
     }
   }
@@ -57,95 +69,150 @@ GNOMAD_GENE_QUERY = """
 """
 
 # Classification thresholds — named constants so they can be found and changed together.
-_AM_PATHOGENIC_THRESHOLD = 0.6   # AlphaMissense: scores above this indicate high pathogenicity in human
-_ESM_DESTAB_THRESHOLD = -2.0     # ESM-1v LLR: scores below this indicate protein destabilisation
+_AM_PATHOGENIC_THRESHOLD = 0.6     # AlphaMissense: scores above this indicate high pathogenicity in human
+_ESM_DESTAB_THRESHOLD = -2.0       # ESM-1v LLR: scores below this indicate protein destabilisation
 _LOEUF_INTOLERANT_THRESHOLD = 0.5  # gnomAD LOEUF: scores at or below this indicate LoF intolerance
-_GNOMAD_RATE_LIMIT_SLEEP = 0.25  # seconds between gnomAD API requests
 
 # ---------------------------------------------------------------------------
-# gnomAD LOEUF fetch (cached in-process for a single run)
+# gnomAD constraint TSV — download once, parse into memory, cache to disk
 # ---------------------------------------------------------------------------
 
-_loeuf_cache: dict[str, Optional[float]] = {}
+
+def _tsv_cache_path() -> Path:
+    return Path(get_local_storage_root()) / "gnomad" / "gnomad.v4.1.constraint_metrics.tsv.gz"
 
 
-def _gnomad_workers() -> int:
-    """Return number of parallel gnomAD API workers from config (default 20)."""
-    return int(get_tool_config().get("gnomad_workers", 20))
+def _ensure_gnomad_tsv() -> Path:
+    """Download the gnomAD v4.1 constraint TSV if not already cached locally.
 
-
-def _fetch_loeuf(gene_symbol: str) -> Optional[float]:
-    """Fetch LOEUF (LoF o/e upper CI) for a human gene from gnomAD GraphQL API.
-
-    Returns a float in [0, 1+]. Lower = more LoF intolerant.
-    Caches results to avoid repeated requests.
-
-    Falls back to None (not pLI) when LOEUF is unavailable because pLI and LOEUF
-    are on incompatible scales — converting between them introduces spurious precision.
+    Uses the S3 mirror first (fast, free on EC2), falls back to GCS.
+    File is stored compressed to save ~75% disk space.
     """
-    if gene_symbol in _loeuf_cache:
-        return _loeuf_cache[gene_symbol]
+    dest = _tsv_cache_path()
+    if dest.exists():
+        log.info("gnomAD constraint TSV already cached at %s", dest)
+        return dest
 
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    tmp = dest.with_suffix(".tmp")
+
+    for url in (_GNOMAD_TSV_URL_S3, _GNOMAD_TSV_URL_GCS):
+        log.info("Downloading gnomAD constraint TSV from %s ...", url)
+        try:
+            with requests.get(url, stream=True, timeout=120) as r:
+                r.raise_for_status()
+                total_mb = int(r.headers.get("content-length", 0)) / 1_048_576
+                downloaded = 0
+                with gzip.open(tmp, "wt", encoding="utf-8") as fh:
+                    for chunk in r.iter_content(chunk_size=1 << 20):
+                        fh.write(chunk.decode("utf-8", errors="replace"))
+                        downloaded += len(chunk)
+                        if total_mb:
+                            log.info(
+                                "  gnomAD TSV: %.1f / %.1f MB downloaded (%.0f%%).",
+                                downloaded / 1_048_576,
+                                total_mb,
+                                100 * downloaded / (total_mb * 1_048_576),
+                            )
+            tmp.rename(dest)
+            log.info("gnomAD constraint TSV saved to %s", dest)
+            return dest
+        except Exception as exc:
+            log.warning("Failed to download gnomAD TSV from %s: %s", url, exc)
+            if tmp.exists():
+                tmp.unlink()
+
+    raise RuntimeError(
+        "Could not download gnomAD constraint TSV from S3 or GCS. "
+        "Check network access or place the file manually at: " + str(dest)
+    )
+
+
+def _load_loeuf_from_tsv() -> dict[str, float]:
+    """Parse the gnomAD v4.1 constraint TSV and return {gene_symbol: loeuf}.
+
+    Only canonical transcripts are used (one row per gene).
+    Genes without a valid numeric lof.oe_ci.upper are omitted — callers
+    treat missing entries as unknown (neutral classification).
+    """
+    path = _ensure_gnomad_tsv()
+    loeuf_map: dict[str, float] = {}
+
+    open_fn = gzip.open if str(path).endswith(".gz") else open
+    with open_fn(path, "rt", encoding="utf-8") as fh:
+        reader = csv.DictReader(fh, delimiter="\t")
+        for row in reader:
+            # Keep only canonical transcripts to get one row per gene
+            if row.get("canonical", "").lower() != "true":
+                continue
+            gene = row.get("gene", "").strip()
+            raw = row.get("lof.oe_ci.upper", "").strip()
+            if not gene or not raw or raw in ("NA", ""):
+                continue
+            try:
+                loeuf_map[gene] = float(raw)
+            except ValueError:
+                continue
+
+    log.info("gnomAD TSV loaded: LOEUF available for %d genes.", len(loeuf_map))
+    return loeuf_map
+
+
+def _fetch_loeuf_api(gene_symbol: str) -> Optional[float]:
+    """GraphQL fallback for a single gene not found in the TSV (rare)."""
     try:
         r = requests.post(
-            GNOMAD_API,
-            json={"query": GNOMAD_GENE_QUERY % gene_symbol},
+            _GNOMAD_API,
+            json={"query": _GNOMAD_GENE_QUERY % gene_symbol},
             timeout=15,
         )
         if r.status_code == 200:
-            data = r.json()
-            gene_data = data.get("data", {}).get("gene", {})
-            constraint = gene_data.get("gnomad_constraint") or {}
-            loeuf = constraint.get("oe_lof_upper")
-            if loeuf is not None:
-                _loeuf_cache[gene_symbol] = float(loeuf)
-                return _loeuf_cache[gene_symbol]
-            # No LOEUF available — do not fall back to pLI since the scales are
-            # incompatible. Return None and let the caller treat unknown as neutral.
-            log.debug("No LOEUF for %s (pLI available but not used as proxy)", gene_symbol)
-        else:
-            log.debug("gnomAD API returned %d for gene %s", r.status_code, gene_symbol)
+            constraint = (
+                r.json().get("data", {}).get("gene", {}).get("gnomad_constraint") or {}
+            )
+            val = constraint.get("oe_lof_upper")
+            if val is not None:
+                return float(val)
     except Exception as exc:
-        log.debug("gnomAD LOEUF fetch error for %s: %s", gene_symbol, exc)
-
-    _loeuf_cache[gene_symbol] = None
+        log.debug("gnomAD API fallback error for %s: %s", gene_symbol, exc)
     return None
 
 
 def _fetch_loeuf_bulk(gene_symbols: set[str]) -> dict[str, Optional[float]]:
-    """Fetch LOEUF for many gene symbols in parallel using a thread pool.
+    """Return {gene_symbol: loeuf_or_None} for every requested symbol.
 
-    Returns {gene_symbol: loeuf_or_None} for every input symbol.
-    Already-cached symbols are returned immediately without a network call.
+    Primary strategy: parse the gnomAD v4.1 constraint TSV (one download,
+    ~20 MB, covers all ~20k genes, zero per-gene API calls).
+
+    Fallback: GraphQL API for any symbols not found in the TSV (e.g. very
+    recently named genes or non-coding RNA symbols).
     """
+    tsv_map = _load_loeuf_from_tsv()
+
     result: dict[str, Optional[float]] = {}
-    to_fetch = [gs for gs in gene_symbols if gs not in _loeuf_cache]
-    # Return cached hits immediately
+    missing: list[str] = []
     for gs in gene_symbols:
-        if gs in _loeuf_cache:
-            result[gs] = _loeuf_cache[gs]
+        if gs in tsv_map:
+            result[gs] = tsv_map[gs]
+        else:
+            missing.append(gs)
 
-    if not to_fetch:
-        return result
+    tsv_hit_pct = 100 * len(result) / len(gene_symbols) if gene_symbols else 0
+    log.info(
+        "gnomAD LOEUF: %d / %d symbols resolved from TSV (%.0f%%). "
+        "%d will fall back to API.",
+        len(result), len(gene_symbols), tsv_hit_pct, len(missing),
+    )
 
-    workers = _gnomad_workers()
-    log.info("  Fetching gnomAD LOEUF for %d unique gene symbols (%d workers)...",
-             len(to_fetch), workers)
-
-    def _worker(gs: str) -> tuple[str, Optional[float]]:
-        return gs, _fetch_loeuf(gs)
-
-    done = 0
-    total = len(to_fetch)
-    with ThreadPoolExecutor(max_workers=workers) as pool:
-        futures = {pool.submit(_worker, gs): gs for gs in to_fetch}
-        for future in as_completed(futures):
-            gs, loeuf = future.result()
-            result[gs] = loeuf
-            done += 1
-            if done % 500 == 0 or done == total:
-                log.info("  gnomAD LOEUF: %d / %d symbols fetched (%.0f%%).",
-                         done, total, 100 * done / total)
+    if missing:
+        workers = int(get_tool_config().get("gnomad_workers", 20))
+        log.info("  gnomAD API fallback: fetching %d symbols (%d workers)...",
+                 len(missing), workers)
+        with ThreadPoolExecutor(max_workers=workers) as pool:
+            futures = {pool.submit(_fetch_loeuf_api, gs): gs for gs in missing}
+            for future in as_completed(futures):
+                gs = futures[future]
+                result[gs] = future.result()
 
     return result
 
