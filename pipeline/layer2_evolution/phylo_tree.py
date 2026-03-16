@@ -23,7 +23,7 @@ log = logging.getLogger(__name__)
 def build_concatenated_alignment(
     aligned_orthogroups: dict[str, dict[str, str]],
     single_copy_only: bool = True,
-    max_ogs: int = 200,
+    max_ogs: int = 500,
 ) -> Optional[dict[str, str]]:
     """Build a concatenated super-alignment from single-copy orthogroups.
 
@@ -126,7 +126,7 @@ def _collect_species_ids(aligned_orthogroups: dict[str, dict[str, str]]) -> set[
 
 def _max_ogs() -> int:
     """Max OGs for concatenated alignment — configurable via iqtree_max_ogs in environment.yml."""
-    return int(get_tool_config().get("iqtree_max_ogs", 200))
+    return int(get_tool_config().get("iqtree_max_ogs", 500))
 
 
 def run_iqtree(concat_alignment: dict[str, str]) -> Path:
