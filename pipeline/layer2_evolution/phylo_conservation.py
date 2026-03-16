@@ -235,25 +235,24 @@ def _prune_newick_ete3(newick: str, keep: set[str]) -> Optional[str]:
 def _pruned_mod_via_tree_doctor(mod_path: Path, species_in_msa: list[str]) -> Optional[Path]:
     """Use PHAST's tree_doctor to prune a .mod file to only species_in_msa.
 
-    tree_doctor accepts .mod files directly and outputs a pruned .mod — no
-    manual TREE line editing required.
+    tree_doctor writes the pruned .mod to stdout — capture it and write to a
+    temp file for use by phyloP.
     """
     if not shutil.which("tree_doctor"):
         return None
     try:
-        tmp = tempfile.NamedTemporaryFile(suffix=".mod", delete=False, mode="w")
-        tmp.close()
         result = subprocess.run(
             ["tree_doctor",
              "--prune-all-but", ",".join(species_in_msa),
-             "--out-file", tmp.name,
              str(mod_path)],
             capture_output=True, text=True, timeout=30,
         )
-        if result.returncode == 0 and Path(tmp.name).stat().st_size > 0:
+        if result.returncode == 0 and result.stdout.strip():
+            tmp = tempfile.NamedTemporaryFile(suffix=".mod", delete=False, mode="w")
+            tmp.write(result.stdout)
+            tmp.close()
             return Path(tmp.name)
         log.debug("tree_doctor failed (exit %d): %s", result.returncode, result.stderr[:200])
-        Path(tmp.name).unlink(missing_ok=True)
     except Exception as exc:
         log.debug("tree_doctor error: %s", exc)
     return None
