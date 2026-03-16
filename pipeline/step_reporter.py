@@ -514,16 +514,18 @@ def _collect_step4() -> dict:
         )
         data["lineage_motif_coverage"] = dict(lineage_q)
 
-        # Top 20 genes by motif count, with avg divergence score as tiebreaker
+        # Top 20 genes ranked by distinct species showing divergence (most broadly diverged genes)
         top_genes = (
             s.query(
                 Ortholog.gene_id,
-                func.count(DivergentMotif.id),
-                func.avg(DivergentMotif.divergence_score),
+                func.count(DivergentMotif.id).label("motif_count"),
+                func.count(func.distinct(Ortholog.species_id)).label("species_count"),
+                func.avg(DivergentMotif.divergence_score).label("avg_div"),
             )
             .join(DivergentMotif, DivergentMotif.ortholog_id == Ortholog.id)
             .group_by(Ortholog.gene_id)
             .order_by(
+                func.count(func.distinct(Ortholog.species_id)).desc(),
                 func.count(DivergentMotif.id).desc(),
                 func.avg(DivergentMotif.divergence_score).desc(),
             )
@@ -537,9 +539,10 @@ def _collect_step4() -> dict:
                 "gene_id": gid,
                 "symbol": gene_symbols.get(gid, gid),
                 "motif_count": n,
+                "species_count": sp,
                 "avg_divergence": round(float(avg_div), 4) if avg_div else None,
             }
-            for gid, n, avg_div in top_genes
+            for gid, n, sp, avg_div in top_genes
         ]
     return data
 
@@ -1482,13 +1485,14 @@ def _render_md(step: str, data: dict, vr: ValidationResult) -> str:
                 lines.append(f"- {lg}: {n:,}")
         top = data.get("top20_genes_by_motifs", [])
         if top:
-            lines += ["", "**Top 20 genes by motif count (tiebroken by avg divergence score):**", ""]
-            lines.append("| Gene | Motif count | Avg divergence |")
-            lines.append("|------|------------|----------------|")
+            lines += ["", "**Top 20 genes by species breadth (most independently diverged):**", ""]
+            lines.append("| Gene | Species diverged | Motif count | Avg divergence |")
+            lines.append("|------|-----------------|-------------|----------------|")
             for r in top:
                 avg = r.get("avg_divergence")
                 avg_str = f"{avg:.4f}" if avg is not None else "—"
-                lines.append(f"| {r['symbol']} | {r['motif_count']} | {avg_str} |")
+                sp = r.get("species_count", "—")
+                lines.append(f"| {r['symbol']} | {sp} | {r['motif_count']} | {avg_str} |")
         if step == "step4b":
             lines.append(f"\n- Motifs in functional domains: {data.get('motifs_in_functional_domain', 0):,} ({data.get('domain_pct', 0)}%)")
             lines.append(f"- AlphaMissense scored: {data.get('am_scored_count', 0):,} ({data.get('am_pct_coverage', 0)}%)")
