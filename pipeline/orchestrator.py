@@ -433,9 +433,9 @@ def step5_phylogenetic_tree(
         return Path("/tmp/mock.treefile")
 
     from pipeline.config import get_local_storage_root, sync_to_s3
-    from pipeline.layer2_evolution.phylo_tree import build_concatenated_alignment, run_iqtree
+    from pipeline.layer2_evolution.phylo_tree import build_concatenated_alignment, run_iqtree, _max_ogs
 
-    concat = build_concatenated_alignment(aligned_orthogroups)
+    concat = build_concatenated_alignment(aligned_orthogroups, max_ogs=_max_ogs())
     if concat is None:
         raise RuntimeError("Not enough single-copy orthogroups to build species tree.")
 
