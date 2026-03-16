@@ -23,6 +23,7 @@ log = logging.getLogger(__name__)
 def build_concatenated_alignment(
     aligned_orthogroups: dict[str, dict[str, str]],
     single_copy_only: bool = True,
+    max_ogs: int = 500,
 ) -> Optional[dict[str, str]]:
     """Build a concatenated super-alignment from single-copy orthogroups.
 
@@ -33,6 +34,8 @@ def build_concatenated_alignment(
             Labels are in the format "species_id|species_id|protein_id"
             (OrthoFinder reheadered format).
         single_copy_only: If True, only use orthogroups with exactly one protein per species.
+        max_ogs: Maximum number of orthogroups to include. Capped to keep memory manageable
+            for IQ-TREE — 500 OGs is more than sufficient for 18-species topology.
 
     Returns:
         {species_id: concatenated_alignment_string} or None if too few orthogroups.
@@ -80,6 +83,15 @@ def build_concatenated_alignment(
         if len(valid_ogs) == 0:
             return None
 
+    # Cap OG count to keep IQ-TREE memory usage manageable.
+    # 500 OGs × ~900 aa avg × 18 species ≈ 8M columns — more than enough for topology.
+    if len(valid_ogs) > max_ogs:
+        # Prefer OGs with highest species coverage (most informative)
+        def _coverage(og_id: str) -> int:
+            return len({lbl.split("|")[0] for lbl in aligned_orthogroups[og_id]})
+        valid_ogs = sorted(valid_ogs, key=_coverage, reverse=True)[:max_ogs]
+        log.info("Capped to top %d orthogroups by species coverage.", max_ogs)
+
     log.info("Building concatenated alignment from %d orthogroups...", len(valid_ogs))
 
     concat: dict[str, list[str]] = {sid: [] for sid in species_ids}
@@ -125,6 +137,11 @@ def run_iqtree(concat_alignment: dict[str, str]) -> Path:
     threads = cfg.get("iqtree_threads", "AUTO")
     bootstrap = cfg.get("iqtree_bootstrap", 1000)
 
+    # IQ-TREE's AUTO thread detection runs a memory-intensive benchmarking phase
+    # that can OOM on large alignments. Pin to a safe default when AUTO is set.
+    if str(threads).upper() == "AUTO":
+        threads = 4
+
     root = Path(get_local_storage_root())
     tree_dir = root / "phylo"
     tree_dir.mkdir(parents=True, exist_ok=True)
@@ -148,6 +165,7 @@ def run_iqtree(concat_alignment: dict[str, str]) -> Path:
         "-s", str(fasta_path),
         "-m", "TEST",
         "-T", str(threads),
+        "--mem", "20G",       # hard cap to avoid OOM on 30GB instances
         "-o", "human",
         "--prefix", str(tree_dir / "species"),
         "--redo",
