@@ -30,8 +30,8 @@ log = logging.getLogger(__name__)
 INTERPRO_API = "https://www.ebi.ac.uk/interpro/api"
 REQUEST_TIMEOUT = 20
 RETRY_DELAY = 2.0
-# InterPro allows ~20 concurrent connections without triggering rate limits
-_FETCH_WORKERS = 20
+# InterPro tolerates ~50 concurrent connections before rate limiting
+_FETCH_WORKERS = 50
 
 
 def _cache_path(accession: str) -> Path:
@@ -158,7 +158,18 @@ def annotate_motif_domains(gene_ids: Optional[list[str]] = None) -> int:
             q = q.filter(Gene.id.in_(gene_ids))
         genes = q.all()
 
-    log.info("Annotating Pfam domains for %d genes (%d workers)...", len(genes), _FETCH_WORKERS)
+        # Only process genes that actually have divergent motifs — skip the rest
+        genes_with_motifs = {
+            row[0] for row in
+            session.query(Ortholog.gene_id)
+            .join(DivergentMotif, DivergentMotif.ortholog_id == Ortholog.id)
+            .distinct()
+            .all()
+        }
+        genes = [g for g in genes if g.id in genes_with_motifs]
+
+    log.info("Annotating Pfam domains for %d genes with motifs (%d workers)...",
+             len(genes), _FETCH_WORKERS)
 
     # Build list of (gene_id, accession) to fetch
     fetch_args = []
