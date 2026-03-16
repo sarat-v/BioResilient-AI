@@ -495,7 +495,11 @@ def run_phylo_conservation(
             except Exception as exc:
                 errors += 1
                 gid = futures[future]
-                log.debug("  phylo_conservation: worker error for gene %s: %s", gid, exc)
+                if errors <= 3:  # log first 3 errors at WARNING with traceback for diagnosis
+                    log.warning("  phylo_conservation: worker error for gene %s: %s",
+                                gid, exc, exc_info=True)
+                else:
+                    log.debug("  phylo_conservation: worker error for gene %s: %s", gid, exc)
             done += 1
             if done % 100 == 0 or done == total:
                 log.info("  phylo_conservation: %d / %d genes (%.0f%%) — %d scored, %d errors.",
