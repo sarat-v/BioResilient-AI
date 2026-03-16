@@ -27,9 +27,12 @@ The TSV format:
 """
 
 import gzip
+import json
 import logging
 import re
+import time
 from collections import defaultdict
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Optional
 
@@ -37,7 +40,7 @@ import requests
 
 from db.models import DivergentMotif, Gene, Ortholog
 from db.session import get_session
-from pipeline.config import get_local_storage_root
+from pipeline.config import get_local_storage_root, get_tool_config
 
 log = logging.getLogger(__name__)
 
@@ -125,48 +128,157 @@ def _extract_uniprot_accession(raw: str) -> Optional[str]:
     return None
 
 
-def _get_target_accessions() -> Optional[set[str]]:
-    """Return the set of UniProt accessions present in our Gene table.
+def _get_gene_accession_map() -> dict[str, str]:
+    """Return {gene_id: uniprot_accession} for all genes in the Gene table.
 
-    Uses gene_symbol first (set by _build_human_gene_map as the bare accession),
-    then falls back to parsing human_protein.
-
-    Returns None if no valid accessions can be extracted, which signals
-    build_am_index() to load the full unfiltered index.
+    Handles both databases that store bare accessions (P12345) and those that
+    store mnemonics (BRCA1_HUMAN). Mnemonics are resolved via UniProt API
+    and cached on disk.
     """
-    accessions: set[str] = set()
-    fallback_count = 0
+    accession_map: dict[str, str] = {}
+    mnemonic_genes: dict[str, str] = {}  # gene_id → mnemonic
 
     with get_session() as session:
         for gene in session.query(Gene).all():
-            # gene_symbol is set to the bare accession by _build_human_gene_map
-            sym = (gene.gene_symbol or "").strip()
-            if sym and re.match(r"^[A-Z][A-Z0-9]{4,9}$", sym) and "_" not in sym:
-                accessions.add(sym.upper())
+            sym = (gene.gene_symbol or "").strip().upper()
+            if not sym:
                 continue
-            # Fallback: parse from human_protein
-            acc = _extract_uniprot_accession(gene.human_protein or "")
-            if acc:
-                accessions.add(acc)
+            # Already a bare accession?
+            if re.match(r"^[A-Z][A-Z0-9]{4,9}$", sym) and "_" not in sym:
+                accession_map[gene.id] = sym
+            elif _is_mnemonic(sym):
+                mnemonic_genes[gene.id] = sym
             else:
-                fallback_count += 1
+                acc = _extract_uniprot_accession(gene.human_protein or "")
+                if acc:
+                    accession_map[gene.id] = acc
+                else:
+                    mnemonic_genes[gene.id] = sym  # try as mnemonic anyway
 
-    if not accessions:
-        log.warning(
-            "Could not extract UniProt accessions from Gene table "
-            "(%d rows with non-standard IDs). "
-            "Loading full AlphaMissense index without filtering.",
-            fallback_count,
-        )
+    if mnemonic_genes:
+        log.info("Resolving %d UniProt mnemonics to accessions...", len(mnemonic_genes))
+        unique_mnemonics = list(set(mnemonic_genes.values()))
+        resolved = resolve_mnemonics_to_accessions(unique_mnemonics)
+        for gene_id, mnemonic in mnemonic_genes.items():
+            if mnemonic in resolved:
+                accession_map[gene_id] = resolved[mnemonic]
+
+    log.info("Resolved %d / %d genes to UniProt accessions.",
+             len(accession_map), len(accession_map) + len(mnemonic_genes) - sum(
+                 1 for gid in mnemonic_genes if gid in accession_map))
+    return accession_map
+
+
+def _get_target_accessions() -> Optional[set[str]]:
+    """Return the set of UniProt accessions for all genes, resolving mnemonics.
+
+    Returns None only if the Gene table is empty or all lookups fail.
+    """
+    acc_map = _get_gene_accession_map()
+    if not acc_map:
+        log.warning("No UniProt accessions found — loading full AlphaMissense index.")
         return None
-
-    log.info("Collected %d target UniProt accessions for AlphaMissense filtering.", len(accessions))
-    return accessions
-
-    return accessions
+    return set(acc_map.values())
 
 
 _UNSET = object()  # sentinel — distinct from None which means "load all variants"
+
+UNIPROT_ACCESSIONS_API = "https://rest.uniprot.org/uniprotkb/accessions"
+_MNEMONIC_CACHE_FILE = "mnemonic_to_accession.json"
+_MNEMONIC_BATCH = 200
+_MNEMONIC_TIMEOUT = 30
+
+
+def _mnemonic_cache_path() -> Path:
+    root = Path(get_local_storage_root()) / "alphamissense"
+    root.mkdir(parents=True, exist_ok=True)
+    return root / _MNEMONIC_CACHE_FILE
+
+
+def resolve_mnemonics_to_accessions(mnemonics: list[str]) -> dict[str, str]:
+    """Resolve UniProt mnemonics (e.g. 'BRCA1_HUMAN') to accessions ('P38398').
+
+    Uses the UniProt /accessions endpoint with mnemonic IDs (UniProt accepts
+    both accessions and mnemonic IDs in the ?accessions= parameter).
+    Results are cached on disk so subsequent calls are free.
+
+    Returns {mnemonic: accession} for every mnemonic that could be resolved.
+    Unresolvable mnemonics are absent from the result dict.
+    """
+    cache_path = _mnemonic_cache_path()
+    cache: dict[str, str] = {}
+    if cache_path.exists():
+        try:
+            cache = json.loads(cache_path.read_text())
+        except Exception:
+            cache = {}
+
+    to_fetch = [m for m in mnemonics if m not in cache]
+    if not to_fetch:
+        return {m: cache[m] for m in mnemonics if m in cache}
+
+    log.info("Resolving %d UniProt mnemonics to accessions (%d cached)...",
+             len(to_fetch), len(mnemonics) - len(to_fetch))
+
+    def _fetch_batch(batch: list[str]) -> list[tuple[str, str]]:
+        """Returns [(mnemonic, accession), ...] for the batch."""
+        params = {
+            "accessions": ",".join(batch),
+            "fields": "accession,id",   # id = mnemonic
+            "format": "json",
+        }
+        for attempt in range(3):
+            try:
+                r = requests.get(UNIPROT_ACCESSIONS_API, params=params,
+                                 timeout=_MNEMONIC_TIMEOUT)
+                if r.status_code == 200:
+                    pairs = []
+                    for entry in r.json().get("results", []):
+                        acc = entry.get("primaryAccession", "").upper()
+                        mnemonic = entry.get("uniProtkbId", "").upper()
+                        if acc and mnemonic:
+                            pairs.append((mnemonic, acc))
+                    return pairs
+                if r.status_code == 429:
+                    time.sleep(2 * (attempt + 1))
+                else:
+                    log.debug("UniProt mnemonic batch HTTP %d: %s", r.status_code, r.text[:100])
+                    break
+            except Exception as exc:
+                log.debug("UniProt mnemonic fetch error: %s", exc)
+                time.sleep(attempt + 1)
+        return []
+
+    workers = int(get_tool_config().get("uniprot_batch_workers", 4))
+    batches = [to_fetch[i:i + _MNEMONIC_BATCH]
+               for i in range(0, len(to_fetch), _MNEMONIC_BATCH)]
+
+    new_pairs: list[tuple[str, str]] = []
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        futures = {pool.submit(_fetch_batch, b): b for b in batches}
+        done = 0
+        for future in as_completed(futures):
+            new_pairs.extend(future.result())
+            done += 1
+            if done % 10 == 0 or done == len(batches):
+                log.info("  Mnemonic resolution: %d / %d batches done.", done, len(batches))
+
+    for mnemonic, accession in new_pairs:
+        cache[mnemonic] = accession
+
+    try:
+        cache_path.write_text(json.dumps(cache))
+    except Exception as exc:
+        log.debug("Mnemonic cache write failed: %s", exc)
+
+    log.info("Resolved %d / %d mnemonics to UniProt accessions.",
+             len(new_pairs), len(to_fetch))
+    return {m: cache[m] for m in mnemonics if m in cache}
+
+
+def _is_mnemonic(s: str) -> bool:
+    """Return True if s looks like a UniProt mnemonic (GENE_SPECIES format)."""
+    return bool(s and "_" in s and re.match(r"^[A-Z0-9]+_[A-Z]+$", s))
 
 
 def build_am_index(
@@ -296,6 +408,9 @@ def annotate_motif_consequences(
     """
     scored = 0
 
+    # Build gene_id → accession map once (handles mnemonic resolution)
+    gene_accession_map = _get_gene_accession_map()
+
     with get_session() as session:
         q = session.query(Gene)
         if gene_ids:
@@ -303,22 +418,18 @@ def annotate_motif_consequences(
         genes = q.all()
 
         log.info("Scoring AlphaMissense consequences for %d genes...", len(genes))
+        no_acc = 0
+        no_data = 0
 
         for gene in genes:
-            # Use gene_symbol (bare accession) as primary; fall back to parsing human_protein.
-            sym = (gene.gene_symbol or "").strip()
-            if sym and re.match(r"^[A-Z][A-Z0-9]{4,9}$", sym) and "_" not in sym:
-                accession = sym.upper()
-            else:
-                accession = _extract_uniprot_accession(gene.human_protein or "") or ""
-                if not accession:
-                    # Last resort bare strip
-                    accession = (gene.human_protein or "").split("-")[0].strip().upper()
+            accession = gene_accession_map.get(gene.id)
             if not accession:
+                no_acc += 1
                 continue
 
             protein_am = am_index.get(accession)
             if not protein_am:
+                no_data += 1
                 continue
 
             motifs = (
@@ -341,6 +452,10 @@ def annotate_motif_consequences(
 
         session.commit()
 
+    if no_acc:
+        log.info("  %d genes had no resolvable UniProt accession.", no_acc)
+    if no_data:
+        log.info("  %d genes had no AlphaMissense data (accession not in TSV).", no_data)
     log.info("AlphaMissense annotation complete: %d motifs scored.", scored)
     return scored
 

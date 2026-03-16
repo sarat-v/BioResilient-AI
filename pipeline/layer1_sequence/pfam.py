@@ -422,6 +422,20 @@ def annotate_motif_domains(gene_ids: Optional[list[str]] = None) -> int:
         if acc:
             fetch_args.append((gene.id, acc))
 
+    # If all genes still have mnemonics (no valid accessions found), resolve them
+    if fetch_args and all("_" in acc for _, acc in fetch_args):
+        log.info("All %d genes have mnemonic IDs — resolving to UniProt accessions...",
+                 len(fetch_args))
+        from pipeline.layer1_sequence.alphamissense import resolve_mnemonics_to_accessions
+        mnemonics = [acc for _, acc in fetch_args]
+        mnemonic_map = resolve_mnemonics_to_accessions(list(set(mnemonics)))
+        fetch_args = [
+            (gene_id, mnemonic_map[acc])
+            for gene_id, acc in fetch_args
+            if acc in mnemonic_map
+        ]
+        log.info("  Resolved %d / %d genes to accessions.", len(fetch_args), len(genes))
+
     # ------------------------------------------------------------------ #
     # Fetch domains
     # ------------------------------------------------------------------ #
