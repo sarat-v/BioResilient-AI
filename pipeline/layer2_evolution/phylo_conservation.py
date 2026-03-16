@@ -30,7 +30,7 @@ import shutil
 import subprocess
 import tempfile
 import uuid
-from concurrent.futures import ProcessPoolExecutor, as_completed
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Optional
 
@@ -374,20 +374,24 @@ def run_phylo_conservation(
     log.info("Phylogenetic conservation scoring with %s for %d genes (parallel)...",
              tool, len(gene_ids))
 
-    n_workers = max(1, (os.cpu_count() or 4) - 1)
+    n_workers = int(get_tool_config().get("phylop_workers", min(60, max(1, (os.cpu_count() or 4) * 4))))
     work_items = [(gid, str(mod_path), tool) for gid in gene_ids]
     all_results: dict[str, dict[str, Optional[float]]] = {}
     done = 0
     total = len(work_items)
 
-    with ProcessPoolExecutor(max_workers=n_workers) as pool:
+    # ThreadPoolExecutor: phyloP/phastCons are external subprocesses — they
+    # release the GIL and are I/O-bound, so threads outperform processes here.
+    # 60 threads on 16 cores runs ~4 concurrent subprocesses per core, which
+    # is efficient for subprocess-heavy workloads.
+    with ThreadPoolExecutor(max_workers=n_workers) as pool:
         futures = {pool.submit(_score_gene_worker, item): item[0] for item in work_items}
         for future in as_completed(futures):
             gene_id, region_scores = future.result()
             if any(v is not None for v in region_scores.values()):
                 all_results[gene_id] = region_scores
             done += 1
-            if done % 500 == 0 or done == total:
+            if done % 100 == 0 or done == total:
                 log.info("  phylo_conservation: %d / %d genes (%.0f%%).",
                          done, total, 100 * done / total)
 
