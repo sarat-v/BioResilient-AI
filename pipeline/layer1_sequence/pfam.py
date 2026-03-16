@@ -32,7 +32,7 @@ import requests
 
 from db.models import DivergentMotif, Gene, Ortholog
 from db.session import get_session
-from pipeline.config import get_storage_root, get_tool_config
+from pipeline.config import get_local_storage_root, get_tool_config
 
 log = logging.getLogger(__name__)
 
@@ -86,7 +86,7 @@ _INTERPRO_DOMAIN_TYPES = {"domain", "family", "homologous_superfamily", "repeat"
 # --------------------------------------------------------------------------- #
 
 def _cache_path(accession: str) -> Path:
-    root = Path(get_storage_root()) / "pfam"
+    root = Path(get_local_storage_root()) / "pfam"
     root.mkdir(parents=True, exist_ok=True)
     return root / f"{accession}.json"
 

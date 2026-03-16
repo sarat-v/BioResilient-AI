@@ -17,7 +17,7 @@ import pandas as pd
 
 from db.models import CandidateScore, ExpressionResult, Gene, Ortholog
 from db.session import get_session
-from pipeline.config import get_ncbi_api_key, get_ncbi_email, get_storage_root, get_thresholds
+from pipeline.config import get_ncbi_api_key, get_ncbi_email, get_local_storage_root, get_thresholds
 
 log = logging.getLogger(__name__)
 
@@ -299,7 +299,7 @@ def run_expression_pipeline(species_list: list[dict]) -> dict[str, dict[str, flo
 
     Returns {species_id: {gene_symbol: expression_score}}
     """
-    root = Path(get_storage_root())
+    root = Path(get_local_storage_root())
     geo_dir = root / "geo_data"
     geo_dir.mkdir(parents=True, exist_ok=True)
 

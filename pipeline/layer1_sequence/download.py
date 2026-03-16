@@ -22,7 +22,7 @@ from Bio import SeqIO
 from pipeline.config import (
     get_ncbi_api_key,
     get_ncbi_email,
-    get_storage_root,
+    get_local_storage_root,
     get_deployment,
     sync_to_s3,
 )
@@ -48,12 +48,7 @@ def _ncbi_params(extra: dict) -> dict:
 
 
 def _proteomes_dir() -> Path:
-    root = get_storage_root()
-    if root.startswith("s3://"):
-        # For cloud, still cache locally under /tmp
-        d = Path("/tmp/bioresilient/proteomes")
-    else:
-        d = Path(root) / "proteomes"
+    d = Path(get_local_storage_root()) / "proteomes"
     d.mkdir(parents=True, exist_ok=True)
     return d
 

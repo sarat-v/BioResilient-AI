@@ -330,8 +330,8 @@ def _collect_step2() -> dict:
         ]
 
     # Count proteins per FASTA
-    from pipeline.config import get_storage_root, get_deployment
-    storage = get_storage_root()
+    from pipeline.config import get_local_storage_root, get_deployment
+    storage = get_local_storage_root()
     if storage.startswith("s3://"):
         proteomes_dir = Path("/tmp/bioresilient/proteomes")
     else:
@@ -701,10 +701,10 @@ def _collect_step4d() -> dict:
 
 
 def _collect_step5() -> dict:
-    from pipeline.config import get_storage_root
+    from pipeline.config import get_local_storage_root
 
     data: dict[str, Any] = {"step": "step5", "timestamp": _now()}
-    treefile = Path(get_storage_root()) / "phylo" / "species.treefile"
+    treefile = Path(get_local_storage_root()) / "phylo" / "species.treefile"
     data["treefile_exists"] = treefile.exists()
     data["treefile_path"] = str(treefile)
 

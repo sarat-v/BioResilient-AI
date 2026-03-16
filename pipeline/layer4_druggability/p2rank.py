@@ -28,13 +28,13 @@ from typing import Optional
 
 from db.models import DrugTarget, Gene
 from db.session import get_session
-from pipeline.config import get_storage_root, get_tool_config
+from pipeline.config import get_local_storage_root, get_tool_config
 
 log = logging.getLogger(__name__)
 
 
 def _p2rank_output_dir(pdb_path: Path) -> Path:
-    root = Path(get_storage_root()) / "p2rank"
+    root = Path(get_local_storage_root()) / "p2rank"
     root.mkdir(parents=True, exist_ok=True)
     return root / pdb_path.stem
 

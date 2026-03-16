@@ -24,7 +24,7 @@ import requests
 
 from db.models import DivergentMotif, EvolutionScore, Gene, Ortholog, Species
 from db.session import get_session
-from pipeline.config import get_ncbi_api_key, get_ncbi_email, get_storage_root, get_thresholds, get_tool_config
+from pipeline.config import get_ncbi_api_key, get_ncbi_email, get_local_storage_root, get_thresholds, get_tool_config
 
 log = logging.getLogger(__name__)
 
@@ -82,7 +82,7 @@ def _load_species_tree() -> Optional[object]:
     if _SPECIES_TREE_CACHE is not None:
         return _SPECIES_TREE_CACHE
 
-    tree_path = Path(get_storage_root()) / "phylo" / "species.treefile"
+    tree_path = Path(get_local_storage_root()) / "phylo" / "species.treefile"
     if not tree_path.exists():
         return None
     try:

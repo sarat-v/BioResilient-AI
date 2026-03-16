@@ -37,7 +37,7 @@ import requests
 
 from db.models import DivergentMotif, Gene, Ortholog
 from db.session import get_session
-from pipeline.config import get_storage_root
+from pipeline.config import get_local_storage_root
 
 log = logging.getLogger(__name__)
 
@@ -46,7 +46,7 @@ AM_CHUNK = 1024 * 1024 * 8   # 8 MB download chunks
 
 
 def _am_path() -> Path:
-    root = Path(get_storage_root()) / "alphamissense"
+    root = Path(get_local_storage_root()) / "alphamissense"
     root.mkdir(parents=True, exist_ok=True)
     return root / "AlphaMissense_hg38.tsv.gz"
 
@@ -244,8 +244,13 @@ def annotate_motif_consequences(
             accession = gene.human_protein
             if not accession:
                 continue
+            # Normalize identically to _get_target_accessions() and build_am_index():
+            # strip pipe-delimited header prefix, isoform suffix, whitespace, uppercase.
             if "|" in accession:
                 accession = accession.split("|")[-1]
+            accession = accession.split("-")[0].strip().upper()
+            if not accession:
+                continue
 
             protein_am = am_index.get(accession)
             if not protein_am:

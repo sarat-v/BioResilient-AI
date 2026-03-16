@@ -8,7 +8,7 @@ import requests
 
 from db.models import Gene
 from db.session import get_session
-from pipeline.config import get_storage_root
+from pipeline.config import get_local_storage_root
 
 log = logging.getLogger(__name__)
 
@@ -16,11 +16,7 @@ ALPHAFOLD_FILES_BASE = "https://alphafold.ebi.ac.uk/files"
 
 
 def _structures_dir() -> Path:
-    root = get_storage_root()
-    if root.startswith("s3://"):
-        d = Path("/tmp/bioresilient/structures")
-    else:
-        d = Path(root) / "structures"
+    d = Path(get_local_storage_root()) / "structures"
     d.mkdir(parents=True, exist_ok=True)
     return d
 

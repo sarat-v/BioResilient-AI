@@ -20,7 +20,7 @@ from Bio import SeqIO
 
 from db.models import EvolutionScore, Gene, Ortholog
 from db.session import get_session
-from pipeline.config import get_storage_root, get_thresholds, get_tool_config
+from pipeline.config import get_local_storage_root, get_thresholds, get_tool_config
 
 log = logging.getLogger(__name__)
 
@@ -46,7 +46,7 @@ def write_hyphy_input(
 
     Returns (alignment_path, tree_path).
     """
-    root = Path(get_storage_root())
+    root = Path(get_local_storage_root())
     hyphy_dir = root / "hyphy" / og_id
     hyphy_dir.mkdir(parents=True, exist_ok=True)
 

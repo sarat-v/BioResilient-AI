@@ -33,7 +33,7 @@ import requests
 
 from db.models import Gene, SafetyFlag
 from db.session import get_session
-from pipeline.config import get_storage_root
+from pipeline.config import get_local_storage_root
 
 log = logging.getLogger(__name__)
 
@@ -42,7 +42,7 @@ REQUEST_TIMEOUT = 30
 
 
 def _depmap_cache_path() -> Path:
-    root = Path(get_storage_root()) / "depmap"
+    root = Path(get_local_storage_root()) / "depmap"
     root.mkdir(parents=True, exist_ok=True)
     return root / "CRISPRGeneDependency.csv"
 

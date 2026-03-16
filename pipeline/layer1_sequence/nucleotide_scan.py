@@ -36,7 +36,7 @@ from db.session import get_session
 from pipeline.config import (
     get_ncbi_api_key,
     get_ncbi_email,
-    get_storage_root,
+    get_local_storage_root,
     sync_to_s3,
     sync_from_s3,
 )
@@ -56,11 +56,7 @@ _RATE_SLEEP       = 0.11   # 10 req/s with API key
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _genomes_dir(species_id: str) -> Path:
-    root = get_storage_root()
-    if root.startswith("s3://"):
-        base = Path("/tmp/bioresilient/genomes")
-    else:
-        base = Path(root) / "genomes"
+    base = Path(get_local_storage_root()) / "genomes"
     d = base / species_id
     d.mkdir(parents=True, exist_ok=True)
     return d

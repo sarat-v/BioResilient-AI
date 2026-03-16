@@ -36,7 +36,7 @@ from typing import Optional
 
 from Bio import Entrez, SeqIO
 
-from pipeline.config import get_ncbi_api_key, get_ncbi_email, get_storage_root, get_tool_config
+from pipeline.config import get_ncbi_api_key, get_ncbi_email, get_local_storage_root, get_tool_config
 
 log = logging.getLogger(__name__)
 
@@ -71,7 +71,7 @@ def fetch_cds_for_protein(protein_accession: str) -> Optional[str]:
         return None
 
     # Check disk cache first — avoids all network I/O on resume/re-run
-    cache_dir = Path(get_storage_root()) / "cds"
+    cache_dir = Path(get_local_storage_root()) / "cds"
     cache_dir.mkdir(parents=True, exist_ok=True)
     cache_file = cache_dir / f"{acc}.fna"
     if cache_file.exists():
@@ -194,7 +194,7 @@ def run_meme(
     tools = get_tool_config()
     hyphy_bin = tools.get("hyphy_bin", "hyphy")
 
-    root = Path(get_storage_root())
+    root = Path(get_local_storage_root())
     meme_dir = root / "meme" / og_id
     meme_dir.mkdir(parents=True, exist_ok=True)
 
@@ -343,7 +343,7 @@ def run_fel(
     tools = get_tool_config()
     hyphy_bin = tools.get("hyphy_bin", "hyphy")
 
-    root = Path(get_storage_root())
+    root = Path(get_local_storage_root())
     fel_dir = root / "fel" / og_id
     fel_dir.mkdir(parents=True, exist_ok=True)
 
@@ -427,7 +427,7 @@ def run_busted(
     tools = get_tool_config()
     hyphy_bin = tools.get("hyphy_bin", "hyphy")
 
-    root = Path(get_storage_root())
+    root = Path(get_local_storage_root())
     busted_dir = root / "busted" / og_id
     busted_dir.mkdir(parents=True, exist_ok=True)
 
@@ -493,7 +493,7 @@ def _fel_busted_worker(args: tuple) -> tuple[str, dict]:
     from pathlib import Path as _Path
     from Bio import SeqIO as _SeqIO
 
-    root = get_storage_root()
+    root = get_local_storage_root()
     species_ids = [label.split("|")[0] for label in aligned_seqs]
     pruned_tree = prune_tree_to_species(_Path(species_treefile_str), species_ids)
 
@@ -594,7 +594,7 @@ def run_relax(
     tools = get_tool_config()
     hyphy_bin = tools.get("hyphy_bin", "hyphy")
 
-    root = Path(get_storage_root())
+    root = Path(get_local_storage_root())
     relax_dir = root / "relax" / og_id
     relax_dir.mkdir(parents=True, exist_ok=True)
 
@@ -705,7 +705,7 @@ def run_relax_pipeline(
     total = len(candidates)
     all_results: dict[str, dict] = {}
     done = 0
-    storage_root = str(get_storage_root())
+    storage_root = str(get_local_storage_root())
 
     work_items = [
         (og_id, aligned_orthogroups[og_id], str(species_treefile), storage_root)

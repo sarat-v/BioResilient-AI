@@ -57,7 +57,7 @@ from typing import Optional
 
 from db.models import DivergentMotif, Gene, Ortholog
 from db.session import get_session
-from pipeline.config import get_config, get_deployment, get_storage_root
+from pipeline.config import get_config
 
 log = logging.getLogger(__name__)
 
