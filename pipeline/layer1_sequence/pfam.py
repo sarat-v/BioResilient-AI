@@ -53,6 +53,7 @@ RETRY_DELAY = 2.0
 # UniProt strategy constants
 # --------------------------------------------------------------------------- #
 UNIPROT_API = "https://rest.uniprot.org/uniprotkb/search"
+UNIPROT_ACCESSIONS_API = "https://rest.uniprot.org/uniprotkb/accessions"
 # UniProt accepts up to 200 accessions per request; this is a protocol limit,
 # not a tuning parameter — do not raise above 200.
 _UNIPROT_BATCH_SIZE = 200
@@ -137,23 +138,22 @@ def _parse_uniprot_features(entry: dict) -> list[dict]:
 
 
 def _fetch_uniprot_batch(accessions: list[str]) -> dict[str, list[dict]]:
-    """Fetch domains for a batch of UniProt accessions in a single POST request.
+    """Fetch domains for a batch of UniProt accessions.
 
-    Uses POST to avoid URL-length limits that cause HTTP 400 with large batches.
+    Uses GET /uniprotkb/accessions?accessions=P12345,Q9Y523,...&fields=...
+    which is the correct bulk-lookup endpoint (vs /search which has URL limits).
     Returns {accession: [domain, ...]} for every accession in the batch.
     Accessions not found in UniProt map to an empty list.
     """
-    query = " OR ".join(f"accession:{acc}" for acc in accessions)
-    data = {
-        "query": query,
+    params = {
+        "accessions": ",".join(accessions),
         "fields": _UNIPROT_FIELDS,
         "format": "json",
-        "size": len(accessions),
     }
 
     for attempt in range(4):
         try:
-            r = requests.post(UNIPROT_API, data=data, timeout=REQUEST_TIMEOUT)
+            r = requests.get(UNIPROT_ACCESSIONS_API, params=params, timeout=REQUEST_TIMEOUT)
             if r.status_code == 200:
                 break
             if r.status_code == 429:
@@ -164,7 +164,7 @@ def _fetch_uniprot_batch(accessions: list[str]) -> dict[str, list[dict]]:
                 time.sleep(RETRY_DELAY * (attempt + 1))
             else:
                 log.warning("UniProt returned HTTP %d for batch of %d — response: %s",
-                            r.status_code, len(accessions), r.text[:200])
+                            r.status_code, len(accessions), r.text[:300])
                 break
         except requests.RequestException as exc:
             log.debug("UniProt request error (attempt %d): %s", attempt + 1, exc)
