@@ -112,10 +112,10 @@ def build_msa(gene_id: str, region_type: str, session) -> Optional[Path]:
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _newick_with_branch_lengths(treefile: Path) -> Optional[Path]:
-    """Return a Newick file with branch lengths, as required by PHAST tools.
+    """Return a Newick file with branch lengths stripped of bootstrap labels.
 
-    IQ-TREE2 produces a tree with bootstrap labels — phyloP needs a tree
-    with only branch lengths.  We strip bootstrap values here.
+    IQ-TREE2 produces a tree with bootstrap labels — phyloFit needs a clean
+    Newick with only branch lengths.
     """
     try:
         newick = treefile.read_text().strip()
@@ -128,6 +128,60 @@ def _newick_with_branch_lengths(treefile: Path) -> Optional[Path]:
     except Exception as exc:
         log.debug("Tree cleaning failed: %s", exc)
         return None
+
+
+def _fit_neutral_model(treefile: Path, concat_aln: Path) -> Optional[Path]:
+    """Run phyloFit to produce a neutral .mod file for phyloP.
+
+    phyloP requires a pre-fitted neutral evolutionary model (.mod file),
+    not a raw Newick tree.  We fit the model once using the concatenated
+    alignment from step 5 and cache it alongside the species tree.
+
+    Args:
+        treefile: IQ-TREE2 species treefile (Newick with branch lengths).
+        concat_aln: Concatenated protein alignment FASTA from step 5.
+
+    Returns:
+        Path to the fitted .mod file, or None if phyloFit fails.
+    """
+    if not shutil.which("phyloFit"):
+        log.warning("phyloFit not found — cannot fit neutral model for phyloP.")
+        return None
+
+    mod_path = treefile.parent / "neutral.mod"
+    if mod_path.exists():
+        log.info("Neutral model already exists at %s — skipping phyloFit.", mod_path)
+        return mod_path
+
+    nwk_path = _newick_with_branch_lengths(treefile)
+    if nwk_path is None:
+        return None
+
+    try:
+        log.info("Fitting neutral model with phyloFit (this may take a few minutes)...")
+        result = subprocess.run(
+            [
+                "phyloFit",
+                "--tree", str(nwk_path),
+                "--msa-format", "FASTA",
+                "--subst-mod", "SSREV",
+                "--out-root", str(treefile.parent / "neutral"),
+                str(concat_aln),
+            ],
+            capture_output=True, text=True, timeout=1800,
+        )
+        if result.returncode == 0 and mod_path.exists():
+            log.info("Neutral model written to %s", mod_path)
+            return mod_path
+        log.warning("phyloFit failed (exit %d): %s", result.returncode, result.stderr[:400])
+    except Exception as exc:
+        log.warning("phyloFit error: %s", exc)
+    finally:
+        try:
+            nwk_path.unlink(missing_ok=True)
+        except Exception:
+            pass
+    return None
 
 
 def _parse_phylop_output(stdout: str) -> Optional[float]:
@@ -165,11 +219,17 @@ def _parse_phastcons_output(stdout: str) -> Optional[float]:
     return round(sum(scores) / len(scores), 4)
 
 
-def run_phylop(msa_path: Path, tree_path: Path) -> Optional[float]:
-    """Run phyloP on the MSA and return the mean score, or None on failure."""
+def run_phylop(msa_path: Path, mod_path: Path) -> Optional[float]:
+    """Run phyloP on the MSA using a pre-fitted neutral model (.mod file).
+
+    Args:
+        msa_path: FASTA MSA for one gene region.
+        mod_path: Neutral evolutionary model from phyloFit (.mod file).
+    """
     try:
         result = subprocess.run(
-            ["phyloP", "--wig-scores", str(tree_path), str(msa_path)],
+            ["phyloP", "--wig-scores", "--msa-format", "FASTA",
+             str(mod_path), str(msa_path)],
             capture_output=True, text=True, timeout=300,
         )
         if result.returncode == 0:
@@ -199,12 +259,12 @@ def run_phastcons(msa_path: Path, tree_path: Path) -> Optional[float]:
     return None
 
 
-def score_region(msa_path: Path, tree_path: Path, tool: str) -> Optional[float]:
+def score_region(msa_path: Path, mod_path: Path, tool: str) -> Optional[float]:
     """Run the selected phylogenetic tool and return a mean conservation score."""
     if tool == "phyloP":
-        return run_phylop(msa_path, tree_path)
+        return run_phylop(msa_path, mod_path)
     if tool == "phastCons":
-        return run_phastcons(msa_path, tree_path)
+        return run_phastcons(msa_path, mod_path)
     return None
 
 
@@ -228,8 +288,8 @@ def _score_gene_worker(args: tuple) -> tuple[str, dict[str, Optional[float]]]:
     Runs entirely in a subprocess-safe context: opens its own DB session,
     writes to a private temp directory, and returns (gene_id, {field: score}).
     """
-    gene_id, tree_path_str, tool = args
-    tree_path = Path(tree_path_str)
+    gene_id, mod_path_str, tool = args
+    mod_path = Path(mod_path_str)
 
     region_scores: dict[str, Optional[float]] = {}
     tmp_files: list[Path] = []
@@ -242,7 +302,7 @@ def _score_gene_worker(args: tuple) -> tuple[str, dict[str, Optional[float]]]:
                     continue
                 tmp_files.append(msa_path)
 
-                score = score_region(msa_path, tree_path, tool)
+                score = score_region(msa_path, mod_path, tool)
                 field = _REGION_TO_FIELD[region_type]
                 region_scores[field] = score
     finally:
@@ -287,9 +347,20 @@ def run_phylo_conservation(
         log.warning("Treefile not found at %s — phylo conservation skipped.", treefile)
         return 0
 
-    tree_path = _newick_with_branch_lengths(treefile)
-    if tree_path is None:
-        log.warning("Could not prepare tree for phyloP — skipped.")
+    # Fit a neutral evolutionary model with phyloFit — required by phyloP.
+    # The concatenated alignment from step 5 lives alongside the treefile.
+    concat_aln = treefile.parent / "concat_alignment.faa"
+    if not concat_aln.exists():
+        log.warning(
+            "Concatenated alignment not found at %s — cannot fit neutral model. "
+            "Phylogenetic conservation scores will be NULL.",
+            concat_aln,
+        )
+        return 0
+
+    mod_path = _fit_neutral_model(treefile, concat_aln)
+    if mod_path is None:
+        log.warning("Could not fit neutral model for phyloP — skipped.")
         return 0
 
     with get_session() as session:
@@ -304,28 +375,21 @@ def run_phylo_conservation(
              tool, len(gene_ids))
 
     n_workers = max(1, (os.cpu_count() or 4) - 1)
-    work_items = [(gid, str(tree_path), tool) for gid in gene_ids]
+    work_items = [(gid, str(mod_path), tool) for gid in gene_ids]
     all_results: dict[str, dict[str, Optional[float]]] = {}
     done = 0
     total = len(work_items)
 
-    try:
-        with ProcessPoolExecutor(max_workers=n_workers) as pool:
-            futures = {pool.submit(_score_gene_worker, item): item[0] for item in work_items}
-            for future in as_completed(futures):
-                gene_id, region_scores = future.result()
-                if any(v is not None for v in region_scores.values()):
-                    all_results[gene_id] = region_scores
-                done += 1
-                if done % 500 == 0 or done == total:
-                    log.info("  phylo_conservation: %d / %d genes (%.0f%%).",
-                             done, total, 100 * done / total)
-    finally:
-        if tree_path:
-            try:
-                tree_path.unlink(missing_ok=True)
-            except Exception:
-                pass
+    with ProcessPoolExecutor(max_workers=n_workers) as pool:
+        futures = {pool.submit(_score_gene_worker, item): item[0] for item in work_items}
+        for future in as_completed(futures):
+            gene_id, region_scores = future.result()
+            if any(v is not None for v in region_scores.values()):
+                all_results[gene_id] = region_scores
+            done += 1
+            if done % 500 == 0 or done == total:
+                log.info("  phylo_conservation: %d / %d genes (%.0f%%).",
+                         done, total, 100 * done / total)
 
     # Write all results in a single session
     genes_scored = 0
