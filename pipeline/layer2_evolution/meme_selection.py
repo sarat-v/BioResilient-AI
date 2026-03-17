@@ -30,9 +30,11 @@ import re
 import subprocess
 import tempfile
 import time
-from concurrent.futures import ProcessPoolExecutor, as_completed
+from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Optional
+from urllib.parse import urlencode
+from urllib.request import urlopen, Request
 
 from Bio import Entrez, SeqIO
 
@@ -57,24 +59,32 @@ def _setup_entrez() -> None:
 def _prefetch_all_cds(aligned_orthogroups: dict[str, dict[str, str]]) -> None:
     """Pre-fetch CDS for all unique protein accessions before spawning workers.
 
-    Uses NCBI elink (list of IDs → Biopython uses POST) + efetch in batches.
-    Results cached to disk so workers never hit NCBI.
+    Strategy:
+    - Phase 1: elink in large batches (500) to map protein → nuccore IDs
+    - Phase 2: efetch fasta_cds_na in parallel threads (8 workers, batches of 200)
+      fasta_cds_na returns only the CDS FASTA — much smaller/faster than GenBank
+    - Results cached to disk so workers never hit NCBI again
     """
+    import threading
+
     _setup_entrez()
+    api_key = get_ncbi_api_key()
+    base_url = "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/"
     cache_dir = Path(get_local_storage_root()) / "cds"
     cache_dir.mkdir(parents=True, exist_ok=True)
 
-    # UniProt mnemonic: GENENAME_SPECIES where SPECIES is letters-only (e.g. CENPK_HUMAN)
-    # RefSeq like XP_049720501.1 has digits after underscore — must NOT match
-    _UNIPROT_PAT = re.compile(r"^[A-Z0-9]{1,11}_[A-Z]{3,5}$|^[OPQ][0-9][A-Z0-9]{3}[0-9]$|^[A-NR-Z][0-9]([A-Z][A-Z0-9]{2}[0-9]){1,2}$")
+    _UNIPROT_PAT = re.compile(
+        r"^[A-Z0-9]{1,11}_[A-Z]{3,5}$"
+        r"|^[OPQ][0-9][A-Z0-9]{3}[0-9]$"
+        r"|^[A-NR-Z][0-9]([A-Z][A-Z0-9]{2}[0-9]){1,2}$"
+    )
 
     def _is_uniprot(acc: str) -> bool:
-        # Extra check: RefSeq always has digits after underscore (XP_12345, NP_12345)
         if "_" in acc:
             after = acc.split("_", 1)[1].lstrip("0123456789.")
-            if after:  # has letters after digits → it's not a simple RefSeq
+            if after:
                 return bool(_UNIPROT_PAT.match(acc))
-            return False  # digits-only after underscore → RefSeq
+            return False
         return bool(_UNIPROT_PAT.match(acc))
 
     all_accessions: set[str] = set()
@@ -90,7 +100,6 @@ def _prefetch_all_cds(aligned_orthogroups: dict[str, dict[str, str]]) -> None:
             if not cf.exists():
                 cf.write_text("")
             continue
-        # Clear empty cache files that may have been written by buggy earlier code
         if cf.exists() and cf.stat().st_size == 0:
             cf.unlink()
         if not cf.exists():
@@ -104,102 +113,155 @@ def _prefetch_all_cds(aligned_orthogroups: dict[str, dict[str, str]]) -> None:
     log.info("CDS pre-fetch: %d NCBI accessions to fetch (%d cached, %d UniProt skipped).",
              len(to_fetch), ncbi_total - len(to_fetch), len(all_accessions) - ncbi_total)
 
-    # Use small batches — passing list (not comma string) makes Biopython use POST
-    _ELINK_BATCH = 50
-    _EFETCH_BATCH = 50
-    done = 0
-    failed = 0
+    # ── Phase 1: elink in large batches to map protein accession → nuccore ID ──
+    _ELINK_BATCH = 500
+    acc_to_nuc: dict[str, str] = {}
+    elink_failed: list[str] = []
 
-    for batch_start in range(0, len(to_fetch), _ELINK_BATCH):
-        batch = to_fetch[batch_start: batch_start + _ELINK_BATCH]
-
+    def _post_elink(batch: list[str]) -> tuple[list[str], dict[str, str]]:
+        """POST elink for a batch; returns (failed_accs, acc→nuc_id mapping)."""
+        params = {
+            "dbfrom": "protein", "db": "nuccore",
+            "linkname": "protein_nuccore_mrna",
+            "id": ",".join(batch),
+        }
+        if api_key:
+            params["api_key"] = api_key
         try:
-            # Pass list — Biopython sends as POST, avoids URL-length issues
-            handle = Entrez.elink(
-                dbfrom="protein", db="nuccore",
-                id=batch,
-                linkname="protein_nuccore_mrna",
+            req = Request(
+                base_url + "elink.fcgi",
+                data=urlencode(params, doseq=True).encode(),
+                method="POST",
             )
-            link_records = Entrez.read(handle)
-            handle.close()
-            time.sleep(0.12)
-        except Exception as exc:
-            log.debug("elink batch failed at %d: %s", batch_start, exc)
-            for acc in batch:
-                (cache_dir / f"{acc}.fna").write_text("")
-            failed += len(batch)
-            done += len(batch)
-            continue
-
-        acc_to_nuc: dict[str, str] = {}
-        for i, acc in enumerate(batch):
-            try:
-                for ls in link_records[i].get("LinkSetDb", []):
-                    if ls["LinkName"] in ("protein_nuccore_mrna", "protein_nuccore"):
-                        if ls["Link"]:
-                            acc_to_nuc[acc] = ls["Link"][0]["Id"]
-                        break
-            except (IndexError, KeyError):
-                pass
-            if acc not in acc_to_nuc:
-                (cache_dir / f"{acc}.fna").write_text("")
-
-        if not acc_to_nuc:
-            done += len(batch)
-            continue
-
-        acc_by_nuc = {v: k for k, v in acc_to_nuc.items()}
-        nuc_ids = list(acc_to_nuc.values())
-        fetched_nuc_ids: set[str] = set()
-
-        for ef_start in range(0, len(nuc_ids), _EFETCH_BATCH):
-            sub_ids = nuc_ids[ef_start: ef_start + _EFETCH_BATCH]
-            try:
-                handle = Entrez.efetch(
-                    db="nuccore", id=sub_ids,
-                    rettype="gb", retmode="text",
-                )
-                records = list(SeqIO.parse(handle, "genbank"))
-                handle.close()
-                time.sleep(0.12)
-            except Exception as exc:
-                log.debug("efetch batch failed: %s", exc)
-                for nid in sub_ids:
-                    acc = acc_by_nuc.get(nid)
-                    if acc:
-                        (cache_dir / f"{acc}.fna").write_text("")
-                failed += len(sub_ids)
-                continue
-
-            for record in records:
-                matched_acc = None
-                for nid in sub_ids:
-                    if record.id.startswith(nid) or nid in record.id:
-                        matched_acc = acc_by_nuc.get(nid)
-                        fetched_nuc_ids.add(nid)
-                        break
-                if not matched_acc:
-                    continue
-                cds_seq = None
-                for feat in record.features:
-                    if feat.type == "CDS":
-                        seq = str(feat.extract(record.seq))
-                        if len(seq) % 3 == 0 and seq.upper().startswith("ATG"):
-                            cds_seq = seq
+            with urlopen(req, timeout=60) as resp:
+                raw = resp.read()
+            records = Entrez.read(__import__("io").BytesIO(raw))
+            result: dict[str, str] = {}
+            for i, acc in enumerate(batch):
+                try:
+                    for ls in records[i].get("LinkSetDb", []):
+                        if ls["LinkName"] in ("protein_nuccore_mrna", "protein_nuccore"):
+                            if ls["Link"]:
+                                result[acc] = ls["Link"][0]["Id"]
                             break
-                (cache_dir / f"{matched_acc}.fna").write_text(cds_seq or "")
+                except (IndexError, KeyError):
+                    pass
+            return [], result
+        except Exception as exc:
+            log.debug("elink POST failed: %s", exc)
+            return batch, {}
 
-        for acc, nid in acc_to_nuc.items():
-            if nid not in fetched_nuc_ids and not (cache_dir / f"{acc}.fna").exists():
+    log.info("  CDS pre-fetch phase 1: elink %d accessions in batches of %d...",
+             len(to_fetch), _ELINK_BATCH)
+
+    elink_batches = [to_fetch[i:i + _ELINK_BATCH] for i in range(0, len(to_fetch), _ELINK_BATCH)]
+    with ThreadPoolExecutor(max_workers=4) as pool:
+        futures = {pool.submit(_post_elink, b): b for b in elink_batches}
+        done_elink = 0
+        for fut in as_completed(futures):
+            failed_batch, mapping = fut.result()
+            acc_to_nuc.update(mapping)
+            for acc in failed_batch:
                 (cache_dir / f"{acc}.fna").write_text("")
+                elink_failed.append(acc)
+            # Mark accs with no link
+            for acc in futures[fut]:
+                if acc not in acc_to_nuc and acc not in elink_failed:
+                    (cache_dir / f"{acc}.fna").write_text("")
+            done_elink += len(futures[fut])
+            if done_elink % 5000 == 0 or done_elink >= len(to_fetch):
+                log.info("  elink: %d / %d done, %d mapped to nuccore.",
+                         done_elink, len(to_fetch), len(acc_to_nuc))
+            time.sleep(0.05)
 
-        done += len(batch)
-        if done % 1000 == 0 or done >= len(to_fetch):
-            log.info("  CDS pre-fetch: %d / %d done (%d failed).",
-                     done, len(to_fetch), failed)
+    log.info("  Phase 1 complete: %d protein→nuccore mappings, %d no-link.",
+             len(acc_to_nuc), len(to_fetch) - len(acc_to_nuc))
+
+    # ── Phase 2: efetch fasta_cds_na in parallel threads ──────────────────────
+    _EFETCH_BATCH = 200
+    _EFETCH_WORKERS = 8
+    acc_by_nuc = {v: k for k, v in acc_to_nuc.items()}
+    nuc_ids = list(acc_to_nuc.values())
+    done_fetch = 0
+    fetch_lock = threading.Lock()
+
+    def _fetch_cds_batch(nuc_batch: list[str]) -> int:
+        """Fetch fasta_cds_na for a batch of nuccore IDs; write to cache. Returns count written."""
+        params = {
+            "db": "nuccore",
+            "id": ",".join(nuc_batch),
+            "rettype": "fasta_cds_na",
+            "retmode": "text",
+        }
+        if api_key:
+            params["api_key"] = api_key
+        try:
+            req = Request(
+                base_url + "efetch.fcgi",
+                data=urlencode(params, doseq=True).encode(),
+                method="POST",
+            )
+            with urlopen(req, timeout=120) as resp:
+                text = resp.read().decode("utf-8", errors="replace")
+            written = 0
+            current_nuc_id = None
+            current_lines: list[str] = []
+            for line in text.splitlines():
+                if line.startswith(">"):
+                    if current_nuc_id and current_lines:
+                        acc = acc_by_nuc.get(current_nuc_id)
+                        if acc:
+                            seq = "".join(current_lines)
+                            (cache_dir / f"{acc}.fna").write_text(seq if seq else "")
+                            if seq:
+                                written += 1
+                    current_lines = []
+                    current_nuc_id = None
+                    for nid in nuc_batch:
+                        if nid in line:
+                            current_nuc_id = nid
+                            break
+                else:
+                    current_lines.append(line.strip())
+            if current_nuc_id and current_lines:
+                acc = acc_by_nuc.get(current_nuc_id)
+                if acc:
+                    seq = "".join(current_lines)
+                    (cache_dir / f"{acc}.fna").write_text(seq if seq else "")
+                    if seq:
+                        written += 1
+            for nid in nuc_batch:
+                acc = acc_by_nuc.get(nid)
+                if acc and not (cache_dir / f"{acc}.fna").exists():
+                    (cache_dir / f"{acc}.fna").write_text("")
+            return written
+        except Exception as exc:
+            log.debug("efetch batch failed: %s", exc)
+            for nid in nuc_batch:
+                acc = acc_by_nuc.get(nid)
+                if acc:
+                    (cache_dir / f"{acc}.fna").write_text("")
+            return 0
+
+    log.info("  CDS pre-fetch phase 2: efetch fasta_cds_na for %d nuccore IDs "
+             "(%d workers, batches of %d)...", len(nuc_ids), _EFETCH_WORKERS, _EFETCH_BATCH)
+
+    efetch_batches = [nuc_ids[i:i + _EFETCH_BATCH] for i in range(0, len(nuc_ids), _EFETCH_BATCH)]
+    total_written = 0
+    with ThreadPoolExecutor(max_workers=_EFETCH_WORKERS) as pool:
+        futures2 = {pool.submit(_fetch_cds_batch, b): b for b in efetch_batches}
+        for fut in as_completed(futures2):
+            written = fut.result()
+            with fetch_lock:
+                total_written += written
+                done_fetch += len(futures2[fut])
+                if done_fetch % 2000 == 0 or done_fetch >= len(nuc_ids):
+                    log.info("  efetch: %d / %d nuccore IDs done, %d CDS written.",
+                             done_fetch, len(nuc_ids), total_written)
+            time.sleep(0.02)
 
     log.info("CDS pre-fetch complete: %d fetched, %d failed/no-CDS, %d already cached.",
-             done - failed, failed, ncbi_total - len(to_fetch))
+             total_written, len(to_fetch) - total_written, ncbi_total - len(to_fetch))
 
 
 def fetch_cds_for_protein(protein_accession: str) -> Optional[str]:
