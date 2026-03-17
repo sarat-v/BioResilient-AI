@@ -94,13 +94,35 @@ aws s3 sync "s3://${S3_BUCKET}/" "$S3_LOCAL/" \
 S3_SIZE=$(du -sh "$S3_LOCAL" 2>/dev/null | cut -f1 || echo "unknown")
 ok "S3 sync complete: $S3_SIZE downloaded"
 
+# ── Pull step cache files into local step_cache/ dir ─────────────────────────
+banner "Bonus: Pulling step cache reports"
+STEP_CACHE_DIR="$REPO_ROOT/step_cache"
+mkdir -p "$STEP_CACHE_DIR"
+
+echo -e "  Syncing step reports → ${STEP_CACHE_DIR}/"
+aws s3 sync "s3://${S3_BUCKET}/step_cache/cancer_resistance/" "$STEP_CACHE_DIR/" \
+    --region "$AWS_REGION" \
+    --no-progress 2>/dev/null \
+    && ok "Step cache reports downloaded to step_cache/" \
+    || warn "Step cache sync had warnings (non-fatal)"
+
+# Also copy to BioResilient-Results/ for the local results folder
+RESULTS_DIR="$REPO_ROOT/BioResilient-Results"
+mkdir -p "$RESULTS_DIR"
+for f in "$STEP_CACHE_DIR"/*.json "$STEP_CACHE_DIR"/*.md; do
+    [[ -f "$f" ]] && cp "$f" "$RESULTS_DIR/" 2>/dev/null || true
+done
+ok "Results also copied to BioResilient-Results/"
+
 # ── Summary ───────────────────────────────────────────────────────────────────
 banner "Download Complete"
 echo -e "  ${BOLD}Files saved to: ${BACKUP_DIR}${RESET}"
 echo ""
-echo -e "  DB dump (binary): ${BOLD}${DUMP_FILE}${RESET}"
-echo -e "  DB dump (SQL)   : ${BOLD}${DUMP_SQL}${RESET}"
-echo -e "  S3 files        : ${BOLD}${S3_LOCAL}/${RESET}"
+  echo -e "  DB dump (binary): ${BOLD}${DUMP_FILE}${RESET}"
+  echo -e "  DB dump (SQL)   : ${BOLD}${DUMP_SQL}${RESET}"
+  echo -e "  S3 files        : ${BOLD}${S3_LOCAL}/${RESET}"
+  echo -e "  Step reports    : ${BOLD}${STEP_CACHE_DIR}/${RESET}"
+  echo -e "  Results folder  : ${BOLD}${RESULTS_DIR}/${RESET}"
 echo ""
 echo -e "  ${BOLD}Total backup size:${RESET}"
 du -sh "$BACKUP_DIR"
@@ -116,11 +138,13 @@ echo -e "  ${BOLD}2. On Dell PC — restore DB:${RESET}"
 echo -e "     createdb bioresilient"
 echo -e "     pg_restore -d bioresilient -Fc bioresilient_${TIMESTAMP}.dump"
 echo ""
-echo -e "  ${BOLD}3. On Dell PC — place S3 files:${RESET}"
-echo -e "     cp -r s3/proteomes/ data/proteomes/"
-echo -e "     mkdir -p /tmp/bioresilient/phylo"
-echo -e "     cp s3/cache/aligned_orthogroups.pkl /tmp/bioresilient/"
-echo -e "     cp s3/cache/species.treefile /tmp/bioresilient/phylo/"
+  echo -e "  ${BOLD}3. On Dell PC — place S3 files:${RESET}"
+  echo -e "     cp -r s3/proteomes/ data/proteomes/"
+  echo -e "     mkdir -p /tmp/bioresilient/phylo"
+  echo -e "     cp s3/cache/aligned_orthogroups.pkl /tmp/bioresilient/"
+  echo -e "     cp s3/cache/species.treefile /tmp/bioresilient/phylo/"
+  echo -e "     cp -r step_cache/ ./step_cache/"
+  echo -e "     cp -r BioResilient-Results/ ./BioResilient-Results/"
 echo ""
 echo -e "  ${BOLD}4. On Dell PC — set deployment to local in config/environment.yml:${RESET}"
 echo -e "     sed -i 's/deployment: cloud/deployment: local/' config/environment.yml"
