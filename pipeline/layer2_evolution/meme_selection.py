@@ -31,7 +31,6 @@ import subprocess
 import tempfile
 import time
 from concurrent.futures import ProcessPoolExecutor, as_completed
-from io import StringIO
 from pathlib import Path
 from typing import Optional
 
@@ -58,131 +57,84 @@ def _setup_entrez() -> None:
 def _prefetch_all_cds(aligned_orthogroups: dict[str, dict[str, str]]) -> None:
     """Pre-fetch CDS for all unique protein accessions before spawning workers.
 
-    Uses NCBI batch elink (up to 500 accessions per request) to resolve
-    protein → mRNA links, then batch efetch for the GenBank records.
-    This is ~50x faster than per-accession sequential fetching.
-
-    All results are cached to disk so workers never hit NCBI.
+    Uses NCBI elink (list of IDs → Biopython uses POST) + efetch in batches.
+    Results cached to disk so workers never hit NCBI.
     """
     _setup_entrez()
     cache_dir = Path(get_local_storage_root()) / "cds"
     cache_dir.mkdir(parents=True, exist_ok=True)
 
-    # UniProt mnemonic: GENENAME_SPECIESCODE where SPECIESCODE is 3-5 uppercase letters
-    # e.g. CENPK_HUMAN, 1433E_HUMAN, ZN124_MOUSE
-    # RefSeq accessions like XP_049720501.1, NP_001386127.1 must NOT match this.
-    # Key distinction: RefSeq has digits after the underscore; UniProt has only letters.
-    _UNIPROT_MNEMONIC_PAT = re.compile(r"^[A-Z0-9]{1,11}_[A-Z]{3,5}$")
-    # UniProt accession format: O/P/Q + digit + 3 alphanum + digit, or A-N/R-Z + digit + ...
-    _UNIPROT_ACC_PAT = re.compile(r"^[OPQ][0-9][A-Z0-9]{3}[0-9](-\d+)?$|^[A-NR-Z][0-9]([A-Z][A-Z0-9]{2}[0-9]){1,2}(-\d+)?$")
+    # UniProt mnemonic: GENENAME_SPECIES where SPECIES is letters-only (e.g. CENPK_HUMAN)
+    # RefSeq like XP_049720501.1 has digits after underscore — must NOT match
+    _UNIPROT_PAT = re.compile(r"^[A-Z0-9]{1,11}_[A-Z]{3,5}$|^[OPQ][0-9][A-Z0-9]{3}[0-9]$|^[A-NR-Z][0-9]([A-Z][A-Z0-9]{2}[0-9]){1,2}$")
 
-    # Collect all unique accessions
+    def _is_uniprot(acc: str) -> bool:
+        # Extra check: RefSeq always has digits after underscore (XP_12345, NP_12345)
+        if "_" in acc:
+            after = acc.split("_", 1)[1].lstrip("0123456789.")
+            if after:  # has letters after digits → it's not a simple RefSeq
+                return bool(_UNIPROT_PAT.match(acc))
+            return False  # digits-only after underscore → RefSeq
+        return bool(_UNIPROT_PAT.match(acc))
+
     all_accessions: set[str] = set()
     for seqs in aligned_orthogroups.values():
         for label in seqs:
             acc = label.split("|")[-1] if "|" in label else label
             all_accessions.add(acc)
 
-    # Partition: skip UniProt/non-NCBI, skip already cached
     to_fetch = []
     for acc in sorted(all_accessions):
-        if _UNIPROT_MNEMONIC_PAT.match(acc) or _UNIPROT_ACC_PAT.match(acc):
-            # Cache as empty so workers skip immediately
-            cf = cache_dir / f"{acc}.fna"
+        cf = cache_dir / f"{acc}.fna"
+        if _is_uniprot(acc):
             if not cf.exists():
                 cf.write_text("")
             continue
-        cf = cache_dir / f"{acc}.fna"
-        # Delete empty cache files for NCBI accessions — they may have been
-        # incorrectly cached as empty by the old UniProt-misclassifying regex
+        # Clear empty cache files that may have been written by buggy earlier code
         if cf.exists() and cf.stat().st_size == 0:
             cf.unlink()
         if not cf.exists():
             to_fetch.append(acc)
 
-    ncbi_total = len([a for a in all_accessions
-                      if not _UNIPROT_MNEMONIC_PAT.match(a) and not _UNIPROT_ACC_PAT.match(a)])
+    ncbi_total = sum(1 for a in all_accessions if not _is_uniprot(a))
     if not to_fetch:
         log.info("CDS pre-fetch: all %d NCBI accessions already cached.", ncbi_total)
         return
 
     log.info("CDS pre-fetch: %d NCBI accessions to fetch (%d cached, %d UniProt skipped).",
-             len(to_fetch), ncbi_total - len(to_fetch),
-             len(all_accessions) - ncbi_total)
+             len(to_fetch), ncbi_total - len(to_fetch), len(all_accessions) - ncbi_total)
 
-    _ELINK_BATCH = 500   # NCBI elink supports up to 500 IDs per POST
-    _EFETCH_BATCH = 200  # efetch GenBank records are large; 200 is safe per request
+    # Use small batches — passing list (not comma string) makes Biopython use POST
+    _ELINK_BATCH = 50
+    _EFETCH_BATCH = 50
     done = 0
     failed = 0
 
     for batch_start in range(0, len(to_fetch), _ELINK_BATCH):
         batch = to_fetch[batch_start: batch_start + _ELINK_BATCH]
 
-        # Step 1: try direct CDS fetch via protein fasta_cds_na (works for XP_/NP_)
-        # This is faster and more reliable than elink for RefSeq accessions.
         try:
-            handle = Entrez.efetch(
-                db="protein", id=",".join(batch[:_EFETCH_BATCH]),
-                rettype="fasta_cds_na", retmode="text",
-            )
-            raw = handle.read()
-            handle.close()
-            time.sleep(0.12)
-
-            # Parse: each record's description contains the protein accession
-            direct_hits: set[str] = set()
-            for record in SeqIO.parse(StringIO(raw), "fasta"):
-                # Header like: >lcl|NM_... [protein_id=NP_001386127.1] ...
-                desc = record.description
-                for acc in batch:
-                    if acc in desc:
-                        seq = str(record.seq)
-                        if len(seq) % 3 == 0 and seq.upper().startswith("ATG"):
-                            (cache_dir / f"{acc}.fna").write_text(seq)
-                        else:
-                            (cache_dir / f"{acc}.fna").write_text("")
-                        direct_hits.add(acc)
-                        break
-
-            # For accessions not found via direct fetch, fall back to elink
-            remaining = [a for a in batch if a not in direct_hits]
-            done_direct = len(batch) - len(remaining)
-        except Exception as exc:
-            log.debug("Direct CDS fetch failed for batch at %d: %s", batch_start, exc)
-            remaining = batch
-            done_direct = 0
-
-        if not remaining:
-            done += len(batch)
-            if done % 2000 == 0 or done >= len(to_fetch):
-                log.info("  CDS pre-fetch: %d / %d done (%d failed).",
-                         done, len(to_fetch), failed)
-            continue
-
-        # Step 2: elink fallback for accessions not found via direct fetch
-        try:
+            # Pass list — Biopython sends as POST, avoids URL-length issues
             handle = Entrez.elink(
                 dbfrom="protein", db="nuccore",
-                id=",".join(remaining),
+                id=batch,
                 linkname="protein_nuccore_mrna",
             )
             link_records = Entrez.read(handle)
             handle.close()
             time.sleep(0.12)
         except Exception as exc:
-            log.debug("Batch elink failed for batch at %d: %s", batch_start, exc)
-            for acc in remaining:
+            log.debug("elink batch failed at %d: %s", batch_start, exc)
+            for acc in batch:
                 (cache_dir / f"{acc}.fna").write_text("")
-            failed += len(remaining)
+            failed += len(batch)
             done += len(batch)
             continue
 
-        # Build acc → nuc_id map
         acc_to_nuc: dict[str, str] = {}
-        for i, acc in enumerate(remaining):
+        for i, acc in enumerate(batch):
             try:
-                linksetdb = link_records[i].get("LinkSetDb", [])
-                for ls in linksetdb:
+                for ls in link_records[i].get("LinkSetDb", []):
                     if ls["LinkName"] in ("protein_nuccore_mrna", "protein_nuccore"):
                         if ls["Link"]:
                             acc_to_nuc[acc] = ls["Link"][0]["Id"]
@@ -196,58 +148,53 @@ def _prefetch_all_cds(aligned_orthogroups: dict[str, dict[str, str]]) -> None:
             done += len(batch)
             continue
 
-        # Step 3: efetch GenBank for linked nuc IDs in sub-batches
         acc_by_nuc = {v: k for k, v in acc_to_nuc.items()}
         nuc_ids = list(acc_to_nuc.values())
         fetched_nuc_ids: set[str] = set()
 
-        for efetch_start in range(0, len(nuc_ids), _EFETCH_BATCH):
-            sub_nuc_ids = nuc_ids[efetch_start: efetch_start + _EFETCH_BATCH]
+        for ef_start in range(0, len(nuc_ids), _EFETCH_BATCH):
+            sub_ids = nuc_ids[ef_start: ef_start + _EFETCH_BATCH]
             try:
                 handle = Entrez.efetch(
-                    db="nuccore", id=",".join(sub_nuc_ids),
+                    db="nuccore", id=sub_ids,
                     rettype="gb", retmode="text",
                 )
                 records = list(SeqIO.parse(handle, "genbank"))
                 handle.close()
                 time.sleep(0.12)
             except Exception as exc:
-                log.debug("Batch efetch failed: %s", exc)
-                for nid in sub_nuc_ids:
+                log.debug("efetch batch failed: %s", exc)
+                for nid in sub_ids:
                     acc = acc_by_nuc.get(nid)
                     if acc:
                         (cache_dir / f"{acc}.fna").write_text("")
-                failed += len(sub_nuc_ids)
+                failed += len(sub_ids)
                 continue
 
             for record in records:
-                nuc_id = record.id.split(".")[0]
                 matched_acc = None
-                for nid in sub_nuc_ids:
-                    if nid == nuc_id or record.id.startswith(nid):
+                for nid in sub_ids:
+                    if record.id.startswith(nid) or nid in record.id:
                         matched_acc = acc_by_nuc.get(nid)
                         fetched_nuc_ids.add(nid)
                         break
-                if matched_acc is None:
+                if not matched_acc:
                     continue
                 cds_seq = None
-                for feature in record.features:
-                    if feature.type == "CDS":
-                        seq = str(feature.extract(record.seq))
+                for feat in record.features:
+                    if feat.type == "CDS":
+                        seq = str(feat.extract(record.seq))
                         if len(seq) % 3 == 0 and seq.upper().startswith("ATG"):
                             cds_seq = seq
                             break
-                (cache_dir / f"{matched_acc}.fna").write_text(cds_seq if cds_seq else "")
+                (cache_dir / f"{matched_acc}.fna").write_text(cds_seq or "")
 
-        # Cache any accessions whose nuc records didn't come back
         for acc, nid in acc_to_nuc.items():
-            if nid not in fetched_nuc_ids:
-                cf = cache_dir / f"{acc}.fna"
-                if not cf.exists():
-                    cf.write_text("")
+            if nid not in fetched_nuc_ids and not (cache_dir / f"{acc}.fna").exists():
+                (cache_dir / f"{acc}.fna").write_text("")
 
         done += len(batch)
-        if done % 2000 == 0 or done >= len(to_fetch):
+        if done % 1000 == 0 or done >= len(to_fetch):
             log.info("  CDS pre-fetch: %d / %d done (%d failed).",
                      done, len(to_fetch), failed)
 
