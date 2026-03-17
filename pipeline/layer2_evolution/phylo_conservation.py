@@ -24,6 +24,7 @@ Scope: restricted to genes in tier_gene_ids (Tier1 + Tier2 after step9).
 Entry point: run_phylo_conservation(tier_gene_ids, treefile) -> int
 """
 
+import hashlib
 import logging
 import os
 import re
@@ -340,43 +341,23 @@ def _pruned_mod(mod_path: Path, species_in_msa: list[str]) -> Optional[Path]:
 
 
 def run_phylop(msa_path: Path, mod_path: Path) -> Optional[float]:
-    """Run phyloP on the MSA using a pre-fitted neutral model (.mod file).
+    """Run phyloP on the MSA using a pre-pruned neutral model (.mod file).
 
-    The neutral model contains all 18 species; each per-gene MSA may have
-    fewer.  We prune the model tree to only the species in the MSA before
-    calling phyloP to avoid "no match for leaves of tree in alignment" errors.
+    The mod_path is expected to already be pruned to the species in the MSA
+    (done once upfront in run_phylo_conservation). No tree pruning here.
     """
-    # Extract species present in this MSA
-    species_in_msa = [
-        rec.id for rec in SeqIO.parse(str(msa_path), "fasta")
-    ]
-    if not species_in_msa:
-        return None
-
-    pruned_path: Optional[Path] = None
-    effective_mod = mod_path
     try:
-        pruned_path = _pruned_mod(mod_path, species_in_msa)
-        if pruned_path is not None:
-            effective_mod = pruned_path
-
         result = subprocess.run(
             ["phyloP", "--wig-scores", "--msa-format", "FASTA",
-             str(effective_mod), str(msa_path)],
+             str(mod_path), str(msa_path)],
             capture_output=True, text=True, timeout=300,
         )
         if result.returncode == 0:
             return _parse_phylop_output(result.stdout)
         log.warning("phyloP non-zero exit (%d) for %s: %s",
-                    result.returncode, msa_path.name, result.stderr[:300])
+                    result.returncode, msa_path.name, result.stderr[:200])
     except Exception as exc:
         log.debug("phyloP execution error: %s", exc)
-    finally:
-        if pruned_path is not None:
-            try:
-                pruned_path.unlink(missing_ok=True)
-            except Exception:
-                pass
     return None
 
 
@@ -425,13 +406,13 @@ def _upsert_phylo_score(session, gene_id: str, scores: dict[str, Optional[float]
 def _score_gene_worker(args: tuple) -> tuple[str, dict[str, Optional[float]]]:
     """Thread worker: build MSAs from pre-fetched sequences and run phyloP/phastCons.
 
-    Accepts pre-fetched sequences to avoid DB connection pool exhaustion when
-    running 60 concurrent threads.  No DB access in this function.
+    Accepts pre-fetched sequences and pre-built pruned mod paths — no DB access,
+    no tree_doctor calls, no temp .mod file writes in this function.
 
-    args: (gene_id, {region_type: [(species_id, sequence), ...]}, mod_path_str, tool)
+    args: (gene_id, {region_type: [(species_id, sequence)]},
+                    {region_type: pruned_mod_path_str | None}, tool)
     """
-    gene_id, region_seqs, mod_path_str, tool = args
-    mod_path = Path(mod_path_str)
+    gene_id, region_seqs, region_mods, tool = args
 
     region_scores: dict[str, Optional[float]] = {}
     tmp_files: list[Path] = []
@@ -439,11 +420,20 @@ def _score_gene_worker(args: tuple) -> tuple[str, dict[str, Optional[float]]]:
     try:
         for region_type in _REGION_TYPES:
             records = region_seqs.get(region_type, [])
-            msa_path = build_msa_from_records(gene_id, region_type, records)
+            # Strip ambiguous IUPAC characters phyloP rejects (keep only ACGT-)
+            clean_records = [
+                (sp, "".join(c if c in "ACGTacgt-" else "N" for c in seq))
+                for sp, seq in records
+            ]
+            msa_path = build_msa_from_records(gene_id, region_type, clean_records)
             if msa_path is None:
                 continue
             tmp_files.append(msa_path)
-            score = score_region(msa_path, mod_path, tool)
+
+            pruned_mod_str = region_mods.get(region_type)
+            if pruned_mod_str is None:
+                continue
+            score = score_region(msa_path, Path(pruned_mod_str), tool)
             field = _REGION_TO_FIELD[region_type]
             region_scores[field] = score
     finally:
@@ -532,14 +522,57 @@ def run_phylo_conservation(
     for gene_id, region_type, species_id, sequence in rows:
         gene_region_seqs[gene_id][region_type].append((species_id, sequence))
 
+    # Pre-build pruned .mod files for every unique species combination.
+    # With 18 species and variable coverage, there are ~50-200 unique subsets.
+    # Building them upfront (single-threaded, cached on disk) means workers
+    # never call tree_doctor — they just pass a stable path to phyloP.
+    log.info("Pre-building pruned neutral models for unique species subsets...")
+    species_set_to_mod: dict[frozenset, Optional[Path]] = {}
+    pruned_mod_dir = mod_path.parent / "pruned_mods"
+    pruned_mod_dir.mkdir(exist_ok=True)
+
+    for gene_id, region_map in gene_region_seqs.items():
+        for region_type, records in region_map.items():
+            if len(records) < _MIN_SPECIES_FOR_PHYLOP:
+                continue
+            key = frozenset(sp for sp, _ in records)
+            if key not in species_set_to_mod:
+                species_list = sorted(key)
+                # Use a stable filename so we can skip re-building on reruns
+                subset_hash = hashlib.md5(",".join(species_list).encode()).hexdigest()[:8]
+                cached_path = pruned_mod_dir / f"pruned_{subset_hash}_{len(species_list)}sp.mod"
+                if cached_path.exists():
+                    species_set_to_mod[key] = cached_path
+                else:
+                    tmp_path = _pruned_mod_via_tree_doctor(mod_path, species_list)
+                    if tmp_path is not None:
+                        tmp_path.rename(cached_path)
+                        species_set_to_mod[key] = cached_path
+                    else:
+                        species_set_to_mod[key] = None
+
+    n_unique = sum(1 for v in species_set_to_mod.values() if v is not None)
+    log.info("Pre-built %d pruned models for %d unique species subsets.",
+             n_unique, len(species_set_to_mod))
+
     log.info("Phylogenetic conservation scoring with %s for %d genes (parallel)...",
              tool, len(gene_ids))
 
+    # Build work items: pass stable pruned mod path per gene/region directly
+    # so workers never call tree_doctor or write temp .mod files.
     n_workers = int(get_tool_config().get("phylop_workers", min(60, max(1, (os.cpu_count() or 4) * 4))))
-    work_items = [
-        (gid, dict(gene_region_seqs.get(gid, {})), str(mod_path), tool)
-        for gid in gene_ids
-    ]
+
+    def _make_work_item(gid: str) -> tuple:
+        region_map = dict(gene_region_seqs.get(gid, {}))
+        # Attach the pre-built mod path for each region's species set
+        region_mods: dict[str, Optional[str]] = {}
+        for rt, records in region_map.items():
+            key = frozenset(sp for sp, _ in records)
+            p = species_set_to_mod.get(key)
+            region_mods[rt] = str(p) if p is not None else None
+        return (gid, region_map, region_mods, tool)
+
+    work_items = [_make_work_item(gid) for gid in gene_ids]
     done = 0
     total = len(work_items)
 
