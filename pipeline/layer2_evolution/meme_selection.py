@@ -98,14 +98,15 @@ def _prefetch_all_cds(aligned_orthogroups: dict[str, dict[str, str]]) -> None:
              len(to_fetch), ncbi_total - len(to_fetch),
              len(all_accessions) - ncbi_total)
 
-    _BATCH = 200  # NCBI elink batch size (safe limit)
+    _ELINK_BATCH = 500   # NCBI elink supports up to 500 IDs per POST
+    _EFETCH_BATCH = 200  # efetch GenBank records are large; 200 is safe per request
     done = 0
     failed = 0
 
-    for batch_start in range(0, len(to_fetch), _BATCH):
-        batch = to_fetch[batch_start: batch_start + _BATCH]
+    for batch_start in range(0, len(to_fetch), _ELINK_BATCH):
+        batch = to_fetch[batch_start: batch_start + _ELINK_BATCH]
 
-        # Step 1: batch elink protein → nuccore_mrna
+        # Step 1: batch elink protein → nuccore_mrna (up to 500 per request)
         try:
             handle = Entrez.elink(
                 dbfrom="protein", db="nuccore",
@@ -142,45 +143,48 @@ def _prefetch_all_cds(aligned_orthogroups: dict[str, dict[str, str]]) -> None:
             done += len(batch)
             continue
 
-        # Step 2: batch efetch all nuc_ids at once
-        nuc_ids = list(acc_to_nuc.values())
+        # Step 2: efetch in sub-batches of 200 (GenBank records are large)
         acc_by_nuc = {v: k for k, v in acc_to_nuc.items()}
-        try:
-            handle = Entrez.efetch(
-                db="nuccore", id=",".join(nuc_ids),
-                rettype="gb", retmode="text",
-            )
-            records = list(SeqIO.parse(handle, "genbank"))
-            handle.close()
-            time.sleep(0.12)
-        except Exception as exc:
-            log.debug("Batch efetch failed: %s", exc)
-            for acc in acc_to_nuc:
-                (cache_dir / f"{acc}.fna").write_text("")
-            failed += len(acc_to_nuc)
-            done += len(batch)
-            continue
+        nuc_ids = list(acc_to_nuc.values())
+        fetched_nuc_ids: set[str] = set()
 
-        fetched_nuc_ids = set()
-        for record in records:
-            nuc_id = record.id.split(".")[0]
-            # Match back to accession via the nuc_id
-            matched_acc = None
-            for nid in acc_to_nuc.values():
-                if nid == nuc_id or record.id.startswith(nid):
-                    matched_acc = acc_by_nuc.get(nid)
-                    fetched_nuc_ids.add(nid)
-                    break
-            if matched_acc is None:
+        for efetch_start in range(0, len(nuc_ids), _EFETCH_BATCH):
+            sub_nuc_ids = nuc_ids[efetch_start: efetch_start + _EFETCH_BATCH]
+            try:
+                handle = Entrez.efetch(
+                    db="nuccore", id=",".join(sub_nuc_ids),
+                    rettype="gb", retmode="text",
+                )
+                records = list(SeqIO.parse(handle, "genbank"))
+                handle.close()
+                time.sleep(0.12)
+            except Exception as exc:
+                log.debug("Batch efetch failed: %s", exc)
+                for nid in sub_nuc_ids:
+                    acc = acc_by_nuc.get(nid)
+                    if acc:
+                        (cache_dir / f"{acc}.fna").write_text("")
+                failed += len(sub_nuc_ids)
                 continue
-            cds_seq = None
-            for feature in record.features:
-                if feature.type == "CDS":
-                    seq = str(feature.extract(record.seq))
-                    if len(seq) % 3 == 0 and seq.upper().startswith("ATG"):
-                        cds_seq = seq
+
+            for record in records:
+                nuc_id = record.id.split(".")[0]
+                matched_acc = None
+                for nid in sub_nuc_ids:
+                    if nid == nuc_id or record.id.startswith(nid):
+                        matched_acc = acc_by_nuc.get(nid)
+                        fetched_nuc_ids.add(nid)
                         break
-            (cache_dir / f"{matched_acc}.fna").write_text(cds_seq if cds_seq else "")
+                if matched_acc is None:
+                    continue
+                cds_seq = None
+                for feature in record.features:
+                    if feature.type == "CDS":
+                        seq = str(feature.extract(record.seq))
+                        if len(seq) % 3 == 0 and seq.upper().startswith("ATG"):
+                            cds_seq = seq
+                            break
+                (cache_dir / f"{matched_acc}.fna").write_text(cds_seq if cds_seq else "")
 
         # Cache any accessions whose nuc records didn't come back
         for acc, nid in acc_to_nuc.items():
