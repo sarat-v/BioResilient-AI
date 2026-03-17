@@ -119,8 +119,11 @@ def _prefetch_all_cds(aligned_orthogroups: dict[str, dict[str, str]]) -> None:
     elink_failed: list[str] = []
 
     def _post_elink(batch: list[str]) -> tuple[list[str], dict[str, str]]:
-        """POST elink for a batch; returns (failed_accs, acc→nuc_id mapping)."""
-        # Each ID must be a separate &id= parameter — not comma-joined
+        """POST elink for a batch; returns (failed_accs, acc→nuc_id mapping).
+
+        Parses XML directly with ElementTree — avoids Biopython thread-safety issues.
+        """
+        import xml.etree.ElementTree as ET
         parts = [("dbfrom", "protein"), ("db", "nuccore"),
                  ("linkname", "protein_nuccore_mrna"), ("retmode", "xml")]
         if api_key:
@@ -135,22 +138,21 @@ def _prefetch_all_cds(aligned_orthogroups: dict[str, dict[str, str]]) -> None:
             )
             with urlopen(req, timeout=60) as resp:
                 raw = resp.read()
-            import io
-            Entrez.tool = "bioresilient"
-            records = Entrez.read(io.BytesIO(raw))
+            root = ET.fromstring(raw)
+            # Build map: protein GI → nuccore ID from each <LinkSet>
             result: dict[str, str] = {}
+            # elink returns one <LinkSet> per input ID (in order)
+            linksets = root.findall("LinkSet")
             for i, acc in enumerate(batch):
-                try:
-                    for ls in records[i].get("LinkSetDb", []):
-                        if ls["LinkName"] in ("protein_nuccore_mrna", "protein_nuccore"):
-                            if ls["Link"]:
-                                result[acc] = ls["Link"][0]["Id"]
-                            break
-                except (IndexError, KeyError):
-                    pass
+                if i >= len(linksets):
+                    break
+                ls = linksets[i]
+                link_el = ls.find(".//LinkSetDb/Link/Id")
+                if link_el is not None:
+                    result[acc] = link_el.text
             return [], result
         except Exception as exc:
-            log.debug("elink POST failed: %s", exc)
+            log.warning("elink POST failed for batch of %d: %s", len(batch), exc)
             return batch, {}
 
     log.info("  CDS pre-fetch phase 1: elink %d accessions in batches of %d...",
@@ -238,7 +240,7 @@ def _prefetch_all_cds(aligned_orthogroups: dict[str, dict[str, str]]) -> None:
                     (cache_dir / f"{acc}.fna").write_text("")
             return written
         except Exception as exc:
-            log.debug("efetch batch failed: %s", exc)
+            log.warning("efetch batch failed: %s", exc)
             for nid in nuc_batch:
                 acc = acc_by_nuc.get(nid)
                 if acc:
