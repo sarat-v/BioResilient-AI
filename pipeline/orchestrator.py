@@ -463,9 +463,33 @@ def step6_evolutionary_selection(
     from pipeline.layer2_evolution.meme_selection import run_meme_pipeline
     from pipeline.layer2_evolution.selection import build_gene_og_map, load_selection_scores
 
-    selection_results = run_meme_pipeline(aligned_orthogroups, motifs_by_og, treefile)
     gene_by_og = build_gene_og_map()
-    load_selection_scores(selection_results, gene_by_og)
+
+    # Skip OGs already written to DB — safe to resume mid-run
+    from db.models import EvolutionScore
+    from db.session import get_session
+    with get_session() as session:
+        already_scored_genes = {
+            r[0] for r in session.query(EvolutionScore.gene_id)
+            .filter(EvolutionScore.dnds_ratio.isnot(None))
+            .all()
+        }
+    already_scored_ogs = {og for og, gid in gene_by_og.items() if gid in already_scored_genes}
+    if already_scored_ogs:
+        log.info("Skipping %d already-scored orthogroups; resuming from checkpoint.",
+                 len(already_scored_ogs))
+        aligned_orthogroups = {k: v for k, v in aligned_orthogroups.items()
+                                if k not in already_scored_ogs}
+
+    # Flush callback: write to DB every 500 OGs so progress is saved incrementally
+    def _flush(batch: dict[str, dict]) -> None:
+        load_selection_scores(batch, gene_by_og)
+
+    selection_results = run_meme_pipeline(
+        aligned_orthogroups, motifs_by_og, treefile, flush_callback=_flush
+    )
+    if selection_results:
+        load_selection_scores(selection_results, gene_by_og)
 
 
 def step6b_fel_busted(dry_run: bool = False) -> None:

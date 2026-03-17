@@ -776,6 +776,23 @@ def run_meme_pipeline(
 
     Returns {og_id: parsed_selection_result}.
     """
+def run_meme_pipeline(
+    aligned_orthogroups: dict[str, dict[str, str]],
+    motifs_by_og: dict[str, list],
+    species_treefile: Path,
+    flush_callback=None,
+) -> dict[str, dict]:
+    """Run MEME in parallel for all candidate orthogroups.
+
+    Falls back to protein divergence proxy for any orthogroup where CDS
+    fetching fails (e.g. UniProt accessions, missing NCBI links).
+
+    Args:
+        flush_callback: optional callable(batch: dict) called every 500 OGs
+            to write results to DB incrementally.
+
+    Returns {og_id: parsed_selection_result} for any remaining unflushed results.
+    """
     from pipeline.layer2_evolution.selection import _should_run_hyphy
     candidates = [og for og in aligned_orthogroups if _should_run_hyphy(og, motifs_by_og)]
     log.info("Running MEME on %d candidate orthogroups (falls back to proxy if CDS unavailable)...",
@@ -788,6 +805,8 @@ def run_meme_pipeline(
     meme_success = 0
     proxy_fallback = 0
     done = 0
+    pending_flush: dict[str, dict] = {}
+    _FLUSH_INTERVAL = 500
 
     work_items = [
         (og_id, aligned_orthogroups[og_id], str(species_treefile), motifs_by_og)
@@ -801,13 +820,31 @@ def run_meme_pipeline(
             done += 1
             if result is not None:
                 kind, parsed = result
+                pending_flush[og_id] = parsed
                 all_results[og_id] = parsed
                 if kind == "meme":
                     meme_success += 1
                 else:
                     proxy_fallback += 1
             if done % 100 == 0 or done == total:
-                log.info("  MEME: %d / %d orthogroups (%.0f%%).", done, total, 100 * done / total)
+                log.info("  MEME: %d / %d orthogroups (%.0f%%) — %d MEME, %d proxy, %d failed.",
+                         done, total, 100 * done / total,
+                         meme_success, proxy_fallback, done - meme_success - proxy_fallback)
+            # Flush to DB periodically
+            if flush_callback and len(pending_flush) >= _FLUSH_INTERVAL:
+                try:
+                    flush_callback(pending_flush)
+                    pending_flush.clear()
+                except Exception as exc:
+                    log.warning("MEME flush failed: %s", exc)
+
+    # Flush any remaining
+    if flush_callback and pending_flush:
+        try:
+            flush_callback(pending_flush)
+            pending_flush.clear()
+        except Exception as exc:
+            log.warning("MEME final flush failed: %s", exc)
 
     log.info("MEME complete: %d MEME, %d proxy fallback, %d failed.",
              meme_success, proxy_fallback, total - meme_success - proxy_fallback)
@@ -816,4 +853,5 @@ def run_meme_pipeline(
     from pipeline.stats import apply_bh_to_meme_results
     all_results = apply_bh_to_meme_results(all_results)
 
-    return all_results
+    # Return only unflushed results (empty if flush_callback handled everything)
+    return {} if flush_callback else all_results
