@@ -579,7 +579,11 @@ def run_phylo_conservation(
 
     # Build work items: pass stable pruned mod path per gene/region directly
     # so workers never call tree_doctor or write temp .mod files.
-    n_workers = int(get_tool_config().get("phylop_workers", min(60, max(1, (os.cpu_count() or 4) * 4))))
+    # phyloP is CPU-bound (not I/O-bound). Oversubscribing causes thrashing.
+    # Optimal: ~1-2 workers per core. With 3 phyloP calls per gene, 16 cores
+    # supports ~8 concurrent genes before saturating all cores.
+    default_workers = max(1, (os.cpu_count() or 4) // 2)
+    n_workers = int(get_tool_config().get("phylop_workers", default_workers))
 
     def _make_work_item(gid: str) -> tuple:
         region_map = dict(gene_region_seqs.get(gid, {}))
