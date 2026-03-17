@@ -120,22 +120,24 @@ def _prefetch_all_cds(aligned_orthogroups: dict[str, dict[str, str]]) -> None:
 
     def _post_elink(batch: list[str]) -> tuple[list[str], dict[str, str]]:
         """POST elink for a batch; returns (failed_accs, acc→nuc_id mapping)."""
-        params = {
-            "dbfrom": "protein", "db": "nuccore",
-            "linkname": "protein_nuccore_mrna",
-            "id": ",".join(batch),
-        }
+        # Each ID must be a separate &id= parameter — not comma-joined
+        parts = [("dbfrom", "protein"), ("db", "nuccore"),
+                 ("linkname", "protein_nuccore_mrna"), ("retmode", "xml")]
         if api_key:
-            params["api_key"] = api_key
+            parts.append(("api_key", api_key))
+        for acc in batch:
+            parts.append(("id", acc))
         try:
             req = Request(
                 base_url + "elink.fcgi",
-                data=urlencode(params, doseq=True).encode(),
+                data=urlencode(parts).encode(),
                 method="POST",
             )
             with urlopen(req, timeout=60) as resp:
                 raw = resp.read()
-            records = Entrez.read(__import__("io").BytesIO(raw))
+            import io
+            Entrez.tool = "bioresilient"
+            records = Entrez.read(io.BytesIO(raw))
             result: dict[str, str] = {}
             for i, acc in enumerate(batch):
                 try:
