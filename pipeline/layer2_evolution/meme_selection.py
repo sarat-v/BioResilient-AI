@@ -776,6 +776,7 @@ def run_meme_pipeline(
 
     Returns {og_id: parsed_selection_result}.
     """
+    from pipeline.layer2_evolution.selection import _should_run_hyphy
     candidates = [og for og in aligned_orthogroups if _should_run_hyphy(og, motifs_by_og)]
     log.info("Running MEME on %d candidate orthogroups (falls back to proxy if CDS unavailable)...",
              len(candidates))
