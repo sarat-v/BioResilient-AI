@@ -1,0 +1,149 @@
+{
+  "step": "step2",
+  "timestamp": "2026-03-14T08:54:27.952526+00:00",
+  "species_count": 18,
+  "species": [
+    {
+      "id": "naked_mole_rat",
+      "proteome_path": null,
+      "is_control": false,
+      "lineage_group": "Rodents"
+    },
+    {
+      "id": "blind_mole_rat",
+      "proteome_path": null,
+      "is_control": false,
+      "lineage_group": "Rodents"
+    },
+    {
+      "id": "damaraland_mole_rat",
+      "proteome_path": null,
+      "is_control": false,
+      "lineage_group": "Rodents"
+    },
+    {
+      "id": "beaver",
+      "proteome_path": null,
+      "is_control": false,
+      "lineage_group": "Rodents"
+    },
+    {
+      "id": "bowhead_whale",
+      "proteome_path": null,
+      "is_control": false,
+      "lineage_group": "Cetaceans"
+    },
+    {
+      "id": "sperm_whale",
+      "proteome_path": null,
+      "is_control": false,
+      "lineage_group": "Cetaceans"
+    },
+    {
+      "id": "african_elephant",
+      "proteome_path": null,
+      "is_control": false,
+      "lineage_group": "Proboscideans"
+    },
+    {
+      "id": "asian_elephant",
+      "proteome_path": null,
+      "is_control": false,
+      "lineage_group": "Proboscideans"
+    },
+    {
+      "id": "greenland_shark",
+      "proteome_path": null,
+      "is_control": false,
+      "lineage_group": "Sharks"
+    },
+    {
+      "id": "little_skate",
+      "proteome_path": null,
+      "is_control": false,
+      "lineage_group": "Sharks"
+    },
+    {
+      "id": "ocean_quahog_clam",
+      "proteome_path": null,
+      "is_control": false,
+      "lineage_group": "Molluscs"
+    },
+    {
+      "id": "little_brown_bat",
+      "proteome_path": null,
+      "is_control": false,
+      "lineage_group": "Bats"
+    },
+    {
+      "id": "elephant_shark",
+      "proteome_path": null,
+      "is_control": false,
+      "lineage_group": "Cartilaginous fish"
+    },
+    {
+      "id": "hydra",
+      "proteome_path": null,
+      "is_control": false,
+      "lineage_group": "Cnidarians"
+    },
+    {
+      "id": "human",
+      "proteome_path": null,
+      "is_control": false,
+      "lineage_group": "Primates"
+    },
+    {
+      "id": "rat",
+      "proteome_path": null,
+      "is_control": true,
+      "lineage_group": "Rodents"
+    },
+    {
+      "id": "macaque",
+      "proteome_path": null,
+      "is_control": true,
+      "lineage_group": "Primates"
+    },
+    {
+      "id": "painted_turtle",
+      "proteome_path": null,
+      "is_control": false,
+      "lineage_group": "Reptiles"
+    }
+  ],
+  "protein_counts": {
+    "blind_mole_rat": 47817,
+    "greenland_shark": 51045,
+    "ocean_quahog_clam": 78735,
+    "bowhead_whale": 42988,
+    "sperm_whale": 50590,
+    "little_skate": 36230,
+    "human": 20431,
+    "elephant_shark": 28237,
+    "little_brown_bat": 43106,
+    "damaraland_mole_rat": 43907,
+    "painted_turtle": 57064,
+    "naked_mole_rat": 60814,
+    "beaver": 37422,
+    "rat": 73415,
+    "macaque": 67976,
+    "hydra": 32703,
+    "asian_elephant": 53692,
+    "african_elephant": 41267
+  },
+  "_validation": {
+    "step": "step2",
+    "status": "PASS",
+    "checks": [
+      {
+        "name": "species_downloaded",
+        "result": "PASS",
+        "value": 18,
+        "threshold": "\u226514",
+        "message": ""
+      }
+    ],
+    "recommendation": ""
+  }
+}

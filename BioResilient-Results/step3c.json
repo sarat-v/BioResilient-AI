@@ -1,0 +1,88 @@
+{
+  "step": "step3c",
+  "timestamp": "2026-03-14T17:46:50.060426+00:00",
+  "nucleotide_regions_total": 550841,
+  "genes_with_regions": 12784,
+  "species_with_regions": 18,
+  "regions_by_type": {
+    "cds": 183622,
+    "downstream": 183613,
+    "promoter": 183606
+  },
+  "genes_scored": 5680,
+  "total_regulatory_divergence_events": 1242496,
+  "total_regulatory_convergence_events": 1241969,
+  "mean_cds_conservation": 0.077,
+  "mean_promoter_conservation": 0.111,
+  "mean_downstream_conservation": 0.209,
+  "top10_promoter_divergence": [
+    {
+      "gene": "IL32_HUMAN",
+      "divergence_count": 2165
+    },
+    {
+      "gene": "TUG1_HUMAN",
+      "divergence_count": 2080
+    },
+    {
+      "gene": "OR6M1_HUMAN",
+      "divergence_count": 1454
+    },
+    {
+      "gene": "DCDC1_HUMAN",
+      "divergence_count": 1426
+    },
+    {
+      "gene": "IL26_HUMAN",
+      "divergence_count": 1408
+    },
+    {
+      "gene": "ZNF16_HUMAN",
+      "divergence_count": 1371
+    },
+    {
+      "gene": "SETD9_HUMAN",
+      "divergence_count": 1370
+    },
+    {
+      "gene": "ZACN_HUMAN",
+      "divergence_count": 1363
+    },
+    {
+      "gene": "NBDY_HUMAN",
+      "divergence_count": 1354
+    },
+    {
+      "gene": "GVQW3_HUMAN",
+      "divergence_count": 1330
+    }
+  ],
+  "_validation": {
+    "step": "step3c",
+    "status": "PASS",
+    "checks": [
+      {
+        "name": "regions_extracted",
+        "result": "PASS",
+        "value": 12784,
+        "threshold": ">0 genes",
+        "message": ""
+      },
+      {
+        "name": "promoter_coverage",
+        "result": "PASS",
+        "value": "1436.2%",
+        "threshold": "\u226550%",
+        "message": ""
+      },
+      {
+        "name": "regulatory_divergence_events",
+        "result": "INFO",
+        "value": 1242496,
+        "threshold": "any",
+        "message": "1242496 divergence events, 1241969 convergent events detected across all promoters."
+      }
+    ],
+    "recommendation": ""
+  }
+}

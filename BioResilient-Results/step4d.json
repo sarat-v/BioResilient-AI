@@ -1,0 +1,66 @@
+{
+  "step": "step4d",
+  "timestamp": "2026-03-16T14:10:41.483327+00:00",
+  "direction_counts": {
+    "gain_of_function": 96956,
+    "neutral": 868263
+  },
+  "top10_gain_of_function": [
+    {
+      "gene": "KCAB1_HUMAN",
+      "motif_count": 92
+    },
+    {
+      "gene": "KPCA_HUMAN",
+      "motif_count": 86
+    },
+    {
+      "gene": "PTBP1_HUMAN",
+      "motif_count": 83
+    },
+    {
+      "gene": "LIN7A_HUMAN",
+      "motif_count": 77
+    },
+    {
+      "gene": "ARC1A_HUMAN",
+      "motif_count": 76
+    },
+    {
+      "gene": "GBRL1_HUMAN",
+      "motif_count": 74
+    },
+    {
+      "gene": "CATD_HUMAN",
+      "motif_count": 70
+    },
+    {
+      "gene": "IMA5_HUMAN",
+      "motif_count": 65
+    },
+    {
+      "gene": "PRRT2_HUMAN",
+      "motif_count": 65
+    },
+    {
+      "gene": "ELMO1_HUMAN",
+      "motif_count": 65
+    }
+  ],
+  "top10_loss_of_function": [],
+  "functional_shift_count": 0,
+  "_validation": {
+    "step": "step4d",
+    "status": "WARN",
+    "checks": [
+      {
+        "name": "direction_signal",
+        "result": "WARN",
+        "value": "90.0% neutral/unclassified",
+        "threshold": "<80%",
+        "message": "Most motifs unclassified \u2014 AM and ESM-1v scores may be incomplete."
+      }
+    ],
+    "recommendation": ""
+  }
+}

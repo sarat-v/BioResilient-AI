@@ -1,0 +1,72 @@
+{
+  "step": "step3d",
+  "timestamp": "2026-03-17T04:07:17.783037+00:00",
+  "genes_with_phylo_score": 12546,
+  "mean_cds_phylo_score": 3035.9694,
+  "mean_promoter_phylo_score": 0.0038,
+  "mean_downstream_phylo_score": 717.3636,
+  "genes_accelerated_promoter": 0,
+  "top10_accelerated_promoter": [
+    {
+      "gene": "FGF23_HUMAN",
+      "promoter_phylo_score": null
+    },
+    {
+      "gene": "SPNS2_HUMAN",
+      "promoter_phylo_score": null
+    },
+    {
+      "gene": "PRR15_HUMAN",
+      "promoter_phylo_score": null
+    },
+    {
+      "gene": "DISC1_HUMAN",
+      "promoter_phylo_score": null
+    },
+    {
+      "gene": "FIGLA_HUMAN",
+      "promoter_phylo_score": null
+    },
+    {
+      "gene": "XCR1_HUMAN",
+      "promoter_phylo_score": null
+    },
+    {
+      "gene": "ZP1_HUMAN",
+      "promoter_phylo_score": null
+    },
+    {
+      "gene": "LETM1_HUMAN",
+      "promoter_phylo_score": null
+    },
+    {
+      "gene": "RHOH_HUMAN",
+      "promoter_phylo_score": null
+    },
+    {
+      "gene": "AHRR_HUMAN",
+      "promoter_phylo_score": null
+    }
+  ],
+  "_validation": {
+    "step": "step3d",
+    "status": "PASS",
+    "checks": [
+      {
+        "name": "phylo_scores",
+        "result": "PASS",
+        "value": "12546 genes scored",
+        "threshold": ">0",
+        "message": ""
+      },
+      {
+        "name": "accelerated_promoter_genes",
+        "result": "INFO",
+        "value": 0,
+        "threshold": "any",
+        "message": "0 genes show accelerated promoter evolution (negative phyloP score) \u2014 candidates for regulatory adaptation."
+      }
+    ],
+    "recommendation": ""
+  }
+}

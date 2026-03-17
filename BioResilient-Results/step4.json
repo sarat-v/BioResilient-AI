@@ -1,0 +1,167 @@
+{
+  "step": "step4",
+  "timestamp": "2026-03-16T01:10:25.102176+00:00",
+  "motif_count": 965219,
+  "genes_with_motifs": 12185,
+  "motifs_per_species": {
+    "african_elephant": 54072,
+    "asian_elephant": 52038,
+    "beaver": 54098,
+    "blind_mole_rat": 54970,
+    "bowhead_whale": 48978,
+    "damaraland_mole_rat": 60823,
+    "elephant_shark": 76764,
+    "greenland_shark": 60421,
+    "hydra": 51903,
+    "little_brown_bat": 54345,
+    "little_skate": 78001,
+    "macaque": 20995,
+    "naked_mole_rat": 53397,
+    "ocean_quahog_clam": 60606,
+    "painted_turtle": 75898,
+    "rat": 56788,
+    "sperm_whale": 51122
+  },
+  "lineage_motif_coverage": {
+    "Bats": 6991,
+    "Cartilaginous fish": 9619,
+    "Cetaceans": 7531,
+    "Cnidarians": 6489,
+    "Molluscs": 7583,
+    "Primates": 2760,
+    "Proboscideans": 7922,
+    "Reptiles": 9531,
+    "Rodents": 10066,
+    "Sharks": 10445
+  },
+  "top20_genes_by_motifs": [
+    {
+      "gene_id": "8eed54a7-39ca-5457-972e-d979db1548cb",
+      "symbol": "ACM1_HUMAN",
+      "motif_count": 136
+    },
+    {
+      "gene_id": "12b8b7be-7b33-5dc8-9fdd-94db5766cea2",
+      "symbol": "S13A1_HUMAN",
+      "motif_count": 136
+    },
+    {
+      "gene_id": "0ef56090-ec6b-5a0c-9840-0c7fa2783b24",
+      "symbol": "RAB17_HUMAN",
+      "motif_count": 136
+    },
+    {
+      "gene_id": "6e2fabaa-3443-58b0-8594-b24943f0b741",
+      "symbol": "TBCD_HUMAN",
+      "motif_count": 136
+    },
+    {
+      "gene_id": "87670110-362c-5381-8414-f6946142bf22",
+      "symbol": "HYLS1_HUMAN",
+      "motif_count": 136
+    },
+    {
+      "gene_id": "05c06aa7-c4c9-53d0-bd14-d343cedb6e23",
+      "symbol": "ASTE1_HUMAN",
+      "motif_count": 136
+    },
+    {
+      "gene_id": "ab5f443f-d172-5f8b-aa18-0f76d992b960",
+      "symbol": "CE164_HUMAN",
+      "motif_count": 136
+    },
+    {
+      "gene_id": "f49a9fa8-36d3-5648-9c9d-4bd8b5c0bc0a",
+      "symbol": "S26A1_HUMAN",
+      "motif_count": 136
+    },
+    {
+      "gene_id": "975debf1-dc0e-51b0-ac83-37cbae1b16de",
+      "symbol": "RGS12_HUMAN",
+      "motif_count": 136
+    },
+    {
+      "gene_id": "d86086f1-68a2-5413-a9a6-fb727b9204d4",
+      "symbol": "MORC1_HUMAN",
+      "motif_count": 136
+    },
+    {
+      "gene_id": "abe4c2de-c0a7-513e-950f-d1132cccc5c8",
+      "symbol": "RPGR_HUMAN",
+      "motif_count": 136
+    },
+    {
+      "gene_id": "b5a1f4e2-bc9d-5247-bb38-54c7e3014305",
+      "symbol": "ASGR1_HUMAN",
+      "motif_count": 136
+    },
+    {
+      "gene_id": "b072ff64-bedd-5bb9-8a7d-09b4e2f615e5",
+      "symbol": "ACOT1_HUMAN",
+      "motif_count": 136
+    },
+    {
+      "gene_id": "677a75a7-e9f3-57f0-80f4-48be878eea76",
+      "symbol": "PIEZ1_HUMAN",
+      "motif_count": 136
+    },
+    {
+      "gene_id": "7e0bdf61-390d-57d0-a701-ec1d75c8f061",
+      "symbol": "GRM2A_HUMAN",
+      "motif_count": 136
+    },
+    {
+      "gene_id": "7b2e4c6e-8d4a-5ea5-9f34-6ff0db33f0f0",
+      "symbol": "OPN3_HUMAN",
+      "motif_count": 136
+    },
+    {
+      "gene_id": "40b4b523-eabc-52e4-a9df-4c7bd27aa73d",
+      "symbol": "SMG1L_HUMAN",
+      "motif_count": 136
+    },
+    {
+      "gene_id": "bfcaf7a1-8031-5d79-aa03-a40711dbc020",
+      "symbol": "SYT7_HUMAN",
+      "motif_count": 136
+    },
+    {
+      "gene_id": "9c14ebdb-48fd-5240-bd60-e9bdc44eae1c",
+      "symbol": "KI26A_HUMAN",
+      "motif_count": 136
+    },
+    {
+      "gene_id": "8243a8c4-2526-51b4-9c74-f99cf0bce677",
+      "symbol": "HMHA1_HUMAN",
+      "motif_count": 136
+    }
+  ],
+  "_validation": {
+    "step": "step4",
+    "status": "PASS",
+    "checks": [
+      {
+        "name": "gate2_output",
+        "result": "PASS",
+        "value": 12185,
+        "threshold": "\u226550 genes",
+        "message": ""
+      },
+      {
+        "name": "lineage_coverage",
+        "result": "PASS",
+        "value": "10 lineages covered",
+        "threshold": "\u22656 lineages",
+        "message": ""
+      },
+      {
+        "name": "motif_count",
+        "result": "PASS",
+        "value": 965219,
+        "threshold": "\u2265100",
+        "message": ""
+      }
+    ],
+    "recommendation": ""
+  }
+}

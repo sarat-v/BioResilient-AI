@@ -1,0 +1,45 @@
+{
+  "step": "step1",
+  "timestamp": "2026-03-14T08:52:48.686481+00:00",
+  "tools_found": [
+    "orthofinder",
+    "mafft",
+    "diamond",
+    "fpocket",
+    "iqtree",
+    "hyphy"
+  ],
+  "tools_missing": [],
+  "db_ping_ms": 54.7,
+  "db_ok": true,
+  "gpu_available": false,
+  "gpu_name": null,
+  "_validation": {
+    "step": "step1",
+    "status": "PASS",
+    "checks": [
+      {
+        "name": "tools",
+        "result": "PASS",
+        "value": "all present",
+        "threshold": "all present",
+        "message": ""
+      },
+      {
+        "name": "database",
+        "result": "PASS",
+        "value": "54.7ms",
+        "threshold": "reachable",
+        "message": ""
+      },
+      {
+        "name": "gpu",
+        "result": "INFO",
+        "value": "not detected",
+        "threshold": "optional",
+        "message": "No GPU \u2014 step 4c (ESM embeddings) will run on CPU. Slower but functional."
+      }
+    ],
+    "recommendation": ""
+  }
+}

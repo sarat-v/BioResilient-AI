@@ -1,0 +1,125 @@
+{
+  "step": "step4b",
+  "timestamp": "2026-03-16T09:58:47.056546+00:00",
+  "motif_count": 965219,
+  "motifs_in_functional_domain": 141943,
+  "domain_pct": 14.7,
+  "top10_pfam_domains": [
+    {
+      "domain": "Protein kinase",
+      "count": 5250
+    },
+    {
+      "domain": "Peptidase S1",
+      "count": 2118
+    },
+    {
+      "domain": "Ig-like V-type",
+      "count": 1708
+    },
+    {
+      "domain": "PH",
+      "count": 1462
+    },
+    {
+      "domain": "WD 1",
+      "count": 1154
+    },
+    {
+      "domain": "KRAB",
+      "count": 1121
+    },
+    {
+      "domain": "USP",
+      "count": 1071
+    },
+    {
+      "domain": "BTB",
+      "count": 1048
+    },
+    {
+      "domain": "Ig-like C2-type",
+      "count": 1037
+    },
+    {
+      "domain": "Helicase ATP-binding",
+      "count": 1007
+    }
+  ],
+  "am_scored_count": 543590,
+  "am_pct_coverage": 56.3,
+  "am_likely_pathogenic": 109518,
+  "top10_am_motifs": [
+    {
+      "gene": "SMCA2_HUMAN",
+      "am_score": 1.0,
+      "domain": "HSA"
+    },
+    {
+      "gene": "CBX1_HUMAN",
+      "am_score": 1.0,
+      "domain": "Chromo 2; shadow subtype"
+    },
+    {
+      "gene": "ERR1_HUMAN",
+      "am_score": 1.0,
+      "domain": null
+    },
+    {
+      "gene": "SMCA2_HUMAN",
+      "am_score": 1.0,
+      "domain": "HSA"
+    },
+    {
+      "gene": "CBX1_HUMAN",
+      "am_score": 1.0,
+      "domain": "Chromo 2; shadow subtype"
+    },
+    {
+      "gene": "CBX1_HUMAN",
+      "am_score": 1.0,
+      "domain": "Chromo 2; shadow subtype"
+    },
+    {
+      "gene": "GATA1_HUMAN",
+      "am_score": 1.0,
+      "domain": null
+    },
+    {
+      "gene": "PAK1_HUMAN",
+      "am_score": 1.0,
+      "domain": "Protein kinase"
+    },
+    {
+      "gene": "ERR1_HUMAN",
+      "am_score": 1.0,
+      "domain": null
+    },
+    {
+      "gene": "CBX1_HUMAN",
+      "am_score": 1.0,
+      "domain": "Chromo 2; shadow subtype"
+    }
+  ],
+  "_validation": {
+    "step": "step4b",
+    "status": "WARN",
+    "checks": [
+      {
+        "name": "domain_coverage",
+        "result": "WARN",
+        "value": "14.7%",
+        "threshold": "\u226520%",
+        "message": "Fewer motifs in domains than expected \u2014 may indicate generic surface noise."
+      },
+      {
+        "name": "alphamissense_coverage",
+        "result": "PASS",
+        "value": "56.3%",
+        "threshold": "\u226550%",
+        "message": ""
+      }
+    ],
+    "recommendation": ""
+  }
+}

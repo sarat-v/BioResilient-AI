@@ -1,0 +1,97 @@
+{
+  "step": "step3b",
+  "timestamp": "2026-03-14T10:56:34.673818+00:00",
+  "gene_count": 12795,
+  "ortholog_count": 200979,
+  "one_to_one_count": 199561,
+  "species_ortholog_coverage": {
+    "african_elephant": 12177,
+    "asian_elephant": 12321,
+    "beaver": 12126,
+    "blind_mole_rat": 12241,
+    "bowhead_whale": 12293,
+    "damaraland_mole_rat": 12014,
+    "elephant_shark": 10260,
+    "greenland_shark": 7709,
+    "human": 12795,
+    "hydra": 6617,
+    "little_brown_bat": 11682,
+    "little_skate": 10402,
+    "macaque": 12649,
+    "naked_mole_rat": 12162,
+    "ocean_quahog_clam": 7715,
+    "painted_turtle": 11360,
+    "rat": 12219,
+    "sperm_whale": 12237
+  },
+  "top10_orthogroups": [
+    {
+      "og": "OG0002579",
+      "members": 36
+    },
+    {
+      "og": "OG0003439",
+      "members": 36
+    },
+    {
+      "og": "OG0000439",
+      "members": 36
+    },
+    {
+      "og": "OG0002682",
+      "members": 35
+    },
+    {
+      "og": "OG0001042",
+      "members": 35
+    },
+    {
+      "og": "OG0008904",
+      "members": 34
+    },
+    {
+      "og": "OG0001834",
+      "members": 34
+    },
+    {
+      "og": "OG0000301",
+      "members": 33
+    },
+    {
+      "og": "OG0002732",
+      "members": 33
+    },
+    {
+      "og": "OG0010565",
+      "members": 33
+    }
+  ],
+  "_validation": {
+    "step": "step3b",
+    "status": "PASS",
+    "checks": [
+      {
+        "name": "gene_count",
+        "result": "PASS",
+        "value": 12795,
+        "threshold": "\u22655000",
+        "message": ""
+      },
+      {
+        "name": "ortholog_count",
+        "result": "PASS",
+        "value": 200979,
+        "threshold": "\u226510000",
+        "message": ""
+      },
+      {
+        "name": "one_to_one",
+        "result": "PASS",
+        "value": 199561,
+        "threshold": "\u2265500",
+        "message": ""
+      }
+    ],
+    "recommendation": ""
+  }
+}
