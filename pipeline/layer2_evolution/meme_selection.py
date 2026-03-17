@@ -54,6 +54,87 @@ def _setup_entrez() -> None:
         Entrez.api_key = api_key
 
 
+def _prefetch_all_cds(aligned_orthogroups: dict[str, dict[str, str]]) -> None:
+    """Pre-fetch CDS for all unique protein accessions before spawning workers.
+
+    Collects every unique accession across all orthogroups, skips already-cached
+    ones, and fetches the rest sequentially at NCBI's max rate (10 req/s with key).
+    This is faster than 14 workers all hammering NCBI in parallel because:
+      - No rate-limit collisions between workers
+      - One elink batch call per accession instead of per-worker duplication
+      - Progress is visible and resumable (disk cache)
+    """
+    _setup_entrez()
+    cache_dir = Path(get_local_storage_root()) / "cds"
+    cache_dir.mkdir(parents=True, exist_ok=True)
+
+    # Collect all unique NCBI accessions
+    all_accessions: set[str] = set()
+    for seqs in aligned_orthogroups.values():
+        for label in seqs:
+            acc = label.split("|")[-1] if "|" in label else label
+            if re.match(r"^[A-Z0-9]+_[A-Z]+$", acc):
+                continue  # UniProt mnemonic — skip
+            all_accessions.add(acc)
+
+    # Filter to uncached
+    to_fetch = [a for a in sorted(all_accessions)
+                if not (cache_dir / f"{a}.fna").exists()]
+
+    if not to_fetch:
+        log.info("CDS pre-fetch: all %d accessions already cached.", len(all_accessions))
+        return
+
+    log.info("CDS pre-fetch: fetching %d / %d unique accessions (rest already cached)...",
+             len(to_fetch), len(all_accessions))
+
+    done = 0
+    failed = 0
+    for acc in to_fetch:
+        cache_file = cache_dir / f"{acc}.fna"
+        try:
+            handle = Entrez.elink(dbfrom="protein", db="nuccore", id=acc,
+                                  linkname="protein_nuccore_mrna")
+            link_record = Entrez.read(handle)
+            handle.close()
+            time.sleep(0.11)
+
+            nuc_ids = []
+            if link_record and link_record[0].get("LinkSetDb"):
+                for link in link_record[0]["LinkSetDb"]:
+                    if link["LinkName"] in ("protein_nuccore_mrna", "protein_nuccore"):
+                        nuc_ids = [lnk["Id"] for lnk in link["Link"]]
+                        break
+
+            if not nuc_ids:
+                cache_file.write_text("")
+            else:
+                handle = Entrez.efetch(db="nuccore", id=nuc_ids[0],
+                                       rettype="gb", retmode="text")
+                record = SeqIO.read(handle, "genbank")
+                handle.close()
+                time.sleep(0.11)
+                cds_seq = None
+                for feature in record.features:
+                    if feature.type == "CDS":
+                        seq = str(feature.extract(record.seq))
+                        if len(seq) % 3 == 0 and seq.upper().startswith("ATG"):
+                            cds_seq = seq
+                            break
+                cache_file.write_text(cds_seq if cds_seq else "")
+        except Exception as exc:
+            log.debug("CDS pre-fetch failed for %s: %s", acc, exc)
+            failed += 1
+            cache_file.write_text("")  # cache failure so workers don't retry
+
+        done += 1
+        if done % 1000 == 0:
+            log.info("  CDS pre-fetch: %d / %d done (%d failed).", done, len(to_fetch), failed)
+
+    log.info("CDS pre-fetch complete: %d fetched, %d failed, %d already cached.",
+             done - failed, failed, len(all_accessions) - len(to_fetch))
+
+
 def fetch_cds_for_protein(protein_accession: str) -> Optional[str]:
     """Fetch the CDS nucleotide sequence for a protein accession from NCBI.
 
@@ -797,6 +878,10 @@ def run_meme_pipeline(
     candidates = [og for og in aligned_orthogroups if _should_run_hyphy(og, motifs_by_og)]
     log.info("Running MEME on %d candidate orthogroups (falls back to proxy if CDS unavailable)...",
              len(candidates))
+
+    # Pre-fetch all CDS sequences to disk cache before spawning workers.
+    # This avoids 14 workers competing for NCBI's rate limit simultaneously.
+    _prefetch_all_cds(aligned_orthogroups)
 
     n_cpu = os.cpu_count() or 8
     n_workers = max(1, n_cpu - 2)
