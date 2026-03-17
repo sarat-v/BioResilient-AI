@@ -502,6 +502,25 @@ def run_phylo_conservation(
                 r[0] for r in session.query(NucleotideRegion.gene_id).distinct().all()
             ]
 
+        # Skip genes already scored — safe to resume mid-run
+        already_scored = {
+            r[0] for r in session.query(PhyloConservationScore.gene_id)
+            .filter(
+                (PhyloConservationScore.cds_phylo_score.isnot(None)) |
+                (PhyloConservationScore.promoter_phylo_score.isnot(None))
+            )
+            .all()
+        }
+        if already_scored:
+            before = len(gene_ids)
+            gene_ids = [g for g in gene_ids if g not in already_scored]
+            log.info("Skipping %d already-scored genes; %d remaining.",
+                     before - len(gene_ids), len(gene_ids))
+
+        if not gene_ids:
+            log.info("All genes already scored — step3d complete.")
+            return len(already_scored)
+
         # Bulk-fetch all nucleotide sequences in one query — avoids opening a
         # DB connection per worker thread (which exhausts the connection pool).
         log.info("Pre-fetching nucleotide sequences for %d genes...", len(gene_ids))
