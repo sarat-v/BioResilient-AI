@@ -31,6 +31,7 @@ import subprocess
 import tempfile
 import time
 from concurrent.futures import ProcessPoolExecutor, as_completed
+from io import StringIO
 from pathlib import Path
 from typing import Optional
 
@@ -117,11 +118,52 @@ def _prefetch_all_cds(aligned_orthogroups: dict[str, dict[str, str]]) -> None:
     for batch_start in range(0, len(to_fetch), _ELINK_BATCH):
         batch = to_fetch[batch_start: batch_start + _ELINK_BATCH]
 
-        # Step 1: batch elink protein → nuccore_mrna (up to 500 per request)
+        # Step 1: try direct CDS fetch via protein fasta_cds_na (works for XP_/NP_)
+        # This is faster and more reliable than elink for RefSeq accessions.
+        try:
+            handle = Entrez.efetch(
+                db="protein", id=",".join(batch[:_EFETCH_BATCH]),
+                rettype="fasta_cds_na", retmode="text",
+            )
+            raw = handle.read()
+            handle.close()
+            time.sleep(0.12)
+
+            # Parse: each record's description contains the protein accession
+            direct_hits: set[str] = set()
+            for record in SeqIO.parse(StringIO(raw), "fasta"):
+                # Header like: >lcl|NM_... [protein_id=NP_001386127.1] ...
+                desc = record.description
+                for acc in batch:
+                    if acc in desc:
+                        seq = str(record.seq)
+                        if len(seq) % 3 == 0 and seq.upper().startswith("ATG"):
+                            (cache_dir / f"{acc}.fna").write_text(seq)
+                        else:
+                            (cache_dir / f"{acc}.fna").write_text("")
+                        direct_hits.add(acc)
+                        break
+
+            # For accessions not found via direct fetch, fall back to elink
+            remaining = [a for a in batch if a not in direct_hits]
+            done_direct = len(batch) - len(remaining)
+        except Exception as exc:
+            log.debug("Direct CDS fetch failed for batch at %d: %s", batch_start, exc)
+            remaining = batch
+            done_direct = 0
+
+        if not remaining:
+            done += len(batch)
+            if done % 2000 == 0 or done >= len(to_fetch):
+                log.info("  CDS pre-fetch: %d / %d done (%d failed).",
+                         done, len(to_fetch), failed)
+            continue
+
+        # Step 2: elink fallback for accessions not found via direct fetch
         try:
             handle = Entrez.elink(
                 dbfrom="protein", db="nuccore",
-                id=",".join(batch),
+                id=",".join(remaining),
                 linkname="protein_nuccore_mrna",
             )
             link_records = Entrez.read(handle)
@@ -129,15 +171,15 @@ def _prefetch_all_cds(aligned_orthogroups: dict[str, dict[str, str]]) -> None:
             time.sleep(0.12)
         except Exception as exc:
             log.debug("Batch elink failed for batch at %d: %s", batch_start, exc)
-            for acc in batch:
+            for acc in remaining:
                 (cache_dir / f"{acc}.fna").write_text("")
-            failed += len(batch)
+            failed += len(remaining)
             done += len(batch)
             continue
 
         # Build acc → nuc_id map
         acc_to_nuc: dict[str, str] = {}
-        for i, acc in enumerate(batch):
+        for i, acc in enumerate(remaining):
             try:
                 linksetdb = link_records[i].get("LinkSetDb", [])
                 for ls in linksetdb:
@@ -148,13 +190,13 @@ def _prefetch_all_cds(aligned_orthogroups: dict[str, dict[str, str]]) -> None:
             except (IndexError, KeyError):
                 pass
             if acc not in acc_to_nuc:
-                (cache_dir / f"{acc}.fna").write_text("")  # no CDS link
+                (cache_dir / f"{acc}.fna").write_text("")
 
         if not acc_to_nuc:
             done += len(batch)
             continue
 
-        # Step 2: efetch in sub-batches of 200 (GenBank records are large)
+        # Step 3: efetch GenBank for linked nuc IDs in sub-batches
         acc_by_nuc = {v: k for k, v in acc_to_nuc.items()}
         nuc_ids = list(acc_to_nuc.values())
         fetched_nuc_ids: set[str] = set()
