@@ -117,7 +117,7 @@ def _prefetch_all_cds(aligned_orthogroups: dict[str, dict[str, str]]) -> None:
     # No elink needed — protein db supports fasta_cds_na rettype directly.
     # The FASTA header contains [protein_id=XP_xxx] for mapping back to accession.
     _EFETCH_BATCH = 200
-    _EFETCH_WORKERS = 8
+    _EFETCH_WORKERS = min(8, (os.cpu_count() or 8))
     done_fetch = 0
     total_written = 0
     fetch_lock = threading.Lock()
