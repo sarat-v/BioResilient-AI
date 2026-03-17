@@ -113,87 +113,24 @@ def _prefetch_all_cds(aligned_orthogroups: dict[str, dict[str, str]]) -> None:
     log.info("CDS pre-fetch: %d NCBI accessions to fetch (%d cached, %d UniProt skipped).",
              len(to_fetch), ncbi_total - len(to_fetch), len(all_accessions) - ncbi_total)
 
-    # ── Phase 1: elink in large batches to map protein accession → nuccore ID ──
-    _ELINK_BATCH = 500
-    acc_to_nuc: dict[str, str] = {}
-    elink_failed: list[str] = []
-
-    def _post_elink(batch: list[str]) -> tuple[list[str], dict[str, str]]:
-        """POST elink for a batch; returns (failed_accs, acc→nuc_id mapping).
-
-        Parses XML directly with ElementTree — avoids Biopython thread-safety issues.
-        """
-        import xml.etree.ElementTree as ET
-        parts = [("dbfrom", "protein"), ("db", "nuccore"),
-                 ("linkname", "protein_nuccore_mrna"), ("retmode", "xml")]
-        if api_key:
-            parts.append(("api_key", api_key))
-        for acc in batch:
-            parts.append(("id", acc))
-        try:
-            req = Request(
-                base_url + "elink.fcgi",
-                data=urlencode(parts).encode(),
-                method="POST",
-            )
-            with urlopen(req, timeout=60) as resp:
-                raw = resp.read()
-            root = ET.fromstring(raw)
-            # Build map: protein GI → nuccore ID from each <LinkSet>
-            result: dict[str, str] = {}
-            # elink returns one <LinkSet> per input ID (in order)
-            linksets = root.findall("LinkSet")
-            for i, acc in enumerate(batch):
-                if i >= len(linksets):
-                    break
-                ls = linksets[i]
-                link_el = ls.find(".//LinkSetDb/Link/Id")
-                if link_el is not None:
-                    result[acc] = link_el.text
-            return [], result
-        except Exception as exc:
-            log.warning("elink POST failed for batch of %d: %s", len(batch), exc)
-            return batch, {}
-
-    log.info("  CDS pre-fetch phase 1: elink %d accessions in batches of %d...",
-             len(to_fetch), _ELINK_BATCH)
-
-    elink_batches = [to_fetch[i:i + _ELINK_BATCH] for i in range(0, len(to_fetch), _ELINK_BATCH)]
-    with ThreadPoolExecutor(max_workers=4) as pool:
-        futures = {pool.submit(_post_elink, b): b for b in elink_batches}
-        done_elink = 0
-        for fut in as_completed(futures):
-            failed_batch, mapping = fut.result()
-            acc_to_nuc.update(mapping)
-            for acc in failed_batch:
-                (cache_dir / f"{acc}.fna").write_text("")
-                elink_failed.append(acc)
-            # Mark accs with no link
-            for acc in futures[fut]:
-                if acc not in acc_to_nuc and acc not in elink_failed:
-                    (cache_dir / f"{acc}.fna").write_text("")
-            done_elink += len(futures[fut])
-            if done_elink % 5000 == 0 or done_elink >= len(to_fetch):
-                log.info("  elink: %d / %d done, %d mapped to nuccore.",
-                         done_elink, len(to_fetch), len(acc_to_nuc))
-            time.sleep(0.05)
-
-    log.info("  Phase 1 complete: %d protein→nuccore mappings, %d no-link.",
-             len(acc_to_nuc), len(to_fetch) - len(acc_to_nuc))
-
-    # ── Phase 2: efetch fasta_cds_na in parallel threads ──────────────────────
+    # ── Single phase: efetch fasta_cds_na directly from protein db ────────────
+    # No elink needed — protein db supports fasta_cds_na rettype directly.
+    # The FASTA header contains [protein_id=XP_xxx] for mapping back to accession.
     _EFETCH_BATCH = 200
     _EFETCH_WORKERS = 8
-    acc_by_nuc = {v: k for k, v in acc_to_nuc.items()}
-    nuc_ids = list(acc_to_nuc.values())
     done_fetch = 0
+    total_written = 0
     fetch_lock = threading.Lock()
 
-    def _fetch_cds_batch(nuc_batch: list[str]) -> int:
-        """Fetch fasta_cds_na for a batch of nuccore IDs; write to cache. Returns count written."""
+    _pid_pat = re.compile(r"\[protein_id=([^\]]+)\]")
+
+    def _fetch_cds_batch_direct(batch: list[str]) -> int:
+        """Fetch fasta_cds_na for a batch of protein accessions directly.
+        Returns count of CDS sequences written to cache.
+        """
         params = {
-            "db": "nuccore",
-            "id": ",".join(nuc_batch),
+            "db": "protein",
+            "id": ",".join(batch),
             "rettype": "fasta_cds_na",
             "retmode": "text",
         }
@@ -202,66 +139,70 @@ def _prefetch_all_cds(aligned_orthogroups: dict[str, dict[str, str]]) -> None:
         try:
             req = Request(
                 base_url + "efetch.fcgi",
-                data=urlencode(params, doseq=True).encode(),
+                data=urlencode(params).encode(),
                 method="POST",
             )
             with urlopen(req, timeout=120) as resp:
                 text = resp.read().decode("utf-8", errors="replace")
             written = 0
-            current_nuc_id = None
+            current_acc = None
             current_lines: list[str] = []
+
+            def _flush(acc: str, lines: list[str]) -> int:
+                seq = "".join(lines)
+                (cache_dir / f"{acc}.fna").write_text(seq if seq else "")
+                return 1 if seq else 0
+
             for line in text.splitlines():
                 if line.startswith(">"):
-                    if current_nuc_id and current_lines:
-                        acc = acc_by_nuc.get(current_nuc_id)
-                        if acc:
-                            seq = "".join(current_lines)
-                            (cache_dir / f"{acc}.fna").write_text(seq if seq else "")
-                            if seq:
-                                written += 1
+                    if current_acc and current_lines:
+                        written += _flush(current_acc, current_lines)
                     current_lines = []
-                    current_nuc_id = None
-                    for nid in nuc_batch:
-                        if nid in line:
-                            current_nuc_id = nid
-                            break
+                    current_acc = None
+                    m = _pid_pat.search(line)
+                    if m:
+                        pid = m.group(1)
+                        if pid in batch:
+                            current_acc = pid
+                        else:
+                            pid_base = pid.rsplit(".", 1)[0]
+                            for b in batch:
+                                if b.rsplit(".", 1)[0] == pid_base:
+                                    current_acc = b
+                                    break
                 else:
-                    current_lines.append(line.strip())
-            if current_nuc_id and current_lines:
-                acc = acc_by_nuc.get(current_nuc_id)
-                if acc:
-                    seq = "".join(current_lines)
-                    (cache_dir / f"{acc}.fna").write_text(seq if seq else "")
-                    if seq:
-                        written += 1
-            for nid in nuc_batch:
-                acc = acc_by_nuc.get(nid)
-                if acc and not (cache_dir / f"{acc}.fna").exists():
+                    if current_acc:
+                        current_lines.append(line.strip())
+
+            if current_acc and current_lines:
+                written += _flush(current_acc, current_lines)
+
+            for acc in batch:
+                if not (cache_dir / f"{acc}.fna").exists():
                     (cache_dir / f"{acc}.fna").write_text("")
             return written
         except Exception as exc:
-            log.warning("efetch batch failed: %s", exc)
-            for nid in nuc_batch:
-                acc = acc_by_nuc.get(nid)
-                if acc:
+            log.warning("efetch direct batch failed: %s", exc)
+            for acc in batch:
+                if not (cache_dir / f"{acc}.fna").exists():
                     (cache_dir / f"{acc}.fna").write_text("")
             return 0
 
-    log.info("  CDS pre-fetch phase 2: efetch fasta_cds_na for %d nuccore IDs "
-             "(%d workers, batches of %d)...", len(nuc_ids), _EFETCH_WORKERS, _EFETCH_BATCH)
+    log.info("  CDS pre-fetch: efetch fasta_cds_na from protein db, "
+             "%d accessions, %d workers, batches of %d...",
+             len(to_fetch), _EFETCH_WORKERS, _EFETCH_BATCH)
 
-    efetch_batches = [nuc_ids[i:i + _EFETCH_BATCH] for i in range(0, len(nuc_ids), _EFETCH_BATCH)]
-    total_written = 0
+    efetch_batches = [to_fetch[i:i + _EFETCH_BATCH] for i in range(0, len(to_fetch), _EFETCH_BATCH)]
     with ThreadPoolExecutor(max_workers=_EFETCH_WORKERS) as pool:
-        futures2 = {pool.submit(_fetch_cds_batch, b): b for b in efetch_batches}
+        futures2 = {pool.submit(_fetch_cds_batch_direct, b): b for b in efetch_batches}
         for fut in as_completed(futures2):
             written = fut.result()
             with fetch_lock:
                 total_written += written
                 done_fetch += len(futures2[fut])
-                if done_fetch % 2000 == 0 or done_fetch >= len(nuc_ids):
-                    log.info("  efetch: %d / %d nuccore IDs done, %d CDS written.",
-                             done_fetch, len(nuc_ids), total_written)
+                if done_fetch % 2000 == 0 or done_fetch >= len(to_fetch):
+                    log.info("  efetch: %d / %d done, %d CDS written.",
+                             done_fetch, len(to_fetch), total_written)
             time.sleep(0.02)
 
     log.info("CDS pre-fetch complete: %d fetched, %d failed/no-CDS, %d already cached.",
