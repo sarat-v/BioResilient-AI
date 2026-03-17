@@ -523,10 +523,13 @@ def step6b_fel_busted(dry_run: bool = False) -> None:
         log.warning("  Species treefile not found; skipping step 6b.")
         return
 
-    results = run_fel_busted_pipeline(aligned, motifs_by_og, treefile)
     gene_by_og = build_gene_og_map()
-    updated = load_fel_busted_scores(results, gene_by_og)
-    log.info("  FEL/BUSTED: updated %d genes.", updated)
+
+    def _flush_fel_busted(batch: dict) -> None:
+        load_fel_busted_scores(batch, gene_by_og)
+
+    run_fel_busted_pipeline(aligned, motifs_by_og, treefile, flush_callback=_flush_fel_busted)
+    log.info("  FEL/BUSTED: complete.")
 
 
 def step6c_relax(dry_run: bool = False) -> None:
@@ -560,10 +563,13 @@ def step6c_relax(dry_run: bool = False) -> None:
         log.warning("  Species treefile not found; skipping step 6c.")
         return
 
-    results = run_relax_pipeline(aligned, motifs_by_og, treefile)
     gene_by_og = build_gene_og_map()
-    updated = load_relax_scores(results, gene_by_og)
-    log.info("  RELAX: updated %d genes.", updated)
+
+    def _flush_relax(batch: dict) -> None:
+        load_relax_scores(batch, gene_by_og)
+
+    run_relax_pipeline(aligned, motifs_by_og, treefile, flush_callback=_flush_relax)
+    log.info("  RELAX: complete.")
 
 
 def step7_convergence(dry_run: bool = False) -> None:

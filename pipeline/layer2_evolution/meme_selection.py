@@ -687,20 +687,38 @@ def run_fel_busted_pipeline(
     aligned_orthogroups: dict[str, dict[str, str]],
     motifs_by_og: dict[str, list],
     species_treefile: Path,
+    flush_callback=None,
 ) -> dict[str, dict]:
     """Run FEL and BUSTED in parallel for all candidate orthogroups.
+
+    Args:
+        flush_callback: optional callable(batch: dict) called every 500 OGs
+            to write results to DB incrementally (enables spot-safe resume).
 
     Returns {og_id: {"fel_sites": int, "busted_pvalue": float}}.
     """
     from pipeline.layer2_evolution.selection import _should_run_hyphy
 
     candidates = [og for og in aligned_orthogroups if _should_run_hyphy(og, motifs_by_og)]
+
+    # Skip OGs already scored — enables resume after spot termination
+    if flush_callback:
+        already_scored = _get_already_scored_fel_busted_ogs(candidates)
+        if already_scored:
+            log.info("  FEL+BUSTED: skipping %d already-scored OGs (resuming).", len(already_scored))
+            candidates = [og for og in candidates if og not in already_scored]
+
     log.info("Running FEL + BUSTED on %d candidate orthogroups...", len(candidates))
+    if not candidates:
+        log.info("  FEL+BUSTED: all OGs already scored.")
+        return {}
 
     n_cpu = os.cpu_count() or 8
     n_workers = max(1, n_cpu - 2)
     total = len(candidates)
     all_results: dict[str, dict] = {}
+    pending_flush: dict[str, dict] = {}
+    _FLUSH_INTERVAL = 500
     done = 0
 
     work_items = [
@@ -715,11 +733,49 @@ def run_fel_busted_pipeline(
             done += 1
             if result:
                 all_results[og_id] = result
+                pending_flush[og_id] = result
             if done % 100 == 0 or done == total:
                 log.info("  FEL+BUSTED: %d / %d orthogroups (%.0f%%).", done, total, 100 * done / total)
+            if flush_callback and len(pending_flush) >= _FLUSH_INTERVAL:
+                try:
+                    flush_callback(pending_flush)
+                    pending_flush.clear()
+                except Exception as exc:
+                    log.warning("FEL+BUSTED flush failed: %s", exc)
+
+    if flush_callback and pending_flush:
+        try:
+            flush_callback(pending_flush)
+            pending_flush.clear()
+        except Exception as exc:
+            log.warning("FEL+BUSTED final flush failed: %s", exc)
 
     log.info("FEL + BUSTED complete: %d / %d orthogroups processed.", len(all_results), len(candidates))
-    return all_results
+    return {} if flush_callback else all_results
+
+
+def _get_already_scored_fel_busted_ogs(og_ids: list[str]) -> set[str]:
+    """Return set of og_ids that already have fel_sites scored in the DB."""
+    try:
+        from db.session import get_session
+        from db.models import EvolutionScore, Ortholog
+        from sqlalchemy import and_
+        with get_session() as session:
+            scored_genes = {
+                row.gene_id for row in session.query(EvolutionScore.gene_id).filter(
+                    EvolutionScore.fel_sites.isnot(None)
+                )
+            }
+            og_map = {
+                row.orthofinder_og: row.gene_id
+                for row in session.query(Ortholog.orthofinder_og, Ortholog.gene_id).filter(
+                    Ortholog.orthofinder_og.in_(og_ids)
+                )
+            }
+        return {og for og, gid in og_map.items() if gid in scored_genes}
+    except Exception as exc:
+        log.debug("Could not check FEL+BUSTED scored OGs: %s", exc)
+        return set()
 
 
 
@@ -847,20 +903,38 @@ def run_relax_pipeline(
     aligned_orthogroups: dict[str, dict[str, str]],
     motifs_by_og: dict[str, list],
     species_treefile: Path,
+    flush_callback=None,
 ) -> dict[str, dict]:
     """Run RELAX in parallel for all candidate orthogroups that have codon alignments.
+
+    Args:
+        flush_callback: optional callable(batch: dict) called every 500 OGs
+            to write results to DB incrementally (enables spot-safe resume).
 
     Returns {og_id: {"relax_k": float, "relax_pvalue": float}}.
     """
     from pipeline.layer2_evolution.selection import _should_run_hyphy
 
     candidates = [og for og in aligned_orthogroups if _should_run_hyphy(og, motifs_by_og)]
+
+    # Skip OGs already scored — enables resume after spot termination
+    if flush_callback:
+        already_scored = _get_already_scored_relax_ogs(candidates)
+        if already_scored:
+            log.info("  RELAX: skipping %d already-scored OGs (resuming).", len(already_scored))
+            candidates = [og for og in candidates if og not in already_scored]
+
     log.info("Running RELAX on %d candidate orthogroups...", len(candidates))
+    if not candidates:
+        log.info("  RELAX: all OGs already scored.")
+        return {}
 
     n_cpu = os.cpu_count() or 8
     n_workers = max(1, n_cpu - 2)
     total = len(candidates)
     all_results: dict[str, dict] = {}
+    pending_flush: dict[str, dict] = {}
+    _FLUSH_INTERVAL = 500
     done = 0
     storage_root = str(get_local_storage_root())
 
@@ -876,11 +950,48 @@ def run_relax_pipeline(
             done += 1
             if result is not None:
                 all_results[og_id] = result
+                pending_flush[og_id] = result
             if done % 100 == 0 or done == total:
                 log.info("  RELAX: %d / %d orthogroups (%.0f%%).", done, total, 100 * done / total)
+            if flush_callback and len(pending_flush) >= _FLUSH_INTERVAL:
+                try:
+                    flush_callback(pending_flush)
+                    pending_flush.clear()
+                except Exception as exc:
+                    log.warning("RELAX flush failed: %s", exc)
+
+    if flush_callback and pending_flush:
+        try:
+            flush_callback(pending_flush)
+            pending_flush.clear()
+        except Exception as exc:
+            log.warning("RELAX final flush failed: %s", exc)
 
     log.info("RELAX complete: %d / %d orthogroups", len(all_results), len(candidates))
-    return all_results
+    return {} if flush_callback else all_results
+
+
+def _get_already_scored_relax_ogs(og_ids: list[str]) -> set[str]:
+    """Return set of og_ids that already have relax_k scored in the DB."""
+    try:
+        from db.session import get_session
+        from db.models import EvolutionScore, Ortholog
+        with get_session() as session:
+            scored_genes = {
+                row.gene_id for row in session.query(EvolutionScore.gene_id).filter(
+                    EvolutionScore.relax_k.isnot(None)
+                )
+            }
+            og_map = {
+                row.orthofinder_og: row.gene_id
+                for row in session.query(Ortholog.orthofinder_og, Ortholog.gene_id).filter(
+                    Ortholog.orthofinder_og.in_(og_ids)
+                )
+            }
+        return {og for og, gid in og_map.items() if gid in scored_genes}
+    except Exception as exc:
+        log.debug("Could not check RELAX scored OGs: %s", exc)
+        return set()
 
 
 # ---------------------------------------------------------------------------
