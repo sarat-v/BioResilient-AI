@@ -67,8 +67,13 @@ def _prefetch_all_cds(aligned_orthogroups: dict[str, dict[str, str]]) -> None:
     cache_dir = Path(get_local_storage_root()) / "cds"
     cache_dir.mkdir(parents=True, exist_ok=True)
 
-    _NCBI_PAT = re.compile(r"^[A-Z]{2}_?\d+(\.\d+)?$|^[A-Z]{1,2}\d{5,}(\.\d+)?$")
-    _UNIPROT_PAT = re.compile(r"^[A-Z0-9]+_[A-Z]{2,5}$|^[OPQ][0-9][A-Z0-9]{3}[0-9]$|^[A-NR-Z][0-9]([A-Z][A-Z0-9]{2}[0-9]){1,2}$")
+    # UniProt mnemonic: GENENAME_SPECIESCODE where SPECIESCODE is 3-5 uppercase letters
+    # e.g. CENPK_HUMAN, 1433E_HUMAN, ZN124_MOUSE
+    # RefSeq accessions like XP_049720501.1, NP_001386127.1 must NOT match this.
+    # Key distinction: RefSeq has digits after the underscore; UniProt has only letters.
+    _UNIPROT_MNEMONIC_PAT = re.compile(r"^[A-Z0-9]{1,11}_[A-Z]{3,5}$")
+    # UniProt accession format: O/P/Q + digit + 3 alphanum + digit, or A-N/R-Z + digit + ...
+    _UNIPROT_ACC_PAT = re.compile(r"^[OPQ][0-9][A-Z0-9]{3}[0-9](-\d+)?$|^[A-NR-Z][0-9]([A-Z][A-Z0-9]{2}[0-9]){1,2}(-\d+)?$")
 
     # Collect all unique accessions
     all_accessions: set[str] = set()
@@ -80,16 +85,22 @@ def _prefetch_all_cds(aligned_orthogroups: dict[str, dict[str, str]]) -> None:
     # Partition: skip UniProt/non-NCBI, skip already cached
     to_fetch = []
     for acc in sorted(all_accessions):
-        if _UNIPROT_PAT.match(acc):
+        if _UNIPROT_MNEMONIC_PAT.match(acc) or _UNIPROT_ACC_PAT.match(acc):
             # Cache as empty so workers skip immediately
             cf = cache_dir / f"{acc}.fna"
             if not cf.exists():
                 cf.write_text("")
             continue
-        if not (cache_dir / f"{acc}.fna").exists():
+        cf = cache_dir / f"{acc}.fna"
+        # Delete empty cache files for NCBI accessions — they may have been
+        # incorrectly cached as empty by the old UniProt-misclassifying regex
+        if cf.exists() and cf.stat().st_size == 0:
+            cf.unlink()
+        if not cf.exists():
             to_fetch.append(acc)
 
-    ncbi_total = len([a for a in all_accessions if not _UNIPROT_PAT.match(a)])
+    ncbi_total = len([a for a in all_accessions
+                      if not _UNIPROT_MNEMONIC_PAT.match(a) and not _UNIPROT_ACC_PAT.match(a)])
     if not to_fetch:
         log.info("CDS pre-fetch: all %d NCBI accessions already cached.", ncbi_total)
         return
@@ -214,8 +225,10 @@ def fetch_cds_for_protein(protein_accession: str) -> Optional[str]:
     # Strip species prefix (e.g. "human|human|NP_001234.1" → "NP_001234.1")
     acc = protein_accession.split("|")[-1] if "|" in protein_accession else protein_accession
 
-    # Skip non-NCBI accessions (UniProt style like ZN124_HUMAN)
-    if re.match(r"^[A-Z0-9]+_[A-Z]+$", acc):
+    # Skip non-NCBI accessions: UniProt mnemonics (GENE_SPECIES) and UniProt accessions
+    if re.match(r"^[A-Z0-9]{1,11}_[A-Z]{3,5}$", acc):  # UniProt mnemonic e.g. CENPK_HUMAN
+        return None
+    if re.match(r"^[OPQ][0-9][A-Z0-9]{3}[0-9]|^[A-NR-Z][0-9]([A-Z][A-Z0-9]{2}[0-9])", acc):
         return None
 
     # Check disk cache first — avoids all network I/O on resume/re-run
