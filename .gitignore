@@ -64,3 +64,4 @@ Thumbs.db
 .pip_deps/
 *.swp
 *.swo
+.env
