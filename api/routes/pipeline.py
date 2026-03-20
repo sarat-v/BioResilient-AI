@@ -1,13 +1,16 @@
 """Pipeline control endpoints — start runs, monitor status, stream logs.
 
-Supports two execution modes:
-  Seqera mode  — when SEQERA_API_TOKEN + SEQERA_WORKSPACE_ID + SEQERA_PIPELINE_ID
-                  are set, pipelines are launched on AWS Batch via Seqera Platform.
-  Local mode   — fallback; launches pipeline/orchestrator.py as a subprocess.
+Supports three execution modes:
+  Seqera API mode    — SEQERA_API_TOKEN + SEQERA_WORKSPACE_ID + SEQERA_PIPELINE_ID
+                       all set: pipelines are launched on AWS Batch via the Seqera
+                       Platform API.  Full status/log monitoring via Seqera.
+  Tower monitor mode — only SEQERA_API_TOKEN (or TOWER_ACCESS_TOKEN) set, no
+                       workspace/pipeline IDs: Nextflow subprocess runs locally with
+                       ``-with-tower`` flag.  Run appears in the user's personal
+                       Seqera workspace for monitoring.  Ideal for fresh accounts.
+  Local mode         — fallback; launches pipeline/orchestrator.py as a subprocess.
 
-The status and log-streaming endpoints work identically in both modes.
-In Seqera mode, a background thread fetches logs from the Seqera API and
-writes them to pipeline.log so the SSE endpoint can serve them unchanged.
+The status and log-streaming endpoints work identically in all modes.
 """
 
 import asyncio
@@ -27,8 +30,10 @@ from pydantic import BaseModel
 
 from api.services.seqera_client import (
     SeqeraClient,
+    _get_token,
     is_configured as seqera_is_configured,
     start_log_poller,
+    tower_monitor_mode,
 )
 from db.models import PipelineRun
 from db.session import get_session
@@ -264,6 +269,116 @@ def start_pipeline(req: RunRequest, background_tasks: BackgroundTasks):
             message="Pipeline launched on Seqera Platform (AWS Batch).",
             seqera_workflow_id=workflow_id,
             seqera_run_url=watch_url,
+        )
+
+    # ------------------------------------------------------------------
+    # Tower monitor mode: run Nextflow subprocess locally with -with-tower
+    # Only SEQERA_API_TOKEN / TOWER_ACCESS_TOKEN is set (no workspace/pipeline IDs).
+    # The run is visible on cloud.seqera.io → personal workspace.
+    # ------------------------------------------------------------------
+    if tower_monitor_mode():
+        token = _get_token()
+        workspace_id = os.getenv("SEQERA_WORKSPACE_ID", "")
+
+        # Build the nextflow command
+        nf_script = _REPO_ROOT / "nextflow" / "main.nf"
+        profile = os.getenv("NEXTFLOW_PROFILE", "aws")
+        db_url = os.getenv("DB_URL", os.getenv("DATABASE_URL", ""))
+        s3_bucket = os.getenv("S3_BUCKET", "bioresilient-data")
+        work_dir = f"s3://{s3_bucket}/nf-work"
+
+        cmd = [
+            "nextflow", "run", str(nf_script),
+            "-profile", profile,
+            "-with-tower",
+            "-resume",
+            "--resume_from", req.resume_from,
+            "--outdir", f"s3://{s3_bucket}/results",
+            "--work_dir", work_dir,
+        ]
+        if db_url:
+            cmd += ["--db_url", db_url]
+        if req.dry_run:
+            cmd += ["--dry_run", "true"]
+
+        env = os.environ.copy()
+        env["TOWER_ACCESS_TOKEN"] = token
+        if workspace_id:
+            env["TOWER_WORKSPACE_ID"] = workspace_id
+
+        try:
+            with get_session() as session:
+                run = PipelineRun(
+                    id=run_id,
+                    status="running",
+                    started_at=datetime.now(timezone.utc),
+                    step_statuses={},
+                )
+                session.add(run)
+                session.commit()
+        except Exception:
+            run_id = None  # type: ignore[assignment]
+
+        if run_id:
+            env["PIPELINE_RUN_ID"] = run_id
+
+        if req.resume_from == "step1" and not req.dry_run:
+            try:
+                _LOG_FILE.write_text("")
+            except Exception:
+                pass
+
+        _current_process = subprocess.Popen(
+            cmd,
+            cwd=str(_REPO_ROOT),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            env=env,
+        )
+
+        if run_id:
+            try:
+                with get_session() as session:
+                    db_run = session.get(PipelineRun, run_id)
+                    if db_run:
+                        db_run.pid = _current_process.pid
+                        session.commit()
+            except Exception:
+                pass
+
+        seqera_runs_url = (
+            "https://cloud.seqera.io/user/runs"
+            if not workspace_id
+            else f"https://cloud.seqera.io/orgs/{os.getenv('SEQERA_ORG_NAME', '_')}/workspaces/{os.getenv('SEQERA_WORKSPACE_NAME', workspace_id)}/watch"
+        )
+
+        _write_state({
+            "status": "running",
+            "run_id": run_id,
+            "seqera_run_url": seqera_runs_url,
+            "started_at": started_at,
+            "updated_at": started_at,
+            "resume_from": req.resume_from,
+            "dry_run": req.dry_run,
+            "steps": {},
+        })
+
+        def _drain_tower():
+            with open(_LOG_FILE, "ab") as lf:
+                for line in iter(_current_process.stdout.readline, b""):
+                    lf.write(line)
+                    lf.flush()
+            _current_process.stdout.close()
+
+        threading.Thread(target=_drain_tower, daemon=True).start()
+
+        return RunResponse(
+            run_id=run_id or started_at,
+            started_at=started_at,
+            resume_from=req.resume_from,
+            dry_run=req.dry_run,
+            message="Pipeline started (Nextflow + Tower monitoring). View at cloud.seqera.io.",
+            seqera_run_url=seqera_runs_url,
         )
 
     # ------------------------------------------------------------------

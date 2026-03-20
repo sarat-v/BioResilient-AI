@@ -1,18 +1,26 @@
 """Seqera Platform REST API client for BioResilient pipeline orchestration.
 
-Provides a thin wrapper around the Seqera Platform API to:
-- Launch Nextflow pipelines on AWS Batch via Seqera
-- Poll workflow run status and per-task progress
-- Translate Seqera task names back to BioResilient step IDs
-- Fetch live logs for the log-streaming SSE endpoint
+Two operating modes — pick the one that matches your Seqera setup:
 
-All methods are synchronous (compatible with FastAPI sync endpoints).
-Configure via environment variables:
-  SEQERA_API_TOKEN        — Bearer token from cloud.seqera.io → User tokens
-  SEQERA_WORKSPACE_ID     — Numeric workspace ID from Seqera settings
-  SEQERA_PIPELINE_ID      — Pipeline ID from Seqera Launchpad
-  SEQERA_ORG_NAME         — (optional) org slug for constructing watch URLs
-  SEQERA_WORKSPACE_NAME   — (optional) workspace slug for constructing watch URLs
+  FULL API MODE  (launch + monitor via Seqera Launchpad)
+  -------------------------------------------------------
+  Requires SEQERA_API_TOKEN + SEQERA_WORKSPACE_ID + SEQERA_PIPELINE_ID.
+  The API server calls Seqera to launch the pipeline; status + logs are
+  fetched via the Seqera API.  Best for production with a registered pipeline.
+
+  TOWER MONITOR MODE  (run Nextflow locally, monitor via Seqera)
+  --------------------------------------------------------------
+  Requires only SEQERA_API_TOKEN (or TOWER_ACCESS_TOKEN — they are the same).
+  The API server spawns a Nextflow subprocess with ``-with-tower``.
+  Runs appear automatically in your personal Seqera workspace.
+  No workspace ID or pre-registered pipeline needed — ideal for a fresh account.
+
+Environment variables:
+  SEQERA_API_TOKEN   — Bearer token (alias: TOWER_ACCESS_TOKEN)
+  SEQERA_WORKSPACE_ID — Numeric workspace ID (optional; omit → personal workspace)
+  SEQERA_PIPELINE_ID  — Pre-registered Launchpad pipeline ID (full API mode only)
+  SEQERA_ORG_NAME     — (optional) org slug for constructing watch URLs
+  SEQERA_WORKSPACE_NAME — (optional) workspace slug for constructing watch URLs
 """
 
 import logging
@@ -268,7 +276,7 @@ class SeqeraClient:
     @classmethod
     def from_env(cls) -> Optional["SeqeraClient"]:
         """Instantiate from environment variables. Returns ``None`` if not fully configured."""
-        token = os.getenv("SEQERA_API_TOKEN", "")
+        token = _get_token()
         workspace_id = os.getenv("SEQERA_WORKSPACE_ID", "")
         if not token or not workspace_id:
             return None
@@ -285,8 +293,47 @@ class SeqeraClient:
 # ---------------------------------------------------------------------------
 
 def is_configured() -> bool:
-    """Return ``True`` if the required Seqera env vars are present."""
-    return bool(os.getenv("SEQERA_API_TOKEN")) and bool(os.getenv("SEQERA_WORKSPACE_ID"))
+    """Return ``True`` if the required Seqera env vars are present (full API mode)."""
+    return bool(_get_token()) and bool(os.getenv("SEQERA_WORKSPACE_ID"))
+
+
+def tower_monitor_mode() -> bool:
+    """Return ``True`` if we have a token but NOT a full API-mode setup.
+
+    In this mode Nextflow runs as a local subprocess with ``-with-tower`` and
+    reports to the user's personal Seqera workspace.  No pre-registered pipeline
+    or workspace ID is needed.
+    """
+    return bool(_get_token()) and not is_configured()
+
+
+def _get_token() -> str:
+    """Return the Seqera / Tower access token from env, accepting both variable names."""
+    return os.getenv("SEQERA_API_TOKEN") or os.getenv("TOWER_ACCESS_TOKEN") or ""
+
+
+def fetch_workspace_id_from_api(token: str) -> Optional[str]:
+    """Auto-fetch the numeric ID of the caller's personal Seqera workspace.
+
+    Calls ``GET /user-info`` and returns the first workspace ID found.
+    Returns ``None`` on any failure.
+    """
+    try:
+        resp = requests.get(
+            f"{_SEQERA_BASE}/user-info",
+            headers={"Authorization": f"Bearer {token}"},
+            timeout=10,
+        )
+        resp.raise_for_status()
+        data = resp.json()
+        wid = (
+            data.get("user", {}).get("id")
+            or data.get("workspaceId")
+        )
+        return str(wid) if wid else None
+    except Exception as exc:
+        log.debug("fetch_workspace_id_from_api failed: %s", exc)
+        return None
 
 
 def start_log_poller(
