@@ -65,7 +65,7 @@ _ESM1V_MODEL_CACHE = None  # lazy-loaded
 
 
 def _load_esm1v_model():
-    """Load ESM-1v model. Returns (model, alphabet, batch_converter) or None."""
+    """Load ESM-1v model. Returns (model, alphabet, batch_converter, device) or None."""
     global _ESM1V_MODEL_CACHE
     if _ESM1V_MODEL_CACHE is not None:
         return _ESM1V_MODEL_CACHE
@@ -81,7 +81,13 @@ def _load_esm1v_model():
 
         device = "cuda" if torch.cuda.is_available() else "cpu"
         model = model.to(device)
-        log.info("ESM-1v model loaded on device=%s.", device)
+
+        amp_available = device == "cuda" and torch.cuda.is_available()
+        log.info(
+            "ESM-1v model loaded on device=%s (mixed-precision AMP=%s).",
+            device,
+            "enabled" if amp_available else "disabled (CPU)",
+        )
 
         _ESM1V_MODEL_CACHE = (model, alphabet, batch_converter, device)
         return _ESM1V_MODEL_CACHE
@@ -102,10 +108,15 @@ def _compute_logprobs_for_protein(
     Uses the unmasked-marginal approach: feed the full sequence once, read
     log-softmax over the vocabulary at every position.
 
+    On CUDA, uses torch.cuda.amp.autocast() for the transformer forward pass
+    (FP16 for matrix ops, ~1.5-2× faster on T4) then casts back to FP32 before
+    log_softmax to preserve numerical precision.
+
     Returns a CPU tensor of shape [L, vocab_size], or None on failure.
     Positions are 0-indexed (CLS token is stripped).
     """
     try:
+        import contextlib
         import torch
 
         model, alphabet, batch_converter, device = model_tuple
@@ -119,11 +130,20 @@ def _compute_logprobs_for_protein(
         _, _, batch_tokens = batch_converter(data)
         batch_tokens = batch_tokens.to(device)
 
-        with torch.no_grad():
-            logits = model(batch_tokens)["logits"]  # [1, L+2, vocab]
+        # Use AMP autocast on CUDA for FP16 tensor-core throughput.
+        # Explicitly cast logits to float32 before log_softmax — the softmax
+        # exponent is numerically sensitive and benefits from full precision.
+        amp_ctx = (
+            torch.cuda.amp.autocast()
+            if device == "cuda"
+            else contextlib.nullcontext()
+        )
+        with torch.no_grad(), amp_ctx:
+            logits = model(batch_tokens)["logits"]  # [1, L+2, vocab] — may be FP16
 
-        # Strip CLS (+1) and EOS (-1) tokens → shape [L, vocab]
-        log_probs = torch.nn.functional.log_softmax(logits[0, 1: len(seq) + 1], dim=-1)
+        # Strip CLS (+1) and EOS (-1) tokens → [L, vocab], cast to FP32
+        logits_fp32 = logits[0, 1: len(seq) + 1].float()
+        log_probs = torch.nn.functional.log_softmax(logits_fp32, dim=-1)
         return log_probs.cpu()
 
     except Exception as exc:

@@ -47,7 +47,7 @@ process run_orthofinder {
     label 'orthofinder'
     cpus params.orthofinder_cpus
     memory params.orthofinder_memory
-    time '12h'
+    time '4h'
 
     input:
     path proteomes
@@ -70,6 +70,7 @@ process load_orthologs {
     label 'base'
     cpus 2
     memory '8 GB'
+    time '30m'
 
     input:
     path results_dir
@@ -159,7 +160,7 @@ process esm1v_scoring {
     label 'esm'
     cpus params.esm_cpus
     memory params.esm_memory
-    time '6h'
+    time '2h'
 
     input:
     val motifs_loaded
@@ -180,8 +181,7 @@ process variant_direction {
     label 'base'
     cpus 2
     memory '4 GB'
-
-    input:
+    time '30m'
     val domains_done
     val esm_done
 

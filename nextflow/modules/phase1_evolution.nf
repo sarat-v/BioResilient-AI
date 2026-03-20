@@ -10,7 +10,7 @@ process build_species_tree {
     label 'phylo'
     cpus params.iqtree_cpus
     memory params.iqtree_memory
-    time '4h'
+    time '1h'
 
     input:
     path aligned_pkl
@@ -56,6 +56,7 @@ process extract_og_ids {
     label 'base'
     cpus 1
     memory '8 GB'
+    time '10m'
 
     input:
     path aligned_pkl
@@ -256,8 +257,7 @@ process convergent_aa {
     label 'base'
     cpus 4
     memory '8 GB'
-
-    input:
+    time '1h'
     val convergence_done
 
     output:

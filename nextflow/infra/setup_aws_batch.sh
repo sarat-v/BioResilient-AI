@@ -124,9 +124,13 @@ aws batch describe-compute-environments --compute-environments "${PREFIX}-spot" 
                 "type": "SPOT",
                 "allocationStrategy": "SPOT_PRICE_CAPACITY_OPTIMIZED",
                 "minvCpus": 0,
-                "maxvCpus": 256,
+                "maxvCpus": 512,
                 "desiredvCpus": 0,
-                "instanceTypes": ["c6i.xlarge", "c6i.2xlarge", "c5.xlarge", "c5.2xlarge", "m6i.xlarge", "m6i.2xlarge"],
+                "instanceTypes": [
+                    "c6i.large", "c6i.xlarge", "c6i.2xlarge",
+                    "c5.large", "c5.xlarge", "c5.2xlarge",
+                    "m6i.large", "m6i.xlarge", "m6i.2xlarge"
+                ],
                 "subnets": ["'"$(echo $SUBNET_IDS | tr ',' '","')"'"],
                 "securityGroupIds": ["'"$SG_IDS"'"],
                 "spotIamFleetRole": "arn:aws:iam::'"$ACCOUNT_ID"':role/aws-ec2-spot-fleet-tagging-role"
@@ -148,9 +152,13 @@ aws batch describe-compute-environments --compute-environments "${PREFIX}-large"
                 "type": "SPOT",
                 "allocationStrategy": "SPOT_PRICE_CAPACITY_OPTIMIZED",
                 "minvCpus": 0,
-                "maxvCpus": 64,
+                "maxvCpus": 128,
                 "desiredvCpus": 0,
-                "instanceTypes": ["c6i.4xlarge", "c6i.8xlarge", "m6i.4xlarge"],
+                "instanceTypes": [
+                    "c6i.4xlarge", "c6i.8xlarge",
+                    "m6i.4xlarge", "m6i.8xlarge",
+                    "r6i.2xlarge", "r6i.4xlarge"
+                ],
                 "subnets": ["'"$(echo $SUBNET_IDS | tr ',' '","')"'"],
                 "securityGroupIds": ["'"$SG_IDS"'"]
             }' \
@@ -171,9 +179,9 @@ aws batch describe-compute-environments --compute-environments "${PREFIX}-gpu" -
                 "type": "SPOT",
                 "allocationStrategy": "SPOT_PRICE_CAPACITY_OPTIMIZED",
                 "minvCpus": 0,
-                "maxvCpus": 16,
+                "maxvCpus": 32,
                 "desiredvCpus": 0,
-                "instanceTypes": ["g4dn.xlarge", "g4dn.2xlarge"],
+                "instanceTypes": ["g4dn.2xlarge", "g4dn.4xlarge"],
                 "subnets": ["'"$(echo $SUBNET_IDS | tr ',' '","')"'"],
                 "securityGroupIds": ["'"$SG_IDS"'"]
             }' \

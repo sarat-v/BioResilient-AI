@@ -99,8 +99,7 @@ process pathway_convergence {
     label 'base'
     cpus 2
     memory '4 GB'
-
-    input:
+    time '30m'
     val rare_done
     val lit_done
 
@@ -165,8 +164,7 @@ process gene_therapy {
     label 'base'
     cpus 2
     memory '4 GB'
-
-    input:
+    time '1h'
     val p2rank_done
 
     output:
@@ -230,8 +228,7 @@ process final_rescore {
     label 'base'
     cpus 2
     memory '4 GB'
-
-    input:
+    time '30m'
     val therapy_done
     val depmap_done
 
