@@ -5,7 +5,7 @@
 # Usage:
 #   bash docker/build_all.sh                     # build only
 #   bash docker/build_all.sh --push              # build + push to registry
-#   REGISTRY=xxxx.dkr.ecr.ap-southeast-2.amazonaws.com bash docker/build_all.sh --push
+#   REGISTRY=xxxx.dkr.ecr.ap-south-1.amazonaws.com bash docker/build_all.sh --push
 set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"

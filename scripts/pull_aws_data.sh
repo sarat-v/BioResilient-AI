@@ -5,7 +5,7 @@
 # via SSH, uploads the dump to S3, then downloads it here along with all S3 data.
 #
 # Usage:
-#   EC2_HOST=ec2-13-xx-xx.ap-southeast-2.compute.amazonaws.com \
+#   EC2_HOST=ec2-13-xx-xx.ap-south-1.compute.amazonaws.com \
 #   EC2_KEY=~/.ssh/my-key.pem \
 #   BACKUP_DIR="/Volumes/My Passport/BioResilient-backup" \
 #   bash scripts/pull_aws_data.sh
@@ -15,11 +15,11 @@ REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 BACKUP_DIR="${BACKUP_DIR:-$REPO_ROOT/aws-backup}"
 TIMESTAMP=$(date +"%Y%m%dT%H%M%S")
 
-RDS_HOST="bioresilient.chakgoo8k0sx.ap-southeast-2.rds.amazonaws.com"
+RDS_HOST="${RDS_HOST:-}"          # set via env: export RDS_HOST=bioresilient.xxxx.ap-south-1.rds.amazonaws.com
 RDS_USER="bioresilient"
 RDS_DB="bioresilient"
 S3_BUCKET="bioresilient-data"
-AWS_REGION="ap-southeast-2"
+AWS_REGION="ap-south-1"
 
 EC2_HOST="${EC2_HOST:-}"      # public DNS or IP of your EC2
 EC2_KEY="${EC2_KEY:-}"        # path to .pem key file

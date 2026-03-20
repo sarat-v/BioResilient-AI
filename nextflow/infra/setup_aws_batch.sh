@@ -14,7 +14,7 @@
 #   bash nextflow/infra/setup_aws_batch.sh
 set -euo pipefail
 
-REGION="${AWS_REGION:-ap-southeast-2}"
+REGION="${AWS_REGION:-ap-south-1}"
 ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text 2>/dev/null || echo "UNKNOWN")
 ECR_REGISTRY="${ACCOUNT_ID}.dkr.ecr.${REGION}.amazonaws.com"
 PREFIX="bioresilient"

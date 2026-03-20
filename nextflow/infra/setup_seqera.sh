@@ -16,7 +16,7 @@ set -euo pipefail
 
 TOWER_API="https://api.cloud.seqera.io"
 TOWER_TOKEN="${TOWER_ACCESS_TOKEN:-}"
-REGION="${AWS_REGION:-ap-southeast-2}"
+REGION="${AWS_REGION:-ap-south-1}"
 
 GREEN="\033[0;32m"; CYAN="\033[0;36m"; BOLD="\033[1m"; RED="\033[0;31m"; RESET="\033[0m"
 banner() { echo -e "\n${BOLD}${CYAN}━━━  $1  ━━━${RESET}\n"; }
