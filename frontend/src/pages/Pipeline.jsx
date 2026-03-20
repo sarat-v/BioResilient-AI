@@ -2,7 +2,7 @@ import { useEffect, useRef, useState, useCallback } from 'react'
 import { motion, AnimatePresence } from 'framer-motion'
 import {
   CheckCircle2, Circle, Loader2, AlertCircle, Play, Square,
-  ChevronDown, Terminal, RefreshCw,
+  ChevronDown, Terminal, RefreshCw, ExternalLink,
 } from 'lucide-react'
 import { api } from '@/lib/api'
 import { PageHeader, Spinner } from '@/components/ui'
@@ -168,6 +168,18 @@ export default function PipelinePage() {
         title="Pipeline Control"
         subtitle="Run the analysis pipeline and monitor progress"
       >
+        {status?.seqera_run_url && (
+          <a
+            href={status.seqera_run_url}
+            target="_blank"
+            rel="noopener noreferrer"
+            className="btn-ghost text-sm flex items-center gap-1.5"
+            title="Open live run details in Seqera Platform"
+          >
+            <ExternalLink className="w-4 h-4" />
+            View in Seqera
+          </a>
+        )}
         {isRunning ? (
           <button onClick={handleStop} disabled={actionLoading} className="btn-secondary text-sm text-danger border-danger/40">
             {actionLoading ? <Spinner className="w-4 h-4" /> : <Square className="w-4 h-4" />} Stop
@@ -276,12 +288,26 @@ export default function PipelinePage() {
           <div className="flex items-center gap-2 mb-3">
             <Terminal className="w-4 h-4 text-accent" />
             <p className="font-medium text-sm text-text-primary">Live Log</p>
-            {isRunning && (
-              <span className="ml-auto flex items-center gap-1.5 text-xs text-accent">
-                <span className="w-1.5 h-1.5 rounded-full bg-accent animate-pulse" />
-                Live
-              </span>
-            )}
+            <div className="ml-auto flex items-center gap-2">
+              {status?.seqera_run_url && (
+                <a
+                  href={status.seqera_run_url}
+                  target="_blank"
+                  rel="noopener noreferrer"
+                  className="flex items-center gap-1 text-xs text-text-muted hover:text-text-primary transition-colors"
+                  title="View detailed task logs in Seqera Platform"
+                >
+                  <ExternalLink className="w-3 h-3" />
+                  Seqera
+                </a>
+              )}
+              {isRunning && (
+                <span className="flex items-center gap-1.5 text-xs text-accent">
+                  <span className="w-1.5 h-1.5 rounded-full bg-accent animate-pulse" />
+                  Live
+                </span>
+              )}
+            </div>
           </div>
           <div
             ref={logsRef}
