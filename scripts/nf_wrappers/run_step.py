@@ -33,8 +33,8 @@ def _setup_env(args):
 
 
 def _load_species(phenotype: str) -> list[dict]:
-    from pipeline.config import load_species_registry
-    return load_species_registry(phenotype)
+    from pipeline.orchestrator import _load_species_registry
+    return _load_species_registry(phenotype)
 
 
 def _load_aligned(path: str) -> dict:
@@ -109,12 +109,18 @@ def run_step5(args):
 
 
 def run_step6_single_og(args):
-    """Per-OG MEME — called by Nextflow scatter."""
+    """Per-OG MEME — called by Nextflow scatter. Mirrors _meme_worker logic."""
     from pipeline.layer2_evolution.meme_selection import (
-        _build_codon_alignment,
-        _run_hyphy_meme,
-        _prefetch_cds_for_og,
+        fetch_cds_for_protein,
+        protein_to_codon_alignment,
+        run_meme,
+        parse_meme_results,
     )
+    from pipeline.layer2_evolution.selection import (
+        write_hyphy_input, run_absrel, parse_absrel_results,
+    )
+    from pipeline.layer2_evolution.phylo_tree import prune_tree_to_species
+
     og_id = args.og_id
     data = _load_aligned(args.input_pkl)
     aligned = data.get("aligned", data)
@@ -128,31 +134,55 @@ def run_step6_single_og(args):
     out_dir.mkdir(parents=True, exist_ok=True)
 
     seqs = aligned[og_id]
-    _prefetch_cds_for_og(seqs)
-    codon_aln = _build_codon_alignment(og_id, seqs, out_dir)
-    if codon_aln:
-        result = _run_hyphy_meme(og_id, codon_aln, treefile, out_dir)
-        with open(out_dir / "result.json", "w") as f:
-            json.dump(result or {}, f)
+    species_ids = [label.split("|")[0] for label in seqs]
+    pruned_tree = prune_tree_to_species(treefile, species_ids)
+
+    cds_seqs: dict[str, str] = {}
+    for label in seqs:
+        parts = label.split("|")
+        accession = parts[-1] if parts else label
+        cds = fetch_cds_for_protein(accession)
+        if cds:
+            cds_seqs[label] = cds
+
+    codon_aln = None
+    if len(cds_seqs) == len(seqs):
+        codon_aln = protein_to_codon_alignment(seqs, cds_seqs)
+
+    result = {"og_id": og_id}
+    if codon_aln is not None:
+        meme_json = run_meme(codon_aln, pruned_tree, og_id)
+        if meme_json is not None:
+            result.update(parse_meme_results(meme_json, og_id))
+            result["selection_model"] = "meme"
+        else:
+            result["status"] = "meme_failed"
     else:
-        log.warning("No codon alignment for %s", og_id)
-        with open(out_dir / "result.json", "w") as f:
-            json.dump({"og_id": og_id, "status": "no_codon_alignment"}, f)
+        aln_path, tree_path = write_hyphy_input(og_id, seqs, pruned_tree)
+        raw = run_absrel(aln_path, tree_path, og_id)
+        if raw is not None:
+            result.update(parse_absrel_results(raw))
+            result["selection_model"] = "proxy"
+        else:
+            result["status"] = "no_codon_alignment"
+
+    with open(out_dir / "result.json", "w") as f:
+        json.dump(result, f)
 
 
 def run_step6_collect(args):
     """Collect per-OG MEME results and write to DB."""
-    from pipeline.layer2_evolution.selection import load_selection_scores
-    from pipeline.layer2_evolution.meme_selection import build_gene_og_map
+    from pipeline.layer2_evolution.selection import load_selection_scores, build_gene_og_map
 
     results_dir = Path(args.input_dir)
     gene_by_og = build_gene_og_map()
-    batch = []
+    batch: dict[str, dict] = {}
     for rfile in results_dir.glob("*/result.json"):
         with open(rfile) as f:
             r = json.load(f)
-        if r and r.get("status") != "no_codon_alignment":
-            batch.append(r)
+        og_id = r.get("og_id") or rfile.parent.name
+        if r and r.get("status") not in ("no_codon_alignment", "meme_failed", "skipped"):
+            batch[og_id] = r
 
     if batch:
         load_selection_scores(batch, gene_by_og)
@@ -161,41 +191,103 @@ def run_step6_collect(args):
 
 def run_step6b_single_og(args):
     """Per-OG FEL+BUSTED — called by Nextflow scatter."""
+    from Bio import SeqIO
+    from pipeline.layer2_evolution.meme_selection import (
+        run_fel, run_busted,
+        parse_fel_results, parse_busted_results,
+    )
+    from pipeline.layer2_evolution.phylo_tree import prune_tree_to_species
+
     og_id = args.og_id
     out_dir = Path(args.output_dir or ".")
     out_dir.mkdir(parents=True, exist_ok=True)
-    codon_aln = Path(args.codon_aln)
+    codon_aln_path = Path(args.codon_aln)
     treefile = Path(args.treefile)
 
-    if not codon_aln.exists():
+    if not codon_aln_path.exists():
         log.warning("No codon alignment for %s", og_id)
-        json.dump({"og_id": og_id, "status": "skipped"}, open(out_dir / "result.json", "w"))
+        with open(out_dir / "result.json", "w") as f:
+            json.dump({"og_id": og_id, "status": "skipped"}, f)
         return
 
-    from pipeline.layer2_evolution.meme_selection import _run_hyphy_tool
-    fel = _run_hyphy_tool("fel", og_id, codon_aln, treefile, out_dir)
-    busted = _run_hyphy_tool("busted", og_id, codon_aln, treefile, out_dir)
+    codon_aln = {r.id: str(r.seq) for r in SeqIO.parse(str(codon_aln_path), "fasta")}
+    species_ids = [label.split("|")[0] for label in codon_aln]
+    pruned_tree = prune_tree_to_species(treefile, species_ids)
+
+    fel_json = run_fel(codon_aln, pruned_tree, og_id)
+    busted_json = run_busted(codon_aln, pruned_tree, og_id)
+    fel_result = parse_fel_results(fel_json) if fel_json else {"fel_sites": 0}
+    busted_result = parse_busted_results(busted_json) if busted_json else {"busted_pvalue": 1.0}
+
     with open(out_dir / "result.json", "w") as f:
-        json.dump({"og_id": og_id, "fel": fel, "busted": busted}, f)
+        json.dump({"og_id": og_id, **fel_result, **busted_result}, f)
 
 
 def run_step6c_single_og(args):
     """Per-OG RELAX — called by Nextflow scatter."""
+    from Bio import SeqIO
+    from pipeline.layer2_evolution.meme_selection import run_relax, parse_relax_results
+    from pipeline.layer2_evolution.phylo_tree import prune_tree_to_species
+
     og_id = args.og_id
     out_dir = Path(args.output_dir or ".")
     out_dir.mkdir(parents=True, exist_ok=True)
-    codon_aln = Path(args.codon_aln)
+    codon_aln_path = Path(args.codon_aln)
     treefile = Path(args.treefile)
 
-    if not codon_aln.exists():
+    if not codon_aln_path.exists():
         log.warning("No codon alignment for %s", og_id)
-        json.dump({"og_id": og_id, "status": "skipped"}, open(out_dir / "result.json", "w"))
+        with open(out_dir / "result.json", "w") as f:
+            json.dump({"og_id": og_id, "status": "skipped"}, f)
         return
 
-    from pipeline.layer2_evolution.meme_selection import _run_hyphy_tool
-    relax = _run_hyphy_tool("relax", og_id, codon_aln, treefile, out_dir)
+    codon_aln = {r.id: str(r.seq) for r in SeqIO.parse(str(codon_aln_path), "fasta")}
+    species_ids = [label.split("|")[0] for label in codon_aln]
+    pruned_tree = prune_tree_to_species(treefile, species_ids)
+
+    relax_json = run_relax(codon_aln, pruned_tree, og_id)
+    relax_result = parse_relax_results(relax_json) if relax_json else {"relax_k": None, "relax_pvalue": 1.0}
+
     with open(out_dir / "result.json", "w") as f:
-        json.dump({"og_id": og_id, "relax": relax}, f)
+        json.dump({"og_id": og_id, **relax_result}, f)
+
+
+def run_step6b_collect(args):
+    """Collect per-OG FEL+BUSTED results and write to DB."""
+    from pipeline.layer2_evolution.selection import load_fel_busted_scores, build_gene_og_map
+
+    results_dir = Path(args.input_dir)
+    gene_by_og = build_gene_og_map()
+    batch: dict[str, dict] = {}
+    for rfile in results_dir.glob("*/result.json"):
+        with open(rfile) as f:
+            r = json.load(f)
+        og_id = r.get("og_id") or rfile.parent.name
+        if r and r.get("status") != "skipped":
+            batch[og_id] = r
+
+    if batch:
+        load_fel_busted_scores(batch, gene_by_og)
+        log.info("Loaded %d FEL+BUSTED results to DB", len(batch))
+
+
+def run_step6c_collect(args):
+    """Collect per-OG RELAX results and write to DB."""
+    from pipeline.layer2_evolution.selection import load_relax_scores, build_gene_og_map
+
+    results_dir = Path(args.input_dir)
+    gene_by_og = build_gene_og_map()
+    batch: dict[str, dict] = {}
+    for rfile in results_dir.glob("*/result.json"):
+        with open(rfile) as f:
+            r = json.load(f)
+        og_id = r.get("og_id") or rfile.parent.name
+        if r and r.get("status") != "skipped":
+            batch[og_id] = r
+
+    if batch:
+        load_relax_scores(batch, gene_by_og)
+        log.info("Loaded %d RELAX results to DB", len(batch))
 
 
 def run_step7(args):
@@ -294,7 +386,9 @@ STEP_MAP = {
     "step6_single_og": run_step6_single_og,
     "step6_collect": run_step6_collect,
     "step6b_single_og": run_step6b_single_og,
+    "step6b_collect": run_step6b_collect,
     "step6c_single_og": run_step6c_single_og,
+    "step6c_collect": run_step6c_collect,
     "step7": run_step7,
     "step7b": run_step7b,
     "step8": run_step8,

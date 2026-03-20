@@ -189,6 +189,48 @@ process run_relax {
     """
 }
 
+process collect_fel_busted_results {
+    label 'base'
+    cpus 2
+    memory '8 GB'
+
+    input:
+    path 'results/*'
+
+    output:
+    val true, emit: fb_done
+
+    script:
+    """
+    python -m scripts.nf_wrappers.run_step \
+        --step step6b_collect \
+        --input-dir results/ \
+        --db-url '${params.db_url}' \
+        --storage-root '${params.storage_root}'
+    """
+}
+
+process collect_relax_results {
+    label 'base'
+    cpus 2
+    memory '8 GB'
+
+    input:
+    path 'results/*'
+
+    output:
+    val true, emit: relax_done
+
+    script:
+    """
+    python -m scripts.nf_wrappers.run_step \
+        --step step6c_collect \
+        --input-dir results/ \
+        --db-url '${params.db_url}' \
+        --storage-root '${params.storage_root}'
+    """
+}
+
 process convergence_scoring {
     label 'base'
     cpus 4
@@ -258,12 +300,19 @@ workflow PHASE1_EVOLUTION {
 
     // Step 6b: FEL+BUSTED — reuses codon alignments from MEME
     run_fel_busted(run_meme.out.meme_result, build_species_tree.out.treefile)
+    collect_fel_busted_results(run_fel_busted.out.fb_result.map { it[1] }.collect())
 
     // Step 6c: RELAX — also reuses codon alignments
     run_relax(run_meme.out.meme_result, build_species_tree.out.treefile)
+    collect_relax_results(run_relax.out.relax_result.map { it[1] }.collect())
 
-    // Step 7: convergence (after MEME results in DB)
-    convergence_scoring(collect_meme_results.out.meme_done)
+    // Step 7: convergence (after all selection results in DB)
+    convergence_scoring(
+        collect_meme_results.out.meme_done
+            .combine(collect_fel_busted_results.out.fb_done)
+            .combine(collect_relax_results.out.relax_done)
+            .map { true }
+    )
 
     // Step 7b: convergent AA
     convergent_aa(convergence_scoring.out.convergence_done)
