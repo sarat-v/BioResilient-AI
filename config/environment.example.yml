@@ -60,3 +60,7 @@ thresholds:
   expression_padj_max: 0.05
   tier1_composite_min: 0.70
   tier2_composite_min: 0.40
+  # Branch-length normalised divergence weighting (step 4).
+  # Requires species.treefile from step 5. Keep false on first run.
+  # Set true for reruns to scale divergence_score by inverse evolutionary distance.
+  divergence_apply_branch_norm: false

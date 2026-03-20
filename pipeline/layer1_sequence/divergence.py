@@ -324,7 +324,18 @@ def filter_by_independent_lineages(
 ) -> dict[str, list[dict]]:
     """Gate 2: keep only orthogroups with divergent motifs in ≥ min_lineages independent lineage groups.
 
-    species_to_lineage: {species_id: lineage_group} e.g. {'naked_mole_rat': 'Rodents', ...}
+    species_to_lineage: {species_id: lineage_group} — must be pre-filtered by the caller
+        to exclude control species (is_control=True) and baseline species.
+        Control species' motifs in passing OGs are preserved (they provide background-
+        branch sequences for HyPhy) but do NOT contribute to the lineage count.
+
+    Example caller pattern (see orchestrator.step4):
+        species_to_lineage = {
+            s["id"]: s["lineage_group"]
+            for s in species_list
+            if not s.get("is_control") and "baseline" not in s.get("phenotypes", [])
+        }
+
     Expected reduction: ~2k–4k → 500–800 orthogroups passed to HyPhy.
     """
     filtered: dict[str, list[dict]] = {}
@@ -342,6 +353,104 @@ def filter_by_independent_lineages(
         min_lineages,
     )
     return filtered
+
+
+def branch_length_weights_from_tree(
+    treefile: Path,
+    reference_species: str = "human",
+) -> dict[str, float]:
+    """Compute per-species divergence weights from an IQ-TREE Newick species tree.
+
+    Weight = min_distance / distance_to_reference, so the closest species to
+    *reference_species* gets weight 1.0 and more distant species get lower weights.
+    Closely related species' divergence signals are therefore up-weighted relative
+    to background noise from very distant lineages.
+
+    Returns {} (no-op) if the treefile is missing, ete3 is unavailable, or
+    the reference species is not a leaf in the tree.
+    """
+    if not treefile.exists():
+        log.info("Branch-length weighting: treefile not found at %s (expected on first run).", treefile)
+        return {}
+
+    try:
+        from ete3 import Tree  # type: ignore
+    except ImportError:
+        log.warning("ete3 not installed — branch-length divergence weighting skipped.")
+        return {}
+
+    try:
+        tree = Tree(str(treefile))
+    except Exception as exc:
+        log.warning("Could not parse treefile %s: %s — weighting skipped.", treefile, exc)
+        return {}
+
+    leaf_names = {n.name for n in tree.get_leaves()}
+    if reference_species not in leaf_names:
+        log.warning(
+            "'%s' not found in tree leaves %s — branch-length weighting skipped.",
+            reference_species, sorted(leaf_names),
+        )
+        return {}
+
+    distances: dict[str, float] = {}
+    for name in leaf_names:
+        if name == reference_species:
+            continue
+        try:
+            d = tree.get_distance(reference_species, name)
+            if d and d > 0:
+                distances[name] = d
+        except Exception as exc:
+            log.debug("Could not compute distance to %s: %s", name, exc)
+
+    if not distances:
+        log.warning("No valid distances computed from species tree — weighting skipped.")
+        return {}
+
+    min_dist = min(distances.values())
+    weights = {sid: round(min_dist / d, 4) for sid, d in distances.items()}
+
+    log.info(
+        "Branch-length weights from %s (reference='%s', min_dist=%.4f):",
+        treefile.name, reference_species, min_dist,
+    )
+    for sid, w in sorted(weights.items(), key=lambda x: -x[1]):
+        log.info("  %-30s  dist=%.4f  weight=%.4f", sid, distances[sid], w)
+
+    return weights
+
+
+def apply_branch_length_weighting(
+    motifs_by_og: dict[str, list[dict]],
+    species_weights: dict[str, float],
+) -> dict[str, list[dict]]:
+    """Scale each motif's divergence_score by the species' branch-length weight.
+
+    Motifs from evolutionary distant species (e.g., hydra, molluscs) get lower
+    divergence scores, reducing background noise in downstream convergence tests.
+    Species absent from species_weights are left unchanged (implicit weight = 1.0).
+    """
+    if not species_weights:
+        return motifs_by_og
+
+    updated: dict[str, list[dict]] = {}
+    for og_id, motifs in motifs_by_og.items():
+        new_motifs = []
+        for m in motifs:
+            w = species_weights.get(m.get("species_id", ""), 1.0)
+            if w != 1.0:
+                m = dict(m)
+                m["divergence_score"] = round(float(m["divergence_score"]) * w, 4)
+            new_motifs.append(m)
+        updated[og_id] = new_motifs
+
+    n_weighted = sum(1 for sid in species_weights)
+    log.info(
+        "Branch-length weighting applied to %d species across %d orthogroups.",
+        n_weighted, len(updated),
+    )
+    return updated
 
 
 def _divergence_worker(args: tuple) -> tuple[str, list[dict]]:

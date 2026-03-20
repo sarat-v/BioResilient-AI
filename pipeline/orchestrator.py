@@ -332,6 +332,8 @@ def step4_alignment_and_divergence(
         load_orthogroup_sequences_from_db,
     )
     from pipeline.layer1_sequence.divergence import (
+        apply_branch_length_weighting,
+        branch_length_weights_from_tree,
         filter_by_independent_lineages,
         load_motifs_to_db,
         run_divergence_pipeline,
@@ -356,6 +358,22 @@ def step4_alignment_and_divergence(
     update_sequence_identities(aligned)
 
     motifs_by_og_raw = run_divergence_pipeline(aligned)
+
+    # Optional: scale divergence_score by inverse evolutionary distance.
+    # Requires the IQ-TREE species tree from step 5 (chicken-and-egg on first run;
+    # set divergence_apply_branch_norm: true in environment.yml for reruns).
+    if thresholds.get("divergence_apply_branch_norm", False):
+        from pipeline.config import get_local_storage_root as _glsr
+        _treefile = Path(_glsr()) / "phylo" / "species.treefile"
+        _weights = branch_length_weights_from_tree(_treefile)
+        if _weights:
+            motifs_by_og_raw = apply_branch_length_weighting(motifs_by_og_raw, _weights)
+        else:
+            log.info(
+                "Branch-length weighting requested but tree unavailable — skipped. "
+                "Re-run step4 after step5 to apply weighting."
+            )
+
     species_to_lineage = {
         s["id"]: s.get("lineage_group", "Other")
         for s in species_list
