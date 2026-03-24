@@ -281,63 +281,84 @@ workflow PHASE1_EVOLUTION {
     directions_done
 
     main:
-    // Global step order — used to decide whether to skip step5/3d when resuming
-    def GLOBAL_STEPS = [
-        'step1','step2','step3','step3b','step3c','step3d',
-        'step4','step4b','step4c','step4d',
-        'step5','step6','step6b','step6c','step7','step7b',
-        'step8','step8b','step9',
-    ]
+    // Phase execution order — step3d runs after step5 in this workflow
+    def EVO_STEPS = ['step5','step3d','step6','step6b','step6c','step7','step7b']
     def fromStep   = params.from_step ?: 'step1'
-    def fromIdx    = GLOBAL_STEPS.indexOf(fromStep)
-    def step5Idx   = GLOBAL_STEPS.indexOf('step5')
+    def untilStep  = params['until'] ?: 'step7b'
+    def fromIdx    = EVO_STEPS.indexOf(fromStep)
+    def untilIdx   = EVO_STEPS.indexOf(untilStep)
+    def step5Idx   = EVO_STEPS.indexOf('step5')
+    if (fromIdx < 0) fromIdx = 0
+    if (untilIdx < 0) untilIdx = EVO_STEPS.size() - 1
 
     // ── Step 5: build species tree ────────────────────────────────────────
     // Skip when resuming from step6 or later — tree already in S3.
     if (fromIdx < 0 || fromIdx <= step5Idx) {
         build_species_tree(aligned_pkl)
         treefile_ch  = build_species_tree.out.treefile
+    } else {
+        treefile_ch  = Channel.fromPath("s3://${params.s3_bucket}/cache/species.treefile")
+    }
+
+    if (untilIdx >= EVO_STEPS.indexOf('step3d')) {
         phylo_conservation(treefile_ch, nuc_done)
         phylo_done_ch = phylo_conservation.out.phylo_done
     } else {
-        treefile_ch  = Channel.fromPath("s3://${params.s3_bucket}/cache/species.treefile")
         phylo_done_ch = Channel.value(true)
     }
 
-    // Extract OG IDs for scatter
-    extract_og_ids(aligned_pkl)
-    og_ids_ch = extract_og_ids.out.og_list
-        .splitText()
-        .map { it.trim() }
-        .filter { it.length() > 0 }
+    if (untilIdx >= EVO_STEPS.indexOf('step6')) {
+        extract_og_ids(aligned_pkl)
+        og_ids_ch = extract_og_ids.out.og_list
+            .splitText()
+            .map { it.trim() }
+            .filter { it.length() > 0 }
 
-    // Step 6: MEME — per-OG scatter
-    run_meme(og_ids_ch, aligned_pkl, treefile_ch)
+        // Step 6: MEME — per-OG scatter
+        run_meme(og_ids_ch, aligned_pkl, treefile_ch)
+        collect_meme_results(run_meme.out.meme_result.map { it[1] }.collect())
+        meme_done_ch = collect_meme_results.out.meme_done
+    } else {
+        meme_done_ch = Channel.value(true)
+    }
 
-    // Collect MEME results, write to DB
-    collect_meme_results(run_meme.out.meme_result.map { it[1] }.collect())
+    if (untilIdx >= EVO_STEPS.indexOf('step6b')) {
+        run_fel_busted(run_meme.out.meme_result, treefile_ch)
+        collect_fel_busted_results(run_fel_busted.out.fb_result.map { it[1] }.collect())
+        fb_done_ch = collect_fel_busted_results.out.fb_done
+    } else {
+        fb_done_ch = Channel.value(true)
+    }
 
-    // Step 6b: FEL+BUSTED — reuses codon alignments from MEME
-    run_fel_busted(run_meme.out.meme_result, treefile_ch)
-    collect_fel_busted_results(run_fel_busted.out.fb_result.map { it[1] }.collect())
+    if (untilIdx >= EVO_STEPS.indexOf('step6c')) {
+        run_relax(run_meme.out.meme_result, treefile_ch)
+        collect_relax_results(run_relax.out.relax_result.map { it[1] }.collect())
+        relax_done_ch = collect_relax_results.out.relax_done
+    } else {
+        relax_done_ch = Channel.value(true)
+    }
 
-    // Step 6c: RELAX — also reuses codon alignments
-    run_relax(run_meme.out.meme_result, treefile_ch)
-    collect_relax_results(run_relax.out.relax_result.map { it[1] }.collect())
+    if (untilIdx >= EVO_STEPS.indexOf('step7')) {
+        convergence_scoring(
+            meme_done_ch
+                .combine(fb_done_ch)
+                .combine(relax_done_ch)
+                .map { true }
+        )
+        convergence_done_ch = convergence_scoring.out.convergence_done
+    } else {
+        convergence_done_ch = Channel.value(true)
+    }
 
-    // Step 7: convergence (after all selection results in DB)
-    convergence_scoring(
-        collect_meme_results.out.meme_done
-            .combine(collect_fel_busted_results.out.fb_done)
-            .combine(collect_relax_results.out.relax_done)
-            .map { true }
-    )
-
-    // Step 7b: convergent AA
-    convergent_aa(convergence_scoring.out.convergence_done)
+    if (untilIdx >= EVO_STEPS.indexOf('step7b')) {
+        convergent_aa(convergence_done_ch)
+        convergent_aa_done_ch = convergent_aa.out.convergent_aa_done
+    } else {
+        convergent_aa_done_ch = Channel.value(true)
+    }
 
     emit:
     treefile          = treefile_ch
     phylo_done        = phylo_done_ch
-    convergent_aa_done = convergent_aa.out.convergent_aa_done
+    convergent_aa_done = convergent_aa_done_ch
 }

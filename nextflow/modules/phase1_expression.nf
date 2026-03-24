@@ -75,10 +75,35 @@ workflow PHASE1_EXPRESSION {
     phylo_done
 
     main:
-    expression_analysis(convergent_aa_done)
-    bgee_expression(expression_analysis.out.expression_done)
-    composite_score_phase1(bgee_expression.out.bgee_done, phylo_done)
+    def EXPR_STEPS = ['step8','step8b','step9']
+    def fromStep = params.from_step ?: 'step1'
+    def untilStep = params['until'] ?: 'step9'
+    def fromIdx = EXPR_STEPS.indexOf(fromStep)
+    def untilIdx = EXPR_STEPS.indexOf(untilStep)
+    if (fromIdx < 0) fromIdx = 0
+    if (untilIdx < 0) untilIdx = EXPR_STEPS.size() - 1
+
+    if (fromIdx <= EXPR_STEPS.indexOf('step8') && untilIdx >= EXPR_STEPS.indexOf('step8')) {
+        expression_analysis(convergent_aa_done)
+        expression_done_ch = expression_analysis.out.expression_done
+    } else {
+        expression_done_ch = Channel.value(true)
+    }
+
+    if (fromIdx <= EXPR_STEPS.indexOf('step8b') && untilIdx >= EXPR_STEPS.indexOf('step8b')) {
+        bgee_expression(expression_done_ch)
+        bgee_done_ch = bgee_expression.out.bgee_done
+    } else {
+        bgee_done_ch = Channel.value(true)
+    }
+
+    if (fromIdx <= EXPR_STEPS.indexOf('step9') && untilIdx >= EXPR_STEPS.indexOf('step9')) {
+        composite_score_phase1(bgee_done_ch, phylo_done)
+        scored_ch = composite_score_phase1.out.scored
+    } else {
+        scored_ch = Channel.value(true)
+    }
 
     emit:
-    scored = composite_score_phase1.out.scored
+    scored = scored_ch
 }

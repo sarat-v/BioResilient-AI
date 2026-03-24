@@ -100,6 +100,8 @@ process pathway_convergence {
     cpus 2
     memory '4 GB'
     time '30m'
+
+    input:
     val rare_done
     val lit_done
 
@@ -165,6 +167,8 @@ process gene_therapy {
     cpus 2
     memory '4 GB'
     time '1h'
+
+    input:
     val p2rank_done
 
     output:
@@ -229,6 +233,8 @@ process final_rescore {
     cpus 2
     memory '4 GB'
     time '30m'
+
+    input:
     val therapy_done
     val depmap_done
 
@@ -249,29 +255,100 @@ workflow PHASE2_CLINICAL {
     scored
 
     main:
+    def CLINICAL_STEPS = [
+        'step10b','step11','step11b','step11c','step11d',
+        'step12','step12b','step13','step14','step14b','step15'
+    ]
+    def fromStep = params.from_step ?: 'step1'
+    def untilStep = params['until'] ?: 'step15'
+    def fromIdx = CLINICAL_STEPS.indexOf(fromStep)
+    def untilIdx = CLINICAL_STEPS.indexOf(untilStep)
+    if (fromIdx < 0) fromIdx = 0
+    if (untilIdx < 0) untilIdx = CLINICAL_STEPS.size() - 1
+
     // step10b and step11 can run in parallel after scoring
-    alphagenome_regulatory(scored)
-    disease_annotation(scored)
+    if (fromIdx <= CLINICAL_STEPS.indexOf('step10b') && untilIdx >= CLINICAL_STEPS.indexOf('step10b')) {
+        alphagenome_regulatory(scored)
+        alphagenome_done_ch = alphagenome_regulatory.out.alphagenome_done
+    } else {
+        alphagenome_done_ch = Channel.value(true)
+    }
+
+    if (fromIdx <= CLINICAL_STEPS.indexOf('step11') && untilIdx >= CLINICAL_STEPS.indexOf('step11')) {
+        disease_annotation(scored)
+        disease_done_ch = disease_annotation.out.disease_done
+    } else {
+        disease_done_ch = Channel.value(true)
+    }
 
     // step11b and step11c can run in parallel after disease annotation
-    rare_variants(disease_annotation.out.disease_done)
-    literature_search(disease_annotation.out.disease_done)
+    if (fromIdx <= CLINICAL_STEPS.indexOf('step11b') && untilIdx >= CLINICAL_STEPS.indexOf('step11b')) {
+        rare_variants(disease_done_ch)
+        rare_done_ch = rare_variants.out.rare_done
+    } else {
+        rare_done_ch = Channel.value(true)
+    }
+
+    if (fromIdx <= CLINICAL_STEPS.indexOf('step11c') && untilIdx >= CLINICAL_STEPS.indexOf('step11c')) {
+        literature_search(disease_done_ch)
+        lit_done_ch = literature_search.out.lit_done
+    } else {
+        lit_done_ch = Channel.value(true)
+    }
 
     // step11d waits for 11b + 11c
-    pathway_convergence(rare_variants.out.rare_done, literature_search.out.lit_done)
+    if (fromIdx <= CLINICAL_STEPS.indexOf('step11d') && untilIdx >= CLINICAL_STEPS.indexOf('step11d')) {
+        pathway_convergence(rare_done_ch, lit_done_ch)
+        pathways_done_ch = pathway_convergence.out.pathways_done
+    } else {
+        pathways_done_ch = Channel.value(true)
+    }
 
     // step12 waits for pathways + alphagenome
-    druggability(pathway_convergence.out.pathways_done, alphagenome_regulatory.out.alphagenome_done)
-    p2rank_pockets(druggability.out.drug_done)
+    if (fromIdx <= CLINICAL_STEPS.indexOf('step12') && untilIdx >= CLINICAL_STEPS.indexOf('step12')) {
+        druggability(pathways_done_ch, alphagenome_done_ch)
+        drug_done_ch = druggability.out.drug_done
+    } else {
+        drug_done_ch = Channel.value(true)
+    }
+
+    if (fromIdx <= CLINICAL_STEPS.indexOf('step12b') && untilIdx >= CLINICAL_STEPS.indexOf('step12b')) {
+        p2rank_pockets(drug_done_ch)
+        p2rank_done_ch = p2rank_pockets.out.p2rank_done
+    } else {
+        p2rank_done_ch = Channel.value(true)
+    }
 
     // step13 and step14 can run in parallel
-    gene_therapy(p2rank_pockets.out.p2rank_done)
-    safety_screen(p2rank_pockets.out.p2rank_done)
-    depmap_gtex(safety_screen.out.safety_done)
+    if (fromIdx <= CLINICAL_STEPS.indexOf('step13') && untilIdx >= CLINICAL_STEPS.indexOf('step13')) {
+        gene_therapy(p2rank_done_ch)
+        therapy_done_ch = gene_therapy.out.therapy_done
+    } else {
+        therapy_done_ch = Channel.value(true)
+    }
+
+    if (fromIdx <= CLINICAL_STEPS.indexOf('step14') && untilIdx >= CLINICAL_STEPS.indexOf('step14')) {
+        safety_screen(p2rank_done_ch)
+        safety_done_ch = safety_screen.out.safety_done
+    } else {
+        safety_done_ch = Channel.value(true)
+    }
+
+    if (fromIdx <= CLINICAL_STEPS.indexOf('step14b') && untilIdx >= CLINICAL_STEPS.indexOf('step14b')) {
+        depmap_gtex(safety_done_ch)
+        depmap_done_ch = depmap_gtex.out.depmap_done
+    } else {
+        depmap_done_ch = Channel.value(true)
+    }
 
     // step15 waits for therapy + depmap
-    final_rescore(gene_therapy.out.therapy_done, depmap_gtex.out.depmap_done)
+    if (fromIdx <= CLINICAL_STEPS.indexOf('step15') && untilIdx >= CLINICAL_STEPS.indexOf('step15')) {
+        final_rescore(therapy_done_ch, depmap_done_ch)
+        pipeline_done_ch = final_rescore.out.pipeline_done
+    } else {
+        pipeline_done_ch = Channel.value(true)
+    }
 
     emit:
-    pipeline_done = final_rescore.out.pipeline_done
+    pipeline_done = pipeline_done_ch
 }

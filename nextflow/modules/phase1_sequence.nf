@@ -208,13 +208,16 @@ workflow PHASE1_SEQUENCE {
     def SEQ_STEPS = ['step1','step2','step3','step3b','step3c',
                      'step4','step4b','step4c','step4d']
     def fromStep = params.from_step ?: 'step1'
+    def untilStep = params['until'] ?: 'step4d'
     // fromIdx == -1 means from_step is a later phase; treat as 0 (run nothing here — main.nf handles it)
     def fromIdx = SEQ_STEPS.indexOf(fromStep)
+    def untilIdx = SEQ_STEPS.indexOf(untilStep)
     if (fromIdx < 0) fromIdx = 0
+    if (untilIdx < 0) untilIdx = SEQ_STEPS.size() - 1
 
     // ── Steps 1–3b: download + OrthoFinder ───────────────────────────────
     // Skip if resuming from step3c or later (orthologs already in DB)
-    if (fromIdx <= SEQ_STEPS.indexOf('step3b')) {
+    if (fromIdx <= SEQ_STEPS.indexOf('step3b') && untilIdx >= SEQ_STEPS.indexOf('step1')) {
         validate_environment()
         download_proteomes(validate_environment.out.validated)
         run_orthofinder(download_proteomes.out.proteomes_dir)
@@ -226,7 +229,7 @@ workflow PHASE1_SEQUENCE {
 
     // ── Step 3c: nucleotide conservation ─────────────────────────────────
     // Skip if resuming from step4 or later
-    if (fromIdx <= SEQ_STEPS.indexOf('step3c')) {
+    if (fromIdx <= SEQ_STEPS.indexOf('step3c') && untilIdx >= SEQ_STEPS.indexOf('step3c')) {
         nucleotide_conservation(orthologs_loaded_ch)
         nuc_done_ch = nucleotide_conservation.out.nuc_done
     } else {
@@ -235,7 +238,7 @@ workflow PHASE1_SEQUENCE {
 
     // ── Step 4: alignment + divergence scoring ────────────────────────────
     // Skip if resuming from step4b or later (load pre-computed pkl from S3)
-    if (fromIdx <= SEQ_STEPS.indexOf('step4')) {
+    if (fromIdx <= SEQ_STEPS.indexOf('step4') && untilIdx >= SEQ_STEPS.indexOf('step4')) {
         align_and_divergence(orthologs_loaded_ch)
         aligned_pkl_ch = align_and_divergence.out.aligned_pkl
         motifs_done_ch = align_and_divergence.out.motifs_loaded
@@ -246,14 +249,14 @@ workflow PHASE1_SEQUENCE {
 
     // ── Steps 4b + 4c: domain annotation + ESM scoring (parallel) ────────
     // Each is independently skippable
-    if (fromIdx <= SEQ_STEPS.indexOf('step4b')) {
+    if (fromIdx <= SEQ_STEPS.indexOf('step4b') && untilIdx >= SEQ_STEPS.indexOf('step4b')) {
         domain_and_consequence(motifs_done_ch)
         domains_done_ch = domain_and_consequence.out.domains_done
     } else {
         domains_done_ch = Channel.value(true)
     }
 
-    if (fromIdx <= SEQ_STEPS.indexOf('step4c')) {
+    if (fromIdx <= SEQ_STEPS.indexOf('step4c') && untilIdx >= SEQ_STEPS.indexOf('step4c')) {
         esm1v_scoring(motifs_done_ch)
         esm_done_ch = esm1v_scoring.out.esm_done
     } else {
@@ -261,10 +264,15 @@ workflow PHASE1_SEQUENCE {
     }
 
     // ── Step 4d: variant direction — waits for both 4b and 4c ────────────
-    variant_direction(domains_done_ch, esm_done_ch)
+    if (untilIdx >= SEQ_STEPS.indexOf('step4d')) {
+        variant_direction(domains_done_ch, esm_done_ch)
+        directions_done_ch = variant_direction.out.directions_done
+    } else {
+        directions_done_ch = Channel.value(true)
+    }
 
     emit:
     aligned_pkl     = aligned_pkl_ch
     nuc_done        = nuc_done_ch
-    directions_done = variant_direction.out.directions_done
+    directions_done = directions_done_ch
 }
