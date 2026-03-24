@@ -52,6 +52,8 @@ process composite_score_phase1 {
     cpus 2
     memory '4 GB'
     time '30m'
+
+    input:
     val bgee_done
     val phylo_done
 

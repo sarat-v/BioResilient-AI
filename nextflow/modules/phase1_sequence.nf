@@ -182,6 +182,8 @@ process variant_direction {
     cpus 2
     memory '4 GB'
     time '30m'
+
+    input:
     val domains_done
     val esm_done
 
@@ -202,24 +204,67 @@ workflow PHASE1_SEQUENCE {
     start_signal
 
     main:
-    validate_environment()
-    download_proteomes(validate_environment.out.validated)
-    run_orthofinder(download_proteomes.out.proteomes_dir)
-    load_orthologs(run_orthofinder.out.results_dir)
+    // Step ordering within this phase — drives skip logic when resuming
+    def SEQ_STEPS = ['step1','step2','step3','step3b','step3c',
+                     'step4','step4b','step4c','step4d']
+    def fromStep = params.from_step ?: 'step1'
+    // fromIdx == -1 means from_step is a later phase; treat as 0 (run nothing here — main.nf handles it)
+    def fromIdx = SEQ_STEPS.indexOf(fromStep)
+    if (fromIdx < 0) fromIdx = 0
 
-    // step3c and step4 can run in parallel after orthologs are loaded
-    nucleotide_conservation(load_orthologs.out.orthologs_loaded)
-    align_and_divergence(load_orthologs.out.orthologs_loaded)
+    // ── Steps 1–3b: download + OrthoFinder ───────────────────────────────
+    // Skip if resuming from step3c or later (orthologs already in DB)
+    if (fromIdx <= SEQ_STEPS.indexOf('step3b')) {
+        validate_environment()
+        download_proteomes(validate_environment.out.validated)
+        run_orthofinder(download_proteomes.out.proteomes_dir)
+        load_orthologs(run_orthofinder.out.results_dir)
+        orthologs_loaded_ch = load_orthologs.out.orthologs_loaded
+    } else {
+        orthologs_loaded_ch = Channel.value(true)
+    }
 
-    // step4b and step4c can run in parallel after motifs exist
-    domain_and_consequence(align_and_divergence.out.motifs_loaded)
-    esm1v_scoring(align_and_divergence.out.motifs_loaded)
+    // ── Step 3c: nucleotide conservation ─────────────────────────────────
+    // Skip if resuming from step4 or later
+    if (fromIdx <= SEQ_STEPS.indexOf('step3c')) {
+        nucleotide_conservation(orthologs_loaded_ch)
+        nuc_done_ch = nucleotide_conservation.out.nuc_done
+    } else {
+        nuc_done_ch = Channel.value(true)
+    }
 
-    // step4d waits for both 4b and 4c
-    variant_direction(domain_and_consequence.out.domains_done, esm1v_scoring.out.esm_done)
+    // ── Step 4: alignment + divergence scoring ────────────────────────────
+    // Skip if resuming from step4b or later (load pre-computed pkl from S3)
+    if (fromIdx <= SEQ_STEPS.indexOf('step4')) {
+        align_and_divergence(orthologs_loaded_ch)
+        aligned_pkl_ch = align_and_divergence.out.aligned_pkl
+        motifs_done_ch = align_and_divergence.out.motifs_loaded
+    } else {
+        aligned_pkl_ch = Channel.fromPath("s3://${params.s3_bucket}/cache/aligned_orthogroups.pkl")
+        motifs_done_ch = Channel.value(true)
+    }
+
+    // ── Steps 4b + 4c: domain annotation + ESM scoring (parallel) ────────
+    // Each is independently skippable
+    if (fromIdx <= SEQ_STEPS.indexOf('step4b')) {
+        domain_and_consequence(motifs_done_ch)
+        domains_done_ch = domain_and_consequence.out.domains_done
+    } else {
+        domains_done_ch = Channel.value(true)
+    }
+
+    if (fromIdx <= SEQ_STEPS.indexOf('step4c')) {
+        esm1v_scoring(motifs_done_ch)
+        esm_done_ch = esm1v_scoring.out.esm_done
+    } else {
+        esm_done_ch = Channel.value(true)
+    }
+
+    // ── Step 4d: variant direction — waits for both 4b and 4c ────────────
+    variant_direction(domains_done_ch, esm_done_ch)
 
     emit:
-    aligned_pkl     = align_and_divergence.out.aligned_pkl
-    nuc_done        = nucleotide_conservation.out.nuc_done
+    aligned_pkl     = aligned_pkl_ch
+    nuc_done        = nuc_done_ch
     directions_done = variant_direction.out.directions_done
 }

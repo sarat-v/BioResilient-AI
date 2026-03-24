@@ -41,25 +41,54 @@ log.info """
 ╚══════════════════════════════════════════════════════════╝
 """
 
+// Step order — used to decide which phases to skip when resuming
+def STEP_ORDER = [
+    'step1','step2','step3','step3b','step3c','step3d',
+    'step4','step4b','step4c','step4d',
+    'step5','step6','step6b','step6c','step7','step7b',
+    'step8','step8b','step9',
+]
+
 workflow {
     start = Channel.value(true)
 
-    PHASE1_SEQUENCE(start)
+    def fromStep = params.from_step ?: 'step1'
+    def fromIdx  = STEP_ORDER.indexOf(fromStep)
+    if (fromIdx < 0) {
+        error "Unknown from_step value '${fromStep}'. Valid values: ${STEP_ORDER.join(', ')}"
+    }
 
-    PHASE1_EVOLUTION(
-        PHASE1_SEQUENCE.out.aligned_pkl,
-        PHASE1_SEQUENCE.out.nuc_done,
-        PHASE1_SEQUENCE.out.directions_done
-    )
+    // ── Phase 1 Sequence (steps 1–4d) ────────────────────────────────────
+    // Skip entirely when resuming from step5 or later.
+    // aligned_orthogroups.pkl and step3c nucleotide data are loaded from S3.
+    if (fromIdx <= STEP_ORDER.indexOf('step4d')) {
+        PHASE1_SEQUENCE(start)
+        aligned_pkl_ch     = PHASE1_SEQUENCE.out.aligned_pkl
+        nuc_done_ch        = PHASE1_SEQUENCE.out.nuc_done
+        directions_done_ch = PHASE1_SEQUENCE.out.directions_done
+    } else {
+        aligned_pkl_ch     = Channel.fromPath("s3://${params.s3_bucket}/cache/aligned_orthogroups.pkl")
+        nuc_done_ch        = Channel.value(true)
+        directions_done_ch = Channel.value(true)
+    }
 
-    PHASE1_EXPRESSION(
-        PHASE1_EVOLUTION.out.convergent_aa_done,
-        PHASE1_EVOLUTION.out.phylo_done
-    )
+    // ── Phase 1 Evolution (steps 5–7b) ───────────────────────────────────
+    // Skip entirely when resuming from step8 or later.
+    // Note: when resuming from step6+, steps 5 and 3d re-run (~20 min each).
+    // They are idempotent and fast compared to the HyPhy scatter jobs.
+    if (fromIdx <= STEP_ORDER.indexOf('step7b')) {
+        PHASE1_EVOLUTION(aligned_pkl_ch, nuc_done_ch, directions_done_ch)
+        convergent_aa_done_ch = PHASE1_EVOLUTION.out.convergent_aa_done
+        phylo_done_ch         = PHASE1_EVOLUTION.out.phylo_done
+    } else {
+        convergent_aa_done_ch = Channel.value(true)
+        phylo_done_ch         = Channel.value(true)
+    }
 
-    PHASE2_CLINICAL(
-        PHASE1_EXPRESSION.out.scored
-    )
+    // ── Phase 1 Expression + scoring (steps 8–9) ─────────────────────────
+    PHASE1_EXPRESSION(convergent_aa_done_ch, phylo_done_ch)
+
+    PHASE2_CLINICAL(PHASE1_EXPRESSION.out.scored)
 }
 
 workflow.onComplete {

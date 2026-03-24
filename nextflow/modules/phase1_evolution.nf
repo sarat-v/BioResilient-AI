@@ -258,6 +258,8 @@ process convergent_aa {
     cpus 4
     memory '8 GB'
     time '1h'
+
+    input:
     val convergence_done
 
     output:
