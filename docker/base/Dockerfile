@@ -6,6 +6,7 @@ ENV DEBIAN_FRONTEND=noninteractive \
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
         build-essential libpq-dev curl wget git ca-certificates \
+        procps \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
