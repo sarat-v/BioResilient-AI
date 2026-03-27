@@ -53,6 +53,11 @@ alembic.ini.bak
 *.log
 logs/
 
+## Nextflow runtime (written to cwd when running from project root)
+.nextflow.log*
+.nextflow/
+work/
+
 ## OS
 .DS_Store
 Thumbs.db
