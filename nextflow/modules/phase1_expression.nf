@@ -69,6 +69,31 @@ process composite_score_phase1 {
     """
 }
 
+process generate_phase1_reports {
+    label 'base'
+    cpus 1
+    memory '4 GB'
+    time '30m'
+
+    input:
+    val scored
+
+    output:
+    val true, emit: reports_done
+
+    script:
+    def steps = "step5 step6 step6b step6c step7 step7b step8 step9"
+    """
+    export DATABASE_URL='${params.db_url}'
+    export BIORESILIENT_STORAGE_ROOT='${params.storage_root}'
+    for step in ${steps}; do
+        echo "=== Generating report: \$step ==="
+        python -m pipeline.step_reporter --step "\$step" \
+            || echo "WARN: report for \$step failed (non-fatal)"
+    done
+    """
+}
+
 workflow PHASE1_EXPRESSION {
     take:
     convergent_aa_done
@@ -103,6 +128,9 @@ workflow PHASE1_EXPRESSION {
     } else {
         scored_ch = Channel.value(true)
     }
+
+    // Always generate reports after the last requested step completes
+    generate_phase1_reports(scored_ch)
 
     emit:
     scored = scored_ch

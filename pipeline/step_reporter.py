@@ -744,21 +744,21 @@ def _collect_step6() -> dict:
         data["genes_with_selection"] = (
             s.query(func.count(func.distinct(EvolutionScore.gene_id))).scalar() or 0
         )
-        avg = s.query(func.avg(EvolutionScore.meme_pvalue)).scalar()
+        avg = s.query(func.avg(EvolutionScore.meme_qvalue)).scalar()
         data["avg_meme_pvalue"] = round(float(avg), 4) if avg is not None else None
 
         meme_positive = (
             s.query(func.count(EvolutionScore.gene_id))
-            .filter(EvolutionScore.meme_pvalue != None, EvolutionScore.meme_pvalue < 0.1)
+            .filter(EvolutionScore.meme_qvalue != None, EvolutionScore.meme_qvalue < 0.1)
             .scalar() or 0
         )
         data["meme_positive_genes"] = meme_positive
 
         # Top 20 genes by selection evidence
         top = (
-            s.query(EvolutionScore.gene_id, EvolutionScore.meme_pvalue, EvolutionScore.dnds_ratio)
-            .filter(EvolutionScore.meme_pvalue != None)
-            .order_by(EvolutionScore.meme_pvalue.asc())
+            s.query(EvolutionScore.gene_id, EvolutionScore.meme_qvalue, EvolutionScore.dnds_ratio)
+            .filter(EvolutionScore.meme_qvalue != None)
+            .order_by(EvolutionScore.meme_qvalue.asc())
             .limit(20)
             .all()
         )
@@ -772,7 +772,7 @@ def _collect_step6() -> dict:
         )
 
         data["top20_meme_genes"] = [
-            {"gene": sym.get(gid, gid), "meme_pvalue": round(float(p), 5) if p else None,
+            {"gene": sym.get(gid, gid), "meme_qvalue": round(float(p), 5) if p else None,
              "dnds": round(float(d), 3) if d else None}
             for gid, p, d in top
         ]
@@ -800,7 +800,7 @@ def _collect_step6b() -> dict:
         both = (
             s.query(func.count(EvolutionScore.gene_id))
             .filter(
-                EvolutionScore.meme_pvalue < 0.1,
+                EvolutionScore.meme_qvalue < 0.1,
                 EvolutionScore.busted_pvalue < 0.05,
             )
             .scalar() or 0
@@ -1290,21 +1290,27 @@ def validate(step: str, data: dict) -> ValidationResult:
         pass  # informational only
 
     elif step in ("step7", "step7b"):
-        conv3 = data.get("genes_conv_ge3", 0)
-        if conv3 == 0:
-            vr.add("convergence_signal", "FAIL", 0, ">0 genes at ≥3 lineages",
-                   "No genes with convergence across ≥3 lineages. Gate 2 may have been too permissive or species lineage groups are wrong.")
-            vr.recommendation = "Check lineage_group values in species_registry.json and rerun step4."
-        elif conv3 < 10:
-            vr.add("convergence_signal", "WARN", conv3, "≥10 genes",
-                   f"Only {conv3} genes at ≥3 lineages. Signal is present but weak.")
-        else:
-            vr.add("convergence_signal", "PASS", conv3, "≥10 genes")
+        if step == "step7":
+            conv3 = data.get("genes_conv_ge3", 0)
+            if conv3 == 0:
+                vr.add("convergence_signal", "FAIL", 0, ">0 genes at ≥3 lineages",
+                       "No genes with convergence across ≥3 lineages. Gate 2 may have been too permissive or species lineage groups are wrong.")
+                vr.recommendation = "Check lineage_group values in species_registry.json and rerun step4."
+            elif conv3 < 10:
+                vr.add("convergence_signal", "WARN", conv3, "≥10 genes",
+                       f"Only {conv3} genes at ≥3 lineages. Signal is present but weak.")
+            else:
+                vr.add("convergence_signal", "PASS", conv3, "≥10 genes")
 
-        conv4 = data.get("genes_conv_ge4", 0)
-        vr.add("strong_convergence", "PASS" if conv4 >= 3 else "INFO",
-               conv4, "≥3 genes at ≥4 lineages",
-               "" if conv4 >= 3 else "Few genes at ≥4 lineages — strong multi-lineage signal is sparse.")
+            conv4 = data.get("genes_conv_ge4", 0)
+            vr.add("strong_convergence", "PASS" if conv4 >= 3 else "INFO",
+                   conv4, "≥3 genes at ≥4 lineages",
+                   "" if conv4 >= 3 else "Few genes at ≥4 lineages — strong multi-lineage signal is sparse.")
+        else:  # step7b
+            motifs_with_conv = data.get("motifs_with_convergent_aa", 0)
+            vr.add("convergent_aa", "PASS" if motifs_with_conv > 0 else "WARN",
+                   motifs_with_conv, ">0 motifs",
+                   "" if motifs_with_conv > 0 else "No motifs with convergent amino acids found.")
 
     elif step in ("step8", "step8b"):
         de = data.get("de_genes", 0)
@@ -1522,15 +1528,15 @@ def _render_md(step: str, data: dict, vr: ValidationResult) -> str:
         if step == "step6":
             lines.append(f"- Genes with selection scores: {data.get('genes_with_selection', 0):,}")
             lines.append(f"- MEME-positive genes (p<0.1): {data.get('meme_positive_genes', 0):,}")
-            lines.append(f"- Mean MEME p-value: {data.get('avg_meme_pvalue')}")
+            lines.append(f"- Mean MEME q-value: {data.get('avg_meme_pvalue')}")
             bm = data.get("benchmark_genes_in_top20_meme", [])
             if bm:
                 lines.append(f"- Known benchmark genes in top 20: **{', '.join(bm)}**")
             top = data.get("top20_meme_genes", [])
             if top:
-                lines += ["", "**Top 20 by MEME evidence:**", "", "| Gene | MEME p-value | dN/dS |", "|------|-------------|-------|"]
+                lines += ["", "**Top 20 by MEME evidence:**", "", "| Gene | MEME q-value | dN/dS |", "|------|-------------|-------|"]
                 for r in top:
-                    lines.append(f"| {r['gene']} | {r['meme_pvalue']} | {r['dnds']} |")
+                    lines.append(f"| {r['gene']} | {r.get('meme_qvalue', r.get('meme_pvalue'))} | {r['dnds']} |")
         elif step == "step6b":
             lines.append(f"- FEL-positive genes: {data.get('fel_positive_genes', 0):,}")
             lines.append(f"- BUSTED-positive genes: {data.get('busted_positive_genes', 0):,}")
