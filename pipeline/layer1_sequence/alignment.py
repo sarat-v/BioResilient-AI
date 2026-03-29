@@ -182,18 +182,19 @@ def calculate_sequence_identity(seq_a: str, seq_b: str) -> float:
             return (matches / comparable) * 100.0
     except Exception as exc:
         log.debug("numpy identity calculation failed, falling back to pure Python: %s", exc)
-    # Pure Python fallback
-        matches = 0
-        comparable = 0
-        for a, b in zip(seq_a, seq_b):
-            if a == "-" and b == "-":
-                continue
-            comparable += 1
-            if a == b:
-                matches += 1
-        if comparable == 0:
-            return 0.0
-        return (matches / comparable) * 100.0
+
+    # Pure Python fallback (numpy unavailable or failed)
+    matches = 0
+    comparable = 0
+    for a, b in zip(seq_a, seq_b):
+        if a == "-" and b == "-":
+            continue
+        comparable += 1
+        if a == b:
+            matches += 1
+    if comparable == 0:
+        return 0.0
+    return (matches / comparable) * 100.0
 
 
 def _align_worker(args: tuple) -> tuple[str, Optional[dict[str, str]]]:

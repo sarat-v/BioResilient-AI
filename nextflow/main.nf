@@ -113,6 +113,38 @@ workflow {
     }
 }
 
+// ── Standalone health check ────────────────────────────────────────────────
+// Run with: nextflow run main.nf -entry health_check -profile aws
+workflow health_check {
+    process run_health_check {
+        label 'base'
+        cpus 1
+        memory '4 GB'
+        time '30m'
+
+        output:
+        path 'health_check.md'
+        path 'health_check.json'
+
+        script:
+        """
+        export DATABASE_URL='${params.db_url}'
+        export BIORESILIENT_STORAGE_ROOT='${params.storage_root}'
+
+        echo "=== Per-step reports ==="
+        STEPS="step1 step2 step3 step3b step3c step4 step4b step4c step4d step3d step5 step6 step6b step6c step7 step7b step8 step8b step9"
+        for step in \$STEPS; do
+            echo "--- \$step ---"
+            python -m pipeline.step_reporter --step "\$step" || true
+        done
+
+        echo ""
+        echo "=== Pipeline Health Check ==="
+        python scripts/pipeline_health_check.py --output health_check.md
+        """
+    }
+}
+
 workflow.onComplete {
     log.info """
     ══════════════════════════════════════════════════════════

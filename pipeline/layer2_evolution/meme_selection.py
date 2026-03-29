@@ -1036,18 +1036,6 @@ def run_meme_pipeline(
     aligned_orthogroups: dict[str, dict[str, str]],
     motifs_by_og: dict[str, list],
     species_treefile: Path,
-) -> dict[str, dict]:
-    """Run MEME in parallel for all candidate orthogroups.
-
-    Falls back to protein divergence proxy for any orthogroup where CDS
-    fetching fails (e.g. UniProt accessions, missing NCBI links).
-
-    Returns {og_id: parsed_selection_result}.
-    """
-def run_meme_pipeline(
-    aligned_orthogroups: dict[str, dict[str, str]],
-    motifs_by_og: dict[str, list],
-    species_treefile: Path,
     flush_callback=None,
 ) -> dict[str, dict]:
     """Run MEME in parallel for all candidate orthogroups.

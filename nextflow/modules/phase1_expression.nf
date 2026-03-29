@@ -75,10 +75,8 @@ process composite_score_phase1 {
     """
 }
 
-// Final summary report — re-runs ALL Phase 1 step reporters after the last step
-// completes. Each step reporter is idempotent and non-fatal, so this gives a
-// complete consolidated view of the entire phase even if some earlier inline
-// reports ran in containers that have since been torn down.
+// Runs after every Phase 1 step completes.
+// Generates per-step MD/JSON reports AND a comprehensive health check.
 process generate_phase1_reports {
     label 'base'
     cpus 1
@@ -90,19 +88,26 @@ process generate_phase1_reports {
 
     output:
     val true, emit: reports_done
+    path 'health_check.md', emit: health_report, optional: true
+    path 'health_check.json', emit: health_json, optional: true
 
     script:
     def allSteps = "step1 step2 step3 step3b step3c step4 step4b step4c step4d step3d step5 step6 step6b step6c step7 step7b step8 step8b step9"
     """
     export DATABASE_URL='${params.db_url}'
     export BIORESILIENT_STORAGE_ROOT='${params.storage_root}'
-    echo "=== Phase 1 Summary Reports ==="
+
+    echo "=== Per-step reports ==="
     for step in ${allSteps}; do
         echo "--- \$step ---"
         python -m pipeline.step_reporter --step "\$step" \
             || echo "WARN: report for \$step skipped (step may not have run)"
     done
-    echo "=== Phase 1 reports complete ==="
+
+    echo ""
+    echo "=== Pipeline Health Check ==="
+    python scripts/pipeline_health_check.py --output health_check.md
+    echo "=== Reports complete ==="
     """
 }
 

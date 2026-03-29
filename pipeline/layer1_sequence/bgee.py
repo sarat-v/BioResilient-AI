@@ -233,10 +233,16 @@ def run_bgee_pipeline(
                 log.info("  Bgee: %d / %d genes processed (%.0f%%).",
                          done, total, 100 * done / total)
 
-    # Single session write for all results
     written = 0
     if all_rows:
         with get_session() as session:
+            deleted = (
+                session.query(ExpressionResult)
+                .filter(ExpressionResult.geo_accession.like("bgee:%"))
+                .delete(synchronize_session=False)
+            )
+            if deleted:
+                log.info("  Deleted %d existing Bgee ExpressionResult rows (idempotent rerun).", deleted)
             for kwargs in all_rows:
                 session.add(ExpressionResult(**kwargs))
             session.commit()

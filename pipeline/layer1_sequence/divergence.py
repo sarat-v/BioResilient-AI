@@ -271,10 +271,29 @@ def load_motifs_to_db(
         "  Pre-filter done in %.1fs: %d to insert, %d skipped (no ortholog), %d skipped (identity).",
         time.time() - t1, len(rows_to_insert), skipped_no_ortholog, skipped_identity,
     )
-    # Use PostgreSQL COPY for maximum throughput — ~10-50x faster than bulk_insert_mappings
-    # COPY streams all data over a single connection with no per-row overhead
     import io
     from pipeline.config import get_psycopg2_conn
+
+    # Delete existing motifs for the orthologs we're about to re-insert.
+    # This makes step4 idempotent — reruns replace data instead of appending duplicates.
+    affected_ortholog_ids = list({r["ortholog_id"] for r in rows_to_insert})
+    if affected_ortholog_ids:
+        log.info("  Deleting existing motifs for %d orthologs (idempotent rerun safety)...", len(affected_ortholog_ids))
+        t_del = time.time()
+        conn = get_psycopg2_conn()
+        try:
+            cur = conn.cursor()
+            batch_sz = 5000
+            total_deleted = 0
+            for i in range(0, len(affected_ortholog_ids), batch_sz):
+                batch = affected_ortholog_ids[i : i + batch_sz]
+                cur.execute("DELETE FROM divergent_motif WHERE ortholog_id = ANY(%s)", (batch,))
+                total_deleted += cur.rowcount
+            conn.commit()
+            cur.close()
+        finally:
+            conn.close()
+        log.info("  Deleted %d stale motif rows in %.1fs.", total_deleted, time.time() - t_del)
 
     total_to_insert = len(rows_to_insert)
     log.info("  Inserting %d motif rows via COPY (streaming)...", total_to_insert)

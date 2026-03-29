@@ -56,6 +56,8 @@ process phylo_conservation {
     """
 }
 
+// extract_og_ids always queries the DB for authoritative OG list (the pkl's
+// motifs_by_og can be stale). The pkl is still needed for aligned sequences.
 process extract_og_ids {
     label 'base'
     cpus 1
@@ -71,7 +73,7 @@ process extract_og_ids {
     script:
     """
     python3 << 'PYEOF'
-import pickle, sys, os
+import pickle, sys
 
 db_url = '${params.db_url}'
 
@@ -82,26 +84,28 @@ motifs  = data.get('motifs_by_og', {})
 
 sys.stderr.write(f'pkl: {len(aligned)} aligned OGs, {len(motifs)} in motifs_by_og\\n')
 
-# If motifs_by_og covers < 5% of aligned OGs it is stale/incomplete.
-# Fall back to the divergent_motif DB table as the authoritative source.
-if len(motifs) < max(1, len(aligned) * 0.05) and db_url:
-    sys.stderr.write('motifs_by_og is sparse — querying DB for OG IDs with divergent motifs\\n')
-    import psycopg2
-    conn = psycopg2.connect(db_url)
-    cur  = conn.cursor()
-    cur.execute('''
-        SELECT DISTINCT o.og_id
-        FROM divergent_motif dm
-        JOIN ortholog o ON o.id = dm.ortholog_id
-        WHERE o.og_id IS NOT NULL
-    ''')
-    db_og_ids = sorted({row[0] for row in cur.fetchall()})
-    conn.close()
-    sys.stderr.write(f'DB has {len(db_og_ids)} OGs with divergent motifs\\n')
-    og_list = [og for og in db_og_ids if og in aligned]
-    sys.stderr.write(f'OGs in both DB and aligned: {len(og_list)}\\n')
-else:
+# Always use DB as the authoritative source for which OGs have divergent motifs.
+# The pkl's motifs_by_og can be stale if step4 was rerun without regenerating the pkl.
+import psycopg2
+conn = psycopg2.connect(db_url)
+cur  = conn.cursor()
+cur.execute('''
+    SELECT DISTINCT o.orthofinder_og
+    FROM divergent_motif dm
+    JOIN ortholog o ON o.id = dm.ortholog_id
+    WHERE o.orthofinder_og IS NOT NULL
+''')
+db_og_ids = sorted({row[0] for row in cur.fetchall()})
+conn.close()
+
+sys.stderr.write(f'DB has {len(db_og_ids)} OGs with divergent motifs\\n')
+og_list = [og for og in db_og_ids if og in aligned]
+sys.stderr.write(f'OGs in both DB and aligned pkl: {len(og_list)}\\n')
+
+if not og_list:
+    sys.stderr.write('WARNING: No OGs found. Falling back to pkl motifs_by_og\\n')
     og_list = sorted(og for og in motifs if og in aligned)
+    sys.stderr.write(f'Fallback OGs from pkl: {len(og_list)}\\n')
 
 for og_id in og_list:
     print(og_id)

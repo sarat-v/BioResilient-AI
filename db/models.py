@@ -109,6 +109,9 @@ class Ortholog(Base):
 
 class DivergentMotif(Base):
     __tablename__ = "divergent_motif"
+    __table_args__ = (
+        UniqueConstraint("ortholog_id", "start_pos", name="uq_motif_ortholog_pos"),
+    )
 
     id = Column(String, primary_key=True, default=_uuid)
     ortholog_id = Column(String, ForeignKey("ortholog.id", ondelete="CASCADE"), nullable=False)
@@ -156,6 +159,9 @@ class ExpressionResult(Base):
     """Per-GEO-dataset expression evidence for traceability."""
 
     __tablename__ = "expression_result"
+    __table_args__ = (
+        UniqueConstraint("gene_id", "geo_accession", "comparison", name="uq_expression_result"),
+    )
 
     id = Column(String, primary_key=True, default=_uuid)
     gene_id = Column(String, ForeignKey("gene.id", ondelete="CASCADE"), nullable=False, index=True)

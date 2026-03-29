@@ -238,11 +238,24 @@ def save_expression_evidence(
     comparison: str,
     gene_symbol_to_id: dict[str, str],
 ) -> int:
-    """Write per-gene expression evidence to ExpressionResult for traceability."""
+    """Write per-gene expression evidence to ExpressionResult for traceability.
+
+    Idempotent: deletes existing rows for the same (geo_accession, comparison)
+    before inserting, so reruns replace data instead of appending duplicates.
+    """
     if results is None or results.empty:
         return 0
-    n = 0
+
     with get_session() as session:
+        deleted = (
+            session.query(ExpressionResult)
+            .filter_by(geo_accession=geo_accession, comparison=comparison)
+            .delete()
+        )
+        if deleted:
+            log.info("  Deleted %d existing ExpressionResult rows for %s/%s", deleted, geo_accession, comparison)
+
+        n = 0
         for _, row in results.iterrows():
             symbol = str(row.get("gene_id", "")).strip()
             gene_id = gene_symbol_to_id.get(symbol)

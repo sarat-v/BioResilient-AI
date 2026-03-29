@@ -27,5 +27,6 @@ COPY db/ /app/db/
 COPY config/ /app/config/
 COPY alembic.ini /app/alembic.ini
 COPY scripts/nf_wrappers/ /app/scripts/nf_wrappers/
+COPY scripts/pipeline_health_check.py /app/scripts/pipeline_health_check.py
 
 ENV PYTHONPATH=/app
