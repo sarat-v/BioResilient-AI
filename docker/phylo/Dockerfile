@@ -1,4 +1,5 @@
-FROM bioresilient/base:latest
+ARG BASE_IMAGE=bioresilient/base:latest
+FROM ${BASE_IMAGE}
 
 ARG IQTREE_VERSION=2.3.6
 

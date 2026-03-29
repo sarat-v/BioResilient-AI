@@ -17,7 +17,10 @@ COPY requirements.txt /app/requirements.txt
 RUN pip install --upgrade pip && pip install -r requirements.txt
 
 RUN pip install \
-    torch>=2.1.0 --index-url https://download.pytorch.org/whl/cu121 \
+    torch>=2.1.0 \
+    --extra-index-url https://download.pytorch.org/whl/cu121
+
+RUN pip install \
     fair-esm>=2.0.0 \
     pandas>=2.1.0 \
     scipy>=1.11.0 \

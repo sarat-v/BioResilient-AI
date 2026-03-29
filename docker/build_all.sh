@@ -3,8 +3,8 @@
 # Build all BioResilient Docker images.
 #
 # Usage:
-#   bash docker/build_all.sh                     # build only
-#   bash docker/build_all.sh --push              # build + push to registry
+#   bash docker/build_all.sh                     # build only (local cache)
+#   bash docker/build_all.sh --push              # build + push to ECR, no local copy kept
 #   REGISTRY=xxxx.dkr.ecr.ap-south-1.amazonaws.com bash docker/build_all.sh --push
 set -euo pipefail
 
@@ -23,29 +23,45 @@ ok()     { echo -e "${GREEN}  ✓ $1${RESET}"; }
 banner "Building BioResilient Docker Images"
 echo -e "  Registry : ${BOLD}${REGISTRY}${RESET}"
 echo -e "  Tag      : ${BOLD}${TAG}${RESET}"
+echo -e "  Push     : ${BOLD}${PUSH}${RESET}"
 echo ""
+
+# Ensure a buildx builder exists (needed for --push without local load)
+if $PUSH; then
+    docker buildx inspect bioresilient-builder &>/dev/null \
+        || docker buildx create --name bioresilient-builder --use
+    docker buildx use bioresilient-builder
+fi
 
 for img in "${IMAGES[@]}"; do
     banner "Building ${img}"
     local_tag="${REGISTRY}/${img}:${TAG}"
-
-    docker build \
-        -t "$local_tag" \
-        -f "${REPO_ROOT}/docker/${img}/Dockerfile" \
-        "${REPO_ROOT}" \
-        2>&1 | tail -5
-
-    ok "Built ${local_tag}"
+    base_arg="${REGISTRY}/base:${TAG}"
 
     if $PUSH; then
-        echo "  Pushing ${local_tag} ..."
-        docker push "$local_tag"
-        ok "Pushed ${local_tag}"
+        docker buildx build \
+            --platform linux/amd64 \
+            --push \
+            --build-arg BASE_IMAGE="${base_arg}" \
+            -t "$local_tag" \
+            -f "${REPO_ROOT}/docker/${img}/Dockerfile" \
+            "${REPO_ROOT}" \
+            2>&1 | tail -8
+        ok "Built + pushed ${local_tag}"
+    else
+        docker build \
+            --platform linux/amd64 \
+            --build-arg BASE_IMAGE="${base_arg}" \
+            -t "$local_tag" \
+            -f "${REPO_ROOT}/docker/${img}/Dockerfile" \
+            "${REPO_ROOT}" \
+            2>&1 | tail -5
+        ok "Built ${local_tag}"
     fi
 done
 
-banner "All images built"
-echo -e "  Images:"
+banner "Done"
+echo -e "  Images in ECR:"
 for img in "${IMAGES[@]}"; do
     echo -e "    ${REGISTRY}/${img}:${TAG}"
 done

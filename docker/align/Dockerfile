@@ -1,4 +1,5 @@
-FROM bioresilient/base:latest
+ARG BASE_IMAGE=bioresilient/base:latest
+FROM ${BASE_IMAGE}
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
         wget ncbi-blast+ \

@@ -152,16 +152,34 @@ def run_step6_single_og(args):
         if cds:
             cds_seqs[label] = cds
 
+    # Run MEME if we have CDS for ≥60% of species in the OG (strict 100% caused
+    # all OGs to fall through to aBSREL proxy when any one NCBI fetch failed).
     codon_aln = None
-    if len(cds_seqs) == len(seqs):
-        codon_aln = protein_to_codon_alignment(seqs, cds_seqs)
+    cds_coverage = len(cds_seqs) / len(seqs) if seqs else 0
+    log.info("OG %s: CDS coverage %d/%d (%.0f%%)", og_id, len(cds_seqs), len(seqs), cds_coverage * 100)
+    if cds_coverage >= 0.60 and len(cds_seqs) >= 3:
+        # Subset seqs and pruned tree to only those species with CDS
+        seqs_with_cds = {label: seq for label, seq in seqs.items() if label in cds_seqs}
+        cds_species = [label.split("|")[0] for label in cds_seqs]
+        pruned_tree = prune_tree_to_species(treefile, cds_species)
+        codon_aln = protein_to_codon_alignment(seqs_with_cds, cds_seqs)
 
-    result = {"og_id": og_id}
+    result = {"og_id": og_id, "cds_coverage": round(cds_coverage, 3)}
     if codon_aln is not None:
         meme_json = run_meme(codon_aln, pruned_tree, og_id)
         if meme_json is not None:
             result.update(parse_meme_results(meme_json, og_id))
             result["selection_model"] = "meme"
+            # Copy meme outputs from local storage root into out_dir so Nextflow
+            # stages them to S3 — run_meme writes to get_local_storage_root()/meme/og_id/
+            # which is NOT the task work dir that Nextflow syncs.
+            from pipeline.config import get_local_storage_root
+            import shutil
+            meme_local = Path(get_local_storage_root()) / "meme" / og_id
+            for fname in ("codon_aln.fna", "meme.json", "species.treefile"):
+                src = meme_local / fname
+                if src.exists():
+                    shutil.copy2(src, out_dir / fname)
         else:
             result["status"] = "meme_failed"
     else:
@@ -378,6 +396,32 @@ def run_step15(args):
     step15_rescore()
 
 
+def run_dedup_motifs(args):
+    """Remove duplicate divergent_motif rows created by running step4 more than once.
+    Keeps the row with motif_direction populated (gnomAD-aware); falls back to latest id."""
+    from db.session import get_session
+    from sqlalchemy import text
+
+    with get_session() as s:
+        before = s.execute(text("SELECT COUNT(*) FROM divergent_motif")).scalar()
+        s.execute(text("""
+            DELETE FROM divergent_motif
+            WHERE id IN (
+                SELECT id FROM (
+                    SELECT id,
+                           ROW_NUMBER() OVER (
+                               PARTITION BY ortholog_id, start_pos
+                               ORDER BY motif_direction NULLS LAST, id DESC
+                           ) AS rn
+                    FROM divergent_motif
+                ) ranked
+                WHERE rn > 1
+            )
+        """))
+        after = s.execute(text("SELECT COUNT(*) FROM divergent_motif")).scalar()
+    log.info("Deduped divergent_motif: %d → %d rows (removed %d duplicates)", before, after, before - after)
+
+
 STEP_MAP = {
     "step1": run_step1,
     "step2": run_step2,
@@ -412,6 +456,7 @@ STEP_MAP = {
     "step14": run_step14,
     "step14b": run_step14b,
     "step15": run_step15,
+    "dedup_motifs": run_dedup_motifs,
 }
 
 

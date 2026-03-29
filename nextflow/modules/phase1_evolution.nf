@@ -59,8 +59,8 @@ process phylo_conservation {
 process extract_og_ids {
     label 'base'
     cpus 1
-    memory '8 GB'
-    time '10m'
+    memory '16 GB'
+    time '20m'
 
     input:
     path aligned_pkl
@@ -70,17 +70,42 @@ process extract_og_ids {
 
     script:
     """
-    python3 -c "
-import pickle, sys
+    python3 << 'PYEOF'
+import pickle, sys, os
+
+db_url = '${params.db_url}'
+
 with open('${aligned_pkl}', 'rb') as f:
     data = pickle.load(f)
 aligned = data.get('aligned', data)
-motifs = data.get('motifs_by_og', {})
-# Only scatter OGs that have motifs (candidates for HyPhy)
-for og_id in sorted(motifs.keys()):
-    if og_id in aligned:
-        print(og_id)
-" > og_ids.txt
+motifs  = data.get('motifs_by_og', {})
+
+sys.stderr.write(f'pkl: {len(aligned)} aligned OGs, {len(motifs)} in motifs_by_og\\n')
+
+# If motifs_by_og covers < 5% of aligned OGs it is stale/incomplete.
+# Fall back to the divergent_motif DB table as the authoritative source.
+if len(motifs) < max(1, len(aligned) * 0.05) and db_url:
+    sys.stderr.write('motifs_by_og is sparse — querying DB for OG IDs with divergent motifs\\n')
+    import psycopg2
+    conn = psycopg2.connect(db_url)
+    cur  = conn.cursor()
+    cur.execute('''
+        SELECT DISTINCT o.og_id
+        FROM divergent_motif dm
+        JOIN ortholog o ON o.id = dm.ortholog_id
+        WHERE o.og_id IS NOT NULL
+    ''')
+    db_og_ids = sorted({row[0] for row in cur.fetchall()})
+    conn.close()
+    sys.stderr.write(f'DB has {len(db_og_ids)} OGs with divergent motifs\\n')
+    og_list = [og for og in db_og_ids if og in aligned]
+    sys.stderr.write(f'OGs in both DB and aligned: {len(og_list)}\\n')
+else:
+    og_list = sorted(og for og in motifs if og in aligned)
+
+for og_id in og_list:
+    print(og_id)
+PYEOF
     echo "OGs to scatter: \$(wc -l < og_ids.txt)"
     """
 }
