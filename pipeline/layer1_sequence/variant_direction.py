@@ -33,6 +33,7 @@ Result stored as DivergentMotif.motif_direction (string enum: 'gain_of_function'
 import csv
 import gzip
 import logging
+import re
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Optional
@@ -178,41 +179,119 @@ def _fetch_loeuf_api(gene_symbol: str) -> Optional[float]:
     return None
 
 
+def _resolve_uniprot_to_symbols(accessions: set[str]) -> dict[str, str]:
+    """Map UniProt accessions to HGNC gene symbols via the UniProt REST API.
+
+    Gene.gene_symbol is populated with bare UniProt accessions (e.g. 'P04637')
+    rather than HGNC symbols (e.g. 'TP53') during Phase 1. This function
+    translates them before the gnomAD TSV/API lookup.
+
+    Returns {accession: hgnc_symbol}. Unresolvable accessions are absent.
+    """
+    _UNI_PAT = re.compile(
+        r"^[OPQ][0-9][A-Z0-9]{3}[0-9]$"          # reviewed Swiss-Prot format
+        r"|^[A-NR-Z][0-9][A-Z][A-Z0-9]{2}[0-9]$"  # TrEMBL 6-char
+        r"|^[A-NR-Z][0-9][A-Z][A-Z0-9]{2}[0-9][A-Z0-9]{2}$",  # 10-char isoform base
+        re.IGNORECASE,
+    )
+    valid = [a for a in accessions if _UNI_PAT.match(a)]
+    if not valid:
+        log.debug("No UniProt accessions detected among %d gene symbols.", len(accessions))
+        return {}
+
+    log.info("Resolving %d UniProt accessions → HGNC symbols via UniProt REST…", len(valid))
+    result: dict[str, str] = {}
+    _BATCH = 500
+    for i in range(0, len(valid), _BATCH):
+        batch = valid[i : i + _BATCH]
+        try:
+            r = requests.get(
+                "https://rest.uniprot.org/uniprotkb/accessions",
+                params={
+                    "accessions": ",".join(batch),
+                    "fields": "accession,gene_names",
+                    "size": str(_BATCH),
+                },
+                headers={"Accept": "application/json"},
+                timeout=60,
+            )
+            r.raise_for_status()
+            for entry in r.json().get("results", []):
+                acc = entry.get("primaryAccession", "")
+                genes = entry.get("genes", [])
+                if genes:
+                    sym = genes[0].get("geneName", {}).get("value", "")
+                    if sym:
+                        result[acc] = sym
+        except Exception as exc:
+            log.warning("UniProt symbol resolution batch %d failed: %s", i // _BATCH, exc)
+
+    resolved_pct = 100 * len(result) / len(valid) if valid else 0
+    log.info(
+        "UniProt → HGNC: %d / %d accessions resolved (%.0f%%).",
+        len(result), len(valid), resolved_pct,
+    )
+    return result
+
+
 def _fetch_loeuf_bulk(gene_symbols: set[str]) -> dict[str, Optional[float]]:
     """Return {gene_symbol: loeuf_or_None} for every requested symbol.
 
     Primary strategy: parse the gnomAD v4.1 constraint TSV (one download,
     ~20 MB, covers all ~20k genes, zero per-gene API calls).
 
-    Fallback: GraphQL API for any symbols not found in the TSV (e.g. very
-    recently named genes or non-coding RNA symbols).
+    Because Gene.gene_symbol is stored as a UniProt accession during Phase 1
+    (e.g. 'P04637' for TP53), we first resolve accessions → HGNC symbols via
+    UniProt REST, look those up in the TSV, then fall back to the gnomAD
+    GraphQL API for any symbols still missing.
+
+    The returned dict is keyed by the *original* gene_symbol value (accession
+    or HGNC symbol) so callers don't need to change.
     """
+    # Step 0: resolve UniProt accessions → HGNC symbols
+    acc_to_sym: dict[str, str] = _resolve_uniprot_to_symbols(gene_symbols)
+    # Invert to find the original key for each resolved HGNC symbol
+    sym_to_acc: dict[str, str] = {v: k for k, v in acc_to_sym.items()}
+
+    # Effective lookup symbols: resolved HGNC names + any original symbols that
+    # didn't look like accessions (already HGNC or unknown format)
+    unresolved_originals = gene_symbols - set(acc_to_sym.keys())
+    lookup_symbols: set[str] = set(acc_to_sym.values()) | unresolved_originals
+
     tsv_map = _load_loeuf_from_tsv()
 
+    # Build result keyed by original gene_symbol
     result: dict[str, Optional[float]] = {}
-    missing: list[str] = []
-    for gs in gene_symbols:
-        if gs in tsv_map:
-            result[gs] = tsv_map[gs]
+    missing_hgnc: list[str] = []
+
+    for hgnc_sym in lookup_symbols:
+        if hgnc_sym in tsv_map:
+            orig_key = sym_to_acc.get(hgnc_sym, hgnc_sym)
+            result[orig_key] = tsv_map[hgnc_sym]
         else:
-            missing.append(gs)
+            missing_hgnc.append(hgnc_sym)
 
     tsv_hit_pct = 100 * len(result) / len(gene_symbols) if gene_symbols else 0
     log.info(
         "gnomAD LOEUF: %d / %d symbols resolved from TSV (%.0f%%). "
         "%d will fall back to API.",
-        len(result), len(gene_symbols), tsv_hit_pct, len(missing),
+        len(result), len(gene_symbols), tsv_hit_pct, len(missing_hgnc),
     )
 
-    if missing:
+    if missing_hgnc:
         workers = int(get_tool_config().get("gnomad_workers", 20))
         log.info("  gnomAD API fallback: fetching %d symbols (%d workers)...",
-                 len(missing), workers)
+                 len(missing_hgnc), workers)
         with ThreadPoolExecutor(max_workers=workers) as pool:
-            futures = {pool.submit(_fetch_loeuf_api, gs): gs for gs in missing}
+            futures = {pool.submit(_fetch_loeuf_api, gs): gs for gs in missing_hgnc}
             for future in as_completed(futures):
-                gs = futures[future]
-                result[gs] = future.result()
+                hgnc_sym = futures[future]
+                orig_key = sym_to_acc.get(hgnc_sym, hgnc_sym)
+                result[orig_key] = future.result()
+
+    # Ensure every original symbol has an entry (None = unknown)
+    for gs in gene_symbols:
+        result.setdefault(gs, None)
 
     return result
 
