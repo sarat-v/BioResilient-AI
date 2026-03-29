@@ -180,8 +180,8 @@ process esm1v_scoring {
 process variant_direction {
     label 'base'
     cpus 2
-    memory '4 GB'
-    time '30m'
+    memory '8 GB'
+    time '3h'
 
     input:
     val domains_done

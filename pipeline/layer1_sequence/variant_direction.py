@@ -340,7 +340,7 @@ def classify_motif_direction(
 # Pipeline entry point
 # ---------------------------------------------------------------------------
 
-_CLASSIFY_BATCH_SIZE = 50_000  # rows per DB commit — keeps transaction size manageable
+_CLASSIFY_BATCH_SIZE = 200_000  # rows per DB commit — keeps transaction size manageable
 
 
 def annotate_variant_directions(gene_ids: Optional[list[str]] = None) -> int:
