@@ -110,6 +110,7 @@ def run_step5(args):
 
 def run_step6_single_og(args):
     """Per-OG MEME — called by Nextflow scatter. Mirrors _meme_worker logic."""
+    import gc
     from pipeline.layer2_evolution.meme_selection import (
         fetch_cds_for_protein,
         protein_to_codon_alignment,
@@ -133,7 +134,13 @@ def run_step6_single_og(args):
     out_dir = Path(args.output_dir or ".")
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    seqs = aligned[og_id]
+    # Extract only this OG's data then immediately free the full pickle from
+    # memory — the pkl holds all OGs and can be several GB. HyPhy needs the
+    # headroom, especially for large OGs like OG0000000.
+    seqs = dict(aligned[og_id])
+    del data, aligned
+    gc.collect()
+
     species_ids = [label.split("|")[0] for label in seqs]
     pruned_tree = prune_tree_to_species(treefile, species_ids)
 
