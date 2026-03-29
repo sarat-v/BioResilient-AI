@@ -355,7 +355,7 @@ def _collect_step3() -> dict:
     from db.models import Gene, Ortholog
     from sqlalchemy import func
 
-    data: dict[str, Any] = {"step": "step3b", "timestamp": _now()}
+    data: dict[str, Any] = {"step": "step3", "timestamp": _now()}
     with get_session() as s:
         data["gene_count"] = s.query(func.count(Gene.id)).scalar() or 0
         data["ortholog_count"] = s.query(func.count(Ortholog.id)).scalar() or 0
