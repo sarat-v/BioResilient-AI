@@ -349,7 +349,7 @@ def annotate_variant_directions(gene_ids: Optional[list[str]] = None) -> int:
             for i in range(0, total, _CLASSIFY_BATCH_SIZE):
                 batch = updates[i : i + _CLASSIFY_BATCH_SIZE]
                 cur.executemany(
-                    "UPDATE divergent_motif SET motif_direction = %s WHERE id = %s::uuid",
+                    "UPDATE divergent_motif SET motif_direction = %s WHERE id = %s",
                     batch,
                 )
                 conn.commit()
