@@ -132,6 +132,8 @@ process align_and_divergence {
         --db-url '${params.db_url}' \
         --storage-root '${params.storage_root}' \
         --output-dir '.'
+    DATABASE_URL='${params.db_url}' BIORESILIENT_STORAGE_ROOT='${params.storage_root}' \
+        python -m pipeline.step_reporter --step step4 || true
     """
 }
 
@@ -153,6 +155,8 @@ process domain_and_consequence {
         --step step4b \
         --db-url '${params.db_url}' \
         --storage-root '${params.storage_root}'
+    DATABASE_URL='${params.db_url}' BIORESILIENT_STORAGE_ROOT='${params.storage_root}' \
+        python -m pipeline.step_reporter --step step4b || true
     """
 }
 
@@ -174,6 +178,8 @@ process esm1v_scoring {
         --step step4c \
         --db-url '${params.db_url}' \
         --storage-root '${params.storage_root}'
+    DATABASE_URL='${params.db_url}' BIORESILIENT_STORAGE_ROOT='${params.storage_root}' \
+        python -m pipeline.step_reporter --step step4c || true
     """
 }
 
@@ -196,6 +202,8 @@ process variant_direction {
         --step step4d \
         --db-url '${params.db_url}' \
         --storage-root '${params.storage_root}'
+    DATABASE_URL='${params.db_url}' BIORESILIENT_STORAGE_ROOT='${params.storage_root}' \
+        python -m pipeline.step_reporter --step step4d || true
     """
 }
 

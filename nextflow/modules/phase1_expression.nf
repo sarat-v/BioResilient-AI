@@ -23,6 +23,8 @@ process expression_analysis {
         --db-url '${params.db_url}' \
         --storage-root '${params.storage_root}' \
         --ncbi-api-key '${params.ncbi_api_key ?: ""}'
+    DATABASE_URL='${params.db_url}' BIORESILIENT_STORAGE_ROOT='${params.storage_root}' \
+        python -m pipeline.step_reporter --step step8 || true
     """
 }
 
@@ -44,6 +46,8 @@ process bgee_expression {
         --step step8b \
         --db-url '${params.db_url}' \
         --storage-root '${params.storage_root}'
+    DATABASE_URL='${params.db_url}' BIORESILIENT_STORAGE_ROOT='${params.storage_root}' \
+        python -m pipeline.step_reporter --step step8b || true
     """
 }
 
@@ -66,9 +70,15 @@ process composite_score_phase1 {
         --step step9 \
         --db-url '${params.db_url}' \
         --storage-root '${params.storage_root}'
+    DATABASE_URL='${params.db_url}' BIORESILIENT_STORAGE_ROOT='${params.storage_root}' \
+        python -m pipeline.step_reporter --step step9 || true
     """
 }
 
+// Final summary report — re-runs ALL Phase 1 step reporters after the last step
+// completes. Each step reporter is idempotent and non-fatal, so this gives a
+// complete consolidated view of the entire phase even if some earlier inline
+// reports ran in containers that have since been torn down.
 process generate_phase1_reports {
     label 'base'
     cpus 1
@@ -82,15 +92,17 @@ process generate_phase1_reports {
     val true, emit: reports_done
 
     script:
-    def steps = "step5 step6 step6b step6c step7 step7b step8 step9"
+    def allSteps = "step4 step4b step4c step4d step3d step5 step6 step6b step6c step7 step7b step8 step8b step9"
     """
     export DATABASE_URL='${params.db_url}'
     export BIORESILIENT_STORAGE_ROOT='${params.storage_root}'
-    for step in ${steps}; do
-        echo "=== Generating report: \$step ==="
+    echo "=== Phase 1 Summary Reports ==="
+    for step in ${allSteps}; do
+        echo "--- \$step ---"
         python -m pipeline.step_reporter --step "\$step" \
-            || echo "WARN: report for \$step failed (non-fatal)"
+            || echo "WARN: report for \$step skipped (step may not have run)"
     done
+    echo "=== Phase 1 reports complete ==="
     """
 }
 
@@ -129,7 +141,7 @@ workflow PHASE1_EXPRESSION {
         scored_ch = Channel.value(true)
     }
 
-    // Always generate reports after the last requested step completes
+    // Final consolidated summary runs after the last completed step
     generate_phase1_reports(scored_ch)
 
     emit:

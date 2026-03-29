@@ -27,6 +27,8 @@ process build_species_tree {
         --storage-root '${params.storage_root}'
     STORAGE=\$(python -c "from pipeline.config import get_local_storage_root; print(get_local_storage_root())")
     cp \$STORAGE/phylo/species.treefile species.treefile
+    DATABASE_URL='${params.db_url}' BIORESILIENT_STORAGE_ROOT='${params.storage_root}' \
+        python -m pipeline.step_reporter --step step5 || true
     """
 }
 
@@ -49,6 +51,8 @@ process phylo_conservation {
         --step step3d \
         --db-url '${params.db_url}' \
         --storage-root '${params.storage_root}'
+    DATABASE_URL='${params.db_url}' BIORESILIENT_STORAGE_ROOT='${params.storage_root}' \
+        python -m pipeline.step_reporter --step step3d || true
     """
 }
 
@@ -131,6 +135,8 @@ process collect_meme_results {
         --input-dir results/ \
         --db-url '${params.db_url}' \
         --storage-root '${params.storage_root}'
+    DATABASE_URL='${params.db_url}' BIORESILIENT_STORAGE_ROOT='${params.storage_root}' \
+        python -m pipeline.step_reporter --step step6 || true
     """
 }
 
@@ -214,6 +220,8 @@ process collect_fel_busted_results {
         --input-dir results/ \
         --db-url '${params.db_url}' \
         --storage-root '${params.storage_root}'
+    DATABASE_URL='${params.db_url}' BIORESILIENT_STORAGE_ROOT='${params.storage_root}' \
+        python -m pipeline.step_reporter --step step6b || true
     """
 }
 
@@ -235,6 +243,8 @@ process collect_relax_results {
         --input-dir results/ \
         --db-url '${params.db_url}' \
         --storage-root '${params.storage_root}'
+    DATABASE_URL='${params.db_url}' BIORESILIENT_STORAGE_ROOT='${params.storage_root}' \
+        python -m pipeline.step_reporter --step step6c || true
     """
 }
 
@@ -256,6 +266,8 @@ process convergence_scoring {
         --step step7 \
         --db-url '${params.db_url}' \
         --storage-root '${params.storage_root}'
+    DATABASE_URL='${params.db_url}' BIORESILIENT_STORAGE_ROOT='${params.storage_root}' \
+        python -m pipeline.step_reporter --step step7 || true
     """
 }
 
@@ -277,6 +289,8 @@ process convergent_aa {
         --step step7b \
         --db-url '${params.db_url}' \
         --storage-root '${params.storage_root}'
+    DATABASE_URL='${params.db_url}' BIORESILIENT_STORAGE_ROOT='${params.storage_root}' \
+        python -m pipeline.step_reporter --step step7b || true
     """
 }
 
