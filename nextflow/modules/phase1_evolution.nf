@@ -84,9 +84,11 @@ for og_id in sorted(motifs.keys()):
 process run_meme {
     label 'hyphy'
     cpus params.hyphy_cpus
-    memory params.hyphy_memory
-    time '30m'
+    memory { (params.hyphy_memory as nextflow.util.MemoryUnit) * task.attempt }
+    time '1h'
     tag "${og_id}"
+    errorStrategy { task.exitStatus in [137, 143] ? 'retry' : 'finish' }
+    maxRetries 3
 
     input:
     val og_id
@@ -135,9 +137,11 @@ process collect_meme_results {
 process run_fel_busted {
     label 'hyphy'
     cpus params.hyphy_cpus
-    memory params.hyphy_memory
-    time '30m'
+    memory { (params.hyphy_memory as nextflow.util.MemoryUnit) * task.attempt }
+    time '1h'
     tag "${og_id}"
+    errorStrategy { task.exitStatus in [137, 143] ? 'retry' : 'finish' }
+    maxRetries 3
 
     input:
     tuple val(og_id), path(meme_dir)
@@ -164,9 +168,11 @@ process run_fel_busted {
 process run_relax {
     label 'hyphy'
     cpus params.hyphy_cpus
-    memory params.hyphy_memory
-    time '30m'
+    memory { (params.hyphy_memory as nextflow.util.MemoryUnit) * task.attempt }
+    time '1h'
     tag "${og_id}"
+    errorStrategy { task.exitStatus in [137, 143] ? 'retry' : 'finish' }
+    maxRetries 3
 
     input:
     tuple val(og_id), path(meme_dir)
