@@ -92,7 +92,7 @@ process generate_phase1_reports {
     val true, emit: reports_done
 
     script:
-    def allSteps = "step4 step4b step4c step4d step3d step5 step6 step6b step6c step7 step7b step8 step8b step9"
+    def allSteps = "step1 step2 step3 step3b step3c step4 step4b step4c step4d step3d step5 step6 step6b step6c step7 step7b step8 step8b step9"
     """
     export DATABASE_URL='${params.db_url}'
     export BIORESILIENT_STORAGE_ROOT='${params.storage_root}'

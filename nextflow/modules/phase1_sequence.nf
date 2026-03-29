@@ -17,6 +17,8 @@ process validate_environment {
         --step step1 \
         --db-url '${params.db_url}' \
         --storage-root '${params.storage_root}'
+    DATABASE_URL='${params.db_url}' BIORESILIENT_STORAGE_ROOT='${params.storage_root}' \
+        python -m pipeline.step_reporter --step step1 || true
     """
 }
 
@@ -40,6 +42,8 @@ process download_proteomes {
         --storage-root '${params.storage_root}' \
         --ncbi-api-key '${params.ncbi_api_key ?: ""}'
     ln -sf \$(python -c "from pipeline.config import get_local_storage_root; print(get_local_storage_root())")/proteomes proteomes
+    DATABASE_URL='${params.db_url}' BIORESILIENT_STORAGE_ROOT='${params.storage_root}' \
+        python -m pipeline.step_reporter --step step2 || true
     """
 }
 
@@ -63,6 +67,8 @@ process run_orthofinder {
         --storage-root '${params.storage_root}'
     STORAGE=\$(python -c "from pipeline.config import get_local_storage_root; print(get_local_storage_root())")
     ln -sf \$STORAGE/orthofinder_out orthofinder_results
+    DATABASE_URL='${params.db_url}' BIORESILIENT_STORAGE_ROOT='${params.storage_root}' \
+        python -m pipeline.step_reporter --step step3 || true
     """
 }
 
@@ -85,6 +91,8 @@ process load_orthologs {
         --input-dir '${results_dir}' \
         --db-url '${params.db_url}' \
         --storage-root '${params.storage_root}'
+    DATABASE_URL='${params.db_url}' BIORESILIENT_STORAGE_ROOT='${params.storage_root}' \
+        python -m pipeline.step_reporter --step step3b || true
     """
 }
 
@@ -108,6 +116,8 @@ process nucleotide_conservation {
         --db-url '${params.db_url}' \
         --storage-root '${params.storage_root}' \
         --ncbi-api-key '${params.ncbi_api_key ?: ""}'
+    DATABASE_URL='${params.db_url}' BIORESILIENT_STORAGE_ROOT='${params.storage_root}' \
+        python -m pipeline.step_reporter --step step3c || true
     """
 }
 
