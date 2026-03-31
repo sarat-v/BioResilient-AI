@@ -1,2 +1,3 @@
 task_id	hash	native_id	name	status	exit	submit	duration	realtime	%cpu	peak_rss	peak_vmem	rchar	wchar
-1	59/f8b80a	752d5497-c43c-4694-92d5-bbcad6f26e0f	PHASE1_EVOLUTION:extract_og_ids	CACHED	0	2026-03-31 10:55:27.788	2m 15s	28.1s	39.8%	5.9 GB	6 GB	1.3 GB	131.2 KB
+1	5f/a4af6a	9b9af9eb-b6db-4135-a80f-03bf830101cd	PHASE1_EVOLUTION:extract_og_ids	COMPLETED	0	2026-03-31 17:21:21.425	4m 4s	41s	27.2%	5.9 GB	6 GB	1.3 GB	141.9 KB
+2	ec/2387c3	6f4bdbe4-84b7-4611-922d-51618b845057	PHASE1_EVOLUTION:run_meme (og_batch_0000)	COMPLETED	0	2026-03-31 17:25:29.860	19m 42s	16m 3s	371.4%	6 GB	6.7 GB	1.4 GB	7.4 MB

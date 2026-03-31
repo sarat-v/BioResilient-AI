@@ -993,8 +993,8 @@ def run_relax(
         test_branches = [sp for sp in species_labels if sp != "human"]
 
     labeled_tree = tree_newick
-    for branch in test_branches:
-        labeled_tree = labeled_tree.replace(branch, f"{branch}{{Test}}")
+    for branch in sorted(test_branches, key=len, reverse=True):
+        labeled_tree = labeled_tree.replace(f"{branch}:", f"{branch}{{Test}}:")
 
     tree_path.write_text(labeled_tree)
 
