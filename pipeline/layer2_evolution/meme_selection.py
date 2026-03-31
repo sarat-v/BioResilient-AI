@@ -26,6 +26,7 @@ Requirements:
 import json
 import logging
 import os
+import pickle
 import re
 import subprocess
 import tempfile
@@ -43,6 +44,51 @@ from pipeline.config import get_ncbi_api_key, get_ncbi_email, get_local_storage_
 log = logging.getLogger(__name__)
 
 MEME_SIGNIFICANCE_THRESHOLD = 0.05   # per-site p-value threshold for MEME
+
+
+def export_cds_cache_pkl(aligned_orthogroups: dict[str, dict[str, str]], out_path: str) -> str:
+    """Pre-fetch ALL CDS for every accession and export as a single pickle.
+
+    This runs once before the HyPhy scatter so batch tasks never hit NCBI.
+    Returns the output path.
+    """
+    _prefetch_all_cds(aligned_orthogroups)
+
+    cache_dir = Path(get_local_storage_root()) / "cds"
+    cds_cache: dict[str, str] = {}
+    for fna in cache_dir.glob("*.fna"):
+        content = fna.read_text().strip()
+        if content:
+            cds_cache[fna.stem] = content
+
+    log.info("CDS cache: %d accessions with sequences", len(cds_cache))
+    with open(out_path, "wb") as f:
+        pickle.dump(cds_cache, f, protocol=pickle.HIGHEST_PROTOCOL)
+    log.info("CDS cache written to %s (%.1f MB)", out_path,
+             Path(out_path).stat().st_size / 1e6)
+    return out_path
+
+
+def load_cds_cache_pkl(pkl_path: str) -> None:
+    """Load a pre-fetched CDS cache pickle into the local cache directory.
+
+    Each batch task calls this once so fetch_cds_for_protein() finds
+    everything on disk without touching NCBI.
+    """
+    cache_dir = Path(get_local_storage_root()) / "cds"
+    cache_dir.mkdir(parents=True, exist_ok=True)
+
+    with open(pkl_path, "rb") as f:
+        cds_cache: dict[str, str] = pickle.load(f)
+
+    written = 0
+    for acc, seq in cds_cache.items():
+        cache_file = cache_dir / f"{acc}.fna"
+        if not cache_file.exists() or cache_file.stat().st_size == 0:
+            cache_file.write_text(seq)
+            written += 1
+
+    log.info("CDS cache loaded: %d entries, %d newly written to disk", len(cds_cache), written)
 
 
 # ---------------------------------------------------------------------------
@@ -506,6 +552,7 @@ def run_meme(
             "--tree", str(tree_path),
             "--output", str(out_path),
             "--branches", "All",
+            "--full-model", "No",
         ]
         log.info("Running MEME for %s (CPU=%d): %s", og_id, cpus, " ".join(cmd[:3]))
         result = subprocess.run(
@@ -665,6 +712,7 @@ def run_fel(
             "--alignment", str(aln_path),
             "--tree", str(tree_path),
             "--output", str(out_path),
+            "--full-model", "No",
         ]
         result = subprocess.run(cmd, capture_output=True, text=True, timeout=1800, env=hyphy_env)
         if result.returncode != 0:

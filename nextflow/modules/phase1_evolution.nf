@@ -120,11 +120,37 @@ PYEOF
     """
 }
 
+process prefetch_cds {
+    label 'base'
+    cpus 4
+    memory '32 GB'
+    time '2h'
+
+    input:
+    path aligned_pkl
+
+    output:
+    path 'cds_cache.pkl', emit: cds_cache
+
+    script:
+    """
+    echo "cds_prefetch_v10_shared_cache"
+    python -m scripts.nf_wrappers.run_step \
+        --step step6_prefetch_cds \
+        --input-pkl '${aligned_pkl}' \
+        --output-dir . \
+        --db-url '${params.db_url}' \
+        --storage-root '${params.storage_root}' \
+        --ncbi-api-key '${params.ncbi_api_key ?: ""}'
+    ls -lh cds_cache.pkl
+    """
+}
+
 process run_meme {
     label 'hyphy'
     cpus params.hyphy_cpus
     memory { (params.hyphy_memory as nextflow.util.MemoryUnit) * task.attempt }
-    time '12h'
+    time '6h'
     tag "${og_batch.baseName}"
     errorStrategy { task.exitStatus in [137, 143] ? 'retry' : 'finish' }
     maxRetries 3
@@ -133,19 +159,21 @@ process run_meme {
     path og_batch
     path aligned_pkl
     path treefile
+    path cds_cache
 
     output:
     path "${og_batch.baseName}", emit: meme_result
 
     script:
     """
-    echo "hyphy_merged_v9_cpu4_speedflags"
+    echo "hyphy_v10_cached_cds_speedflags"
     mkdir -p '${og_batch.baseName}'
     python -m scripts.nf_wrappers.run_step \
         --step step6_batch \
         --og-id-file '${og_batch}' \
         --input-pkl '${aligned_pkl}' \
         --treefile '${treefile}' \
+        --cds-cache '${cds_cache}' \
         --output-dir '${og_batch.baseName}' \
         --db-url '${params.db_url}' \
         --storage-root '${params.storage_root}' \
@@ -370,11 +398,15 @@ workflow PHASE1_EVOLUTION {
     }
 
     if (fromIdx <= EVO_STEPS.indexOf('step6') && untilIdx >= EVO_STEPS.indexOf('step6')) {
+        // Pre-fetch ALL CDS once (single task) — eliminates NCBI bottleneck in scatter
+        prefetch_cds(aligned_pkl_val)
+        cds_cache_ch = prefetch_cds.out.cds_cache.first()
+
         extract_og_ids(aligned_pkl_val)
         og_batches_ch = extract_og_ids.out.og_batches.flatten()
 
-        // Step 6: All HyPhy (MEME+FEL+BUSTED+RELAX) merged into one batch task per scatter
-        run_meme(og_batches_ch, aligned_pkl_val, treefile_ch)
+        // Step 6: MEME+FEL+BUSTED per OG batch (RELAX deferred)
+        run_meme(og_batches_ch, aligned_pkl_val, treefile_ch, cds_cache_ch)
         collect_all_hyphy_results(run_meme.out.meme_result.collect())
         all_hyphy_done_ch = collect_all_hyphy_results.out.all_hyphy_done
     } else {

@@ -327,13 +327,12 @@ def run_step6_batch(args):
     import json
     import shutil
     from pipeline.layer2_evolution.meme_selection import (
-        _prefetch_all_cds,
+        load_cds_cache_pkl,
         fetch_cds_for_protein,
         protein_to_codon_alignment,
         run_meme, parse_meme_results,
         run_fel, parse_fel_results,
         run_busted, parse_busted_results,
-        run_relax, parse_relax_results,
     )
     from pipeline.layer2_evolution.selection import write_hyphy_input, run_absrel, parse_absrel_results
     from pipeline.layer2_evolution.phylo_tree import prune_tree_to_species
@@ -346,17 +345,18 @@ def run_step6_batch(args):
         og_ids = [line.strip() for line in f if line.strip()]
     log.info("HyPhy batch: %d OGs from %s", len(og_ids), og_id_file)
 
+    cds_cache_file = getattr(args, 'cds_cache', None)
+    if cds_cache_file:
+        log.info("Loading pre-fetched CDS cache from %s", cds_cache_file)
+        load_cds_cache_pkl(cds_cache_file)
+    else:
+        log.warning("No CDS cache provided — batch tasks will skip NCBI fetching")
+
     data = _load_aligned(args.input_pkl)
     aligned = data.get("aligned", data)
     treefile = Path(args.treefile)
     out_dir = Path(args.output_dir or ".")
     out_dir.mkdir(parents=True, exist_ok=True)
-
-    batch_aligned = {og_id: aligned[og_id] for og_id in og_ids if og_id in aligned}
-    if batch_aligned:
-        log.info("Pre-fetching CDS for %d OGs using bulk efetch...", len(batch_aligned))
-        _prefetch_all_cds(batch_aligned)
-        log.info("CDS pre-fetch complete.")
 
     for og_id in og_ids:
         og_out = out_dir / og_id
@@ -417,21 +417,14 @@ def run_step6_batch(args):
                 if src.exists():
                     shutil.copy2(src, og_out / "codon_aln.fna")
 
-            # FEL + BUSTED + RELAX on the same codon alignment
             fel_json = run_fel(codon_aln, pruned_tree, og_id)
             result["fel_sites"] = parse_fel_results(fel_json).get("fel_sites", 0) if fel_json else 0
 
             busted_json = run_busted(codon_aln, pruned_tree, og_id)
             result["busted_pvalue"] = parse_busted_results(busted_json).get("busted_pvalue", 1.0) if busted_json else 1.0
 
-            relax_json = run_relax(codon_aln, pruned_tree, og_id)
-            if relax_json:
-                relax_parsed = parse_relax_results(relax_json)
-                result["relax_k"] = relax_parsed.get("relax_k")
-                result["relax_pvalue"] = relax_parsed.get("relax_pvalue")
-            else:
-                result["relax_k"] = None
-                result["relax_pvalue"] = None
+            result["relax_k"] = None
+            result["relax_pvalue"] = None
         else:
             aln_path, tree_path = write_hyphy_input(og_id, seqs, pruned_tree)
             raw = run_absrel(aln_path, tree_path, og_id)
@@ -748,6 +741,19 @@ def run_dedup_motifs(args):
     log.info("Deduped divergent_motif: %d → %d rows (removed %d duplicates)", before, after, before - after)
 
 
+def run_step6_prefetch_cds(args):
+    """Pre-fetch all CDS sequences and output a single pickle for distribution."""
+    from pipeline.layer2_evolution.meme_selection import export_cds_cache_pkl
+
+    data = _load_aligned(args.input_pkl)
+    aligned = data.get("aligned", data)
+    out_path = getattr(args, 'output_dir', None) or "."
+    pkl_out = Path(out_path) / "cds_cache.pkl"
+    pkl_out.parent.mkdir(parents=True, exist_ok=True)
+    export_cds_cache_pkl(aligned, str(pkl_out))
+    log.info("CDS cache pickle: %s", pkl_out)
+
+
 STEP_MAP = {
     "step1": run_step1,
     "step2": run_step2,
@@ -762,6 +768,7 @@ STEP_MAP = {
     "step4d": run_step4d,
     "step5": run_step5,
     "step6_single_og": run_step6_single_og,
+    "step6_prefetch_cds": run_step6_prefetch_cds,
     "step6_batch": run_step6_batch,
     "step6_collect": run_step6_collect,
     "step6_all_collect": run_step6_all_collect,
@@ -801,6 +808,7 @@ def main():
     parser.add_argument("--og-id", default=None)
     parser.add_argument("--og-id-file", default=None)
     parser.add_argument("--input-pkl", default=None)
+    parser.add_argument("--cds-cache", default=None)
     parser.add_argument("--input-dir", default=None)
     parser.add_argument("--output-dir", default=None)
     parser.add_argument("--treefile", default=None)
