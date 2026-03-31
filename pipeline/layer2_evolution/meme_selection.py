@@ -69,26 +69,21 @@ def export_cds_cache_pkl(aligned_orthogroups: dict[str, dict[str, str]], out_pat
     return out_path
 
 
-def load_cds_cache_pkl(pkl_path: str) -> None:
-    """Load a pre-fetched CDS cache pickle into the local cache directory.
+_IN_MEMORY_CDS_CACHE: dict[str, str] = {}
 
-    Each batch task calls this once so fetch_cds_for_protein() finds
-    everything on disk without touching NCBI.
+
+def load_cds_cache_pkl(pkl_path: str) -> None:
+    """Load a pre-fetched CDS cache pickle into an in-memory dict.
+
+    Each batch task calls this once so fetch_cds_for_protein() can
+    look up sequences instantly without disk I/O or NCBI calls.
     """
-    cache_dir = Path(get_local_storage_root()) / "cds"
-    cache_dir.mkdir(parents=True, exist_ok=True)
+    global _IN_MEMORY_CDS_CACHE
 
     with open(pkl_path, "rb") as f:
-        cds_cache: dict[str, str] = pickle.load(f)
+        _IN_MEMORY_CDS_CACHE = pickle.load(f)
 
-    written = 0
-    for acc, seq in cds_cache.items():
-        cache_file = cache_dir / f"{acc}.fna"
-        if not cache_file.exists() or cache_file.stat().st_size == 0:
-            cache_file.write_text(seq)
-            written += 1
-
-    log.info("CDS cache loaded: %d entries, %d newly written to disk", len(cds_cache), written)
+    log.info("CDS cache loaded in memory: %d entries", len(_IN_MEMORY_CDS_CACHE))
 
 
 # ---------------------------------------------------------------------------
@@ -364,13 +359,16 @@ def _prefetch_all_cds(aligned_orthogroups: dict[str, dict[str, str]]) -> None:
 def fetch_cds_for_protein(protein_accession: str) -> Optional[str]:
     """Fetch the CDS nucleotide sequence for a protein accession from NCBI.
 
-    Results are cached to disk at {storage_root}/cds/{accession}.fna so that
-    repeated runs of step6, 6b, and 6c never re-fetch the same accession.
-
-    Rate: respects NCBI's 10 req/s limit with API key.
+    Checks in-memory cache first (populated by load_cds_cache_pkl),
+    then falls back to disk cache, then NCBI as last resort.
     """
-    _setup_entrez()
     acc = protein_accession.split("|")[-1] if "|" in protein_accession else protein_accession
+
+    if acc in _IN_MEMORY_CDS_CACHE:
+        seq = _IN_MEMORY_CDS_CACHE[acc]
+        return seq if seq else None
+
+    _setup_entrez()
 
     cache_dir = Path(get_local_storage_root()) / "cds"
     cache_dir.mkdir(parents=True, exist_ok=True)
