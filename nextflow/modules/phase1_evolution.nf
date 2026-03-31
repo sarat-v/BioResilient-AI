@@ -58,6 +58,8 @@ process phylo_conservation {
 
 // extract_og_ids always queries the DB for authoritative OG list (the pkl's
 // motifs_by_og can be stale). The pkl is still needed for aligned sequences.
+// Writes og_batch_NNN.txt files with params.hyphy_batch_size OGs each for
+// efficient scatter — one pkl load per task instead of one per OG.
 process extract_og_ids {
     label 'base'
     cpus 1
@@ -68,14 +70,15 @@ process extract_og_ids {
     path aligned_pkl
 
     output:
-    path 'og_ids.txt', emit: og_list
+    path 'og_batch_*.txt', emit: og_batches
 
     script:
     """
     python3 << 'PYEOF'
-import pickle, sys
+import pickle, sys, math
 
-db_url = '${params.db_url}'
+db_url    = '${params.db_url}'
+batch_size = int('${params.hyphy_batch_size}')
 
 with open('${aligned_pkl}', 'rb') as f:
     data = pickle.load(f)
@@ -84,8 +87,6 @@ motifs  = data.get('motifs_by_og', {})
 
 sys.stderr.write(f'pkl: {len(aligned)} aligned OGs, {len(motifs)} in motifs_by_og\\n')
 
-# Always use DB as the authoritative source for which OGs have divergent motifs.
-# The pkl's motifs_by_og can be stale if step4 was rerun without regenerating the pkl.
 import psycopg2
 conn = psycopg2.connect(db_url)
 cur  = conn.cursor()
@@ -107,10 +108,15 @@ if not og_list:
     og_list = sorted(og for og in motifs if og in aligned)
     sys.stderr.write(f'Fallback OGs from pkl: {len(og_list)}\\n')
 
-for og_id in og_list:
-    print(og_id)
+n_batches = math.ceil(len(og_list) / batch_size)
+for i in range(n_batches):
+    chunk = og_list[i * batch_size : (i + 1) * batch_size]
+    with open(f'og_batch_{i:04d}.txt', 'w') as f:
+        f.write('\\n'.join(chunk) + '\\n')
+
+sys.stderr.write(f'Wrote {len(og_list)} OGs into {n_batches} batch files (batch_size={batch_size})\\n')
 PYEOF
-    echo "OGs to scatter: \$(wc -l < og_ids.txt)"
+    echo "Batch files: \$(ls og_batch_*.txt | wc -l)"
     """
 }
 
@@ -118,35 +124,36 @@ process run_meme {
     label 'hyphy'
     cpus params.hyphy_cpus
     memory { (params.hyphy_memory as nextflow.util.MemoryUnit) * task.attempt }
-    time '1h'
-    tag "${og_id}"
+    time '12h'
+    tag "${og_batch.baseName}"
     errorStrategy { task.exitStatus in [137, 143] ? 'retry' : 'finish' }
     maxRetries 3
 
     input:
-    val og_id
+    path og_batch
     path aligned_pkl
     path treefile
 
     output:
-    tuple val(og_id), path("${og_id}/"), emit: meme_result
+    path "${og_batch.baseName}", emit: meme_result
 
     script:
     """
-    mkdir -p '${og_id}'
+    echo "hyphy_merged_v9_cpu4_speedflags"
+    mkdir -p '${og_batch.baseName}'
     python -m scripts.nf_wrappers.run_step \
-        --step step6_single_og \
-        --og-id '${og_id}' \
+        --step step6_batch \
+        --og-id-file '${og_batch}' \
         --input-pkl '${aligned_pkl}' \
         --treefile '${treefile}' \
-        --output-dir '${og_id}' \
+        --output-dir '${og_batch.baseName}' \
         --db-url '${params.db_url}' \
         --storage-root '${params.storage_root}' \
         --ncbi-api-key '${params.ncbi_api_key ?: ""}'
     """
 }
 
-process collect_meme_results {
+process collect_all_hyphy_results {
     label 'base'
     cpus 2
     memory '8 GB'
@@ -155,17 +162,22 @@ process collect_meme_results {
     path 'results/*'
 
     output:
-    val true, emit: meme_done
+    val true, emit: all_hyphy_done
 
     script:
     """
+    echo "collect_v7_merged_all_hyphy"
     python -m scripts.nf_wrappers.run_step \
-        --step step6_collect \
+        --step step6_all_collect \
         --input-dir results/ \
         --db-url '${params.db_url}' \
         --storage-root '${params.storage_root}'
     DATABASE_URL='${params.db_url}' BIORESILIENT_STORAGE_ROOT='${params.storage_root}' \
         python -m pipeline.step_reporter --step step6 || true
+    DATABASE_URL='${params.db_url}' BIORESILIENT_STORAGE_ROOT='${params.storage_root}' \
+        python -m pipeline.step_reporter --step step6b || true
+    DATABASE_URL='${params.db_url}' BIORESILIENT_STORAGE_ROOT='${params.storage_root}' \
+        python -m pipeline.step_reporter --step step6c || true
     """
 }
 
@@ -173,28 +185,26 @@ process run_fel_busted {
     label 'hyphy'
     cpus params.hyphy_cpus
     memory { (params.hyphy_memory as nextflow.util.MemoryUnit) * task.attempt }
-    time '1h'
-    tag "${og_id}"
+    time '12h'
+    tag "${meme_out.baseName}"
     errorStrategy { task.exitStatus in [137, 143] ? 'retry' : 'finish' }
     maxRetries 3
 
     input:
-    tuple val(og_id), path(meme_dir)
+    path meme_out
     path treefile
 
     output:
-    tuple val(og_id), path("${og_id}_fb/"), emit: fb_result
+    path "${meme_out.baseName}_fb", emit: fb_result
 
     script:
     """
-    mkdir -p '${og_id}_fb'
-    CODON_ALN='${meme_dir}/codon_aln.fna'
+    mkdir -p '${meme_out.baseName}_fb'
     python -m scripts.nf_wrappers.run_step \
-        --step step6b_single_og \
-        --og-id '${og_id}' \
-        --codon-aln "\$CODON_ALN" \
+        --step step6b_batch \
+        --input-dir '${meme_out}' \
         --treefile '${treefile}' \
-        --output-dir '${og_id}_fb' \
+        --output-dir '${meme_out.baseName}_fb' \
         --db-url '${params.db_url}' \
         --storage-root '${params.storage_root}'
     """
@@ -204,28 +214,26 @@ process run_relax {
     label 'hyphy'
     cpus params.hyphy_cpus
     memory { (params.hyphy_memory as nextflow.util.MemoryUnit) * task.attempt }
-    time '1h'
-    tag "${og_id}"
+    time '12h'
+    tag "${meme_out.baseName}"
     errorStrategy { task.exitStatus in [137, 143] ? 'retry' : 'finish' }
     maxRetries 3
 
     input:
-    tuple val(og_id), path(meme_dir)
+    path meme_out
     path treefile
 
     output:
-    tuple val(og_id), path("${og_id}_relax/"), emit: relax_result
+    path "${meme_out.baseName}_relax", emit: relax_result
 
     script:
     """
-    mkdir -p '${og_id}_relax'
-    CODON_ALN='${meme_dir}/codon_aln.fna'
+    mkdir -p '${meme_out.baseName}_relax'
     python -m scripts.nf_wrappers.run_step \
-        --step step6c_single_og \
-        --og-id '${og_id}' \
-        --codon-aln "\$CODON_ALN" \
+        --step step6c_batch \
+        --input-dir '${meme_out}' \
         --treefile '${treefile}' \
-        --output-dir '${og_id}_relax' \
+        --output-dir '${meme_out.baseName}_relax' \
         --db-url '${params.db_url}' \
         --storage-root '${params.storage_root}'
     """
@@ -244,6 +252,7 @@ process collect_fel_busted_results {
 
     script:
     """
+    echo "collect_v6_all_fixes"
     python -m scripts.nf_wrappers.run_step \
         --step step6b_collect \
         --input-dir results/ \
@@ -267,6 +276,7 @@ process collect_relax_results {
 
     script:
     """
+    echo "collect_v6_all_fixes"
     python -m scripts.nf_wrappers.run_step \
         --step step6c_collect \
         --input-dir results/ \
@@ -281,7 +291,7 @@ process convergence_scoring {
     label 'base'
     cpus 4
     memory '8 GB'
-    time '1h'
+    time '2h'
 
     input:
     val meme_done
@@ -303,8 +313,8 @@ process convergence_scoring {
 process convergent_aa {
     label 'base'
     cpus 4
-    memory '8 GB'
-    time '1h'
+    memory '16 GB'
+    time '3h'
 
     input:
     val convergence_done
@@ -340,66 +350,45 @@ workflow PHASE1_EVOLUTION {
     if (fromIdx < 0) fromIdx = 0
     if (untilIdx < 0) untilIdx = EVO_STEPS.size() - 1
 
+    // Convert aligned_pkl to a value channel so it can be reused across scatter
+    aligned_pkl_val = aligned_pkl.first()
+
     // ── Step 5: build species tree ────────────────────────────────────────
     // Skip when resuming from step6 or later — tree already in S3.
     if (fromIdx < 0 || fromIdx <= step5Idx) {
-        build_species_tree(aligned_pkl)
-        treefile_ch  = build_species_tree.out.treefile
+        build_species_tree(aligned_pkl_val)
+        treefile_ch  = build_species_tree.out.treefile.first()
     } else {
-        treefile_ch  = Channel.fromPath("s3://${params.s3_bucket}/cache/species.treefile")
+        treefile_ch  = Channel.fromPath("s3://${params.s3_bucket}/cache/species.treefile").first()
     }
 
-    if (untilIdx >= EVO_STEPS.indexOf('step3d')) {
+    if (fromIdx <= EVO_STEPS.indexOf('step3d') && untilIdx >= EVO_STEPS.indexOf('step3d')) {
         phylo_conservation(treefile_ch, nuc_done)
         phylo_done_ch = phylo_conservation.out.phylo_done
     } else {
         phylo_done_ch = Channel.value(true)
     }
 
-    if (untilIdx >= EVO_STEPS.indexOf('step6')) {
-        extract_og_ids(aligned_pkl)
-        og_ids_ch = extract_og_ids.out.og_list
-            .splitText()
-            .map { it.trim() }
-            .filter { it.length() > 0 }
+    if (fromIdx <= EVO_STEPS.indexOf('step6') && untilIdx >= EVO_STEPS.indexOf('step6')) {
+        extract_og_ids(aligned_pkl_val)
+        og_batches_ch = extract_og_ids.out.og_batches.flatten()
 
-        // Step 6: MEME — per-OG scatter
-        run_meme(og_ids_ch, aligned_pkl, treefile_ch)
-        collect_meme_results(run_meme.out.meme_result.map { it[1] }.collect())
-        meme_done_ch = collect_meme_results.out.meme_done
+        // Step 6: All HyPhy (MEME+FEL+BUSTED+RELAX) merged into one batch task per scatter
+        run_meme(og_batches_ch, aligned_pkl_val, treefile_ch)
+        collect_all_hyphy_results(run_meme.out.meme_result.collect())
+        all_hyphy_done_ch = collect_all_hyphy_results.out.all_hyphy_done
     } else {
-        meme_done_ch = Channel.value(true)
+        all_hyphy_done_ch = Channel.value(true)
     }
 
-    if (untilIdx >= EVO_STEPS.indexOf('step6b')) {
-        run_fel_busted(run_meme.out.meme_result, treefile_ch)
-        collect_fel_busted_results(run_fel_busted.out.fb_result.map { it[1] }.collect())
-        fb_done_ch = collect_fel_busted_results.out.fb_done
-    } else {
-        fb_done_ch = Channel.value(true)
-    }
-
-    if (untilIdx >= EVO_STEPS.indexOf('step6c')) {
-        run_relax(run_meme.out.meme_result, treefile_ch)
-        collect_relax_results(run_relax.out.relax_result.map { it[1] }.collect())
-        relax_done_ch = collect_relax_results.out.relax_done
-    } else {
-        relax_done_ch = Channel.value(true)
-    }
-
-    if (untilIdx >= EVO_STEPS.indexOf('step7')) {
-        convergence_scoring(
-            meme_done_ch
-                .combine(fb_done_ch)
-                .combine(relax_done_ch)
-                .map { true }
-        )
+    if (fromIdx <= EVO_STEPS.indexOf('step7') && untilIdx >= EVO_STEPS.indexOf('step7')) {
+        convergence_scoring(all_hyphy_done_ch)
         convergence_done_ch = convergence_scoring.out.convergence_done
     } else {
         convergence_done_ch = Channel.value(true)
     }
 
-    if (untilIdx >= EVO_STEPS.indexOf('step7b')) {
+    if (fromIdx <= EVO_STEPS.indexOf('step7b') && untilIdx >= EVO_STEPS.indexOf('step7b')) {
         convergent_aa(convergence_done_ch)
         convergent_aa_done_ch = convergent_aa.out.convergent_aa_done
     } else {

@@ -56,12 +56,78 @@ def _setup_entrez() -> None:
         Entrez.api_key = api_key
 
 
+def _map_uniprot_to_refseq(uniprot_mnemonics: list[str], cache_dir: Path) -> dict[str, str]:
+    """Map UniProt entry names (e.g. CASP8_HUMAN) to NCBI RefSeq protein IDs.
+
+    Uses UniProt REST search API with xref_refseq field. Returns {mnemonic: refseq_id}.
+    """
+    if not uniprot_mnemonics:
+        return {}
+
+    mapping: dict[str, str] = {}
+    map_cache = cache_dir / "_uniprot_refseq_map.json"
+    if map_cache.exists():
+        try:
+            cached = json.loads(map_cache.read_text())
+            mapping.update(cached)
+        except Exception:
+            pass
+
+    to_map = [m for m in uniprot_mnemonics if m not in mapping]
+    if not to_map:
+        log.info("UniProt→RefSeq: all %d mappings cached.", len(mapping))
+        return {k: v for k, v in mapping.items() if k in set(uniprot_mnemonics)}
+
+    log.info("UniProt→RefSeq: mapping %d accessions via UniProt search API...", len(to_map))
+
+    _BATCH = 100
+    for i in range(0, len(to_map), _BATCH):
+        batch = to_map[i:i + _BATCH]
+        query = " OR ".join(f"id:{m}" for m in batch)
+        params = urlencode({
+            "query": f"({query})",
+            "fields": "accession,id,xref_refseq",
+            "format": "json",
+            "size": str(len(batch)),
+        })
+        url = f"https://rest.uniprot.org/uniprotkb/search?{params}"
+        try:
+            req = Request(url, headers={"Accept": "application/json"})
+            with urlopen(req, timeout=120) as resp:
+                data = json.loads(resp.read().decode())
+
+            for entry in data.get("results", []):
+                entry_name = entry.get("uniProtkbId", "")
+                xrefs = entry.get("uniProtKBCrossReferences", [])
+                for xref in xrefs:
+                    if xref.get("database") == "RefSeq":
+                        refseq_id = xref.get("id", "")
+                        if refseq_id.startswith("NP_"):
+                            mapping[entry_name] = refseq_id
+                            break
+
+            if (i + _BATCH) < len(to_map):
+                time.sleep(0.5)
+
+        except Exception as exc:
+            log.warning("UniProt search batch %d failed: %s", i, exc)
+
+    try:
+        map_cache.write_text(json.dumps(mapping))
+    except Exception:
+        pass
+
+    mapped = {k: v for k, v in mapping.items() if k in set(uniprot_mnemonics)}
+    log.info("UniProt→RefSeq: %d/%d mapped successfully.", len(mapped), len(uniprot_mnemonics))
+    return mapped
+
+
 def _prefetch_all_cds(aligned_orthogroups: dict[str, dict[str, str]]) -> None:
     """Pre-fetch CDS for all unique protein accessions before spawning workers.
 
     Strategy:
-    - Phase 1: elink in large batches (500) to map protein → nuccore IDs
-    - Phase 2: efetch fasta_cds_na in parallel threads (8 workers, batches of 200)
+    - Phase 0: Map UniProt mnemonics (human) → NCBI RefSeq protein IDs
+    - Phase 1: efetch fasta_cds_na in parallel threads (8 workers, batches of 200)
       fasta_cds_na returns only the CDS FASTA — much smaller/faster than GenBank
     - Results cached to disk so workers never hit NCBI again
     """
@@ -93,106 +159,151 @@ def _prefetch_all_cds(aligned_orthogroups: dict[str, dict[str, str]]) -> None:
             acc = label.split("|")[-1] if "|" in label else label
             all_accessions.add(acc)
 
+    uniprot_accs = sorted(a for a in all_accessions if _is_uniprot(a))
+    uniprot_needing_map = []
+    for a in uniprot_accs:
+        cf = cache_dir / f"{a}.fna"
+        if not cf.exists() or cf.stat().st_size == 0:
+            uniprot_needing_map.append(a)
+    uniprot_to_refseq: dict[str, str] = {}
+    if uniprot_needing_map:
+        uniprot_to_refseq = _map_uniprot_to_refseq(uniprot_needing_map, cache_dir)
+
     to_fetch = []
     for acc in sorted(all_accessions):
         cf = cache_dir / f"{acc}.fna"
         if _is_uniprot(acc):
-            if not cf.exists():
+            refseq = uniprot_to_refseq.get(acc)
+            if refseq:
+                to_fetch.append((acc, refseq))
+            elif not cf.exists():
                 cf.write_text("")
             continue
         if cf.exists() and cf.stat().st_size == 0:
             cf.unlink()
         if not cf.exists():
-            to_fetch.append(acc)
+            to_fetch.append((acc, acc))
 
-    ncbi_total = sum(1 for a in all_accessions if not _is_uniprot(a))
     if not to_fetch:
-        log.info("CDS pre-fetch: all %d NCBI accessions already cached.", ncbi_total)
+        log.info("CDS pre-fetch: all %d accessions already cached.", len(all_accessions))
         return
 
-    log.info("CDS pre-fetch: %d NCBI accessions to fetch (%d cached, %d UniProt skipped).",
-             len(to_fetch), ncbi_total - len(to_fetch), len(all_accessions) - ncbi_total)
+    ncbi_direct = sum(1 for _, r in to_fetch if not _is_uniprot(r))
+    uniprot_mapped = sum(1 for o, r in to_fetch if o != r)
+    log.info("CDS pre-fetch: %d to fetch (%d NCBI direct, %d UniProt→RefSeq mapped).",
+             len(to_fetch), ncbi_direct, uniprot_mapped)
 
-    # ── Single phase: efetch fasta_cds_na directly from protein db ────────────
-    # No elink needed — protein db supports fasta_cds_na rettype directly.
-    # The FASTA header contains [protein_id=XP_xxx] for mapping back to accession.
-    _EFETCH_BATCH = 200
-    _EFETCH_WORKERS = min(8, (os.cpu_count() or 8))
+    # Build mapping: fetch_acc → [original_accs] so we can cache under original names
+    fetch_to_originals: dict[str, list[str]] = {}
+    for orig, fetch in to_fetch:
+        fetch_to_originals.setdefault(fetch, []).append(orig)
+
+    fetch_ids = list(fetch_to_originals.keys())
+
+    _EFETCH_BATCH = 100
+    _EFETCH_WORKERS = 2
     done_fetch = 0
     total_written = 0
     fetch_lock = threading.Lock()
 
     _pid_pat = re.compile(r"\[protein_id=([^\]]+)\]")
 
+    import random as _rng
+    _startup_jitter = _rng.uniform(0, 30)
+    log.info("CDS fetch startup jitter: %.1fs", _startup_jitter)
+    time.sleep(_startup_jitter)
+
+    def _flush_cds(fetch_acc: str, lines: list[str]) -> int:
+        seq = "".join(lines)
+        count = 0
+        for orig_acc in fetch_to_originals.get(fetch_acc, [fetch_acc]):
+            cache_path = cache_dir / f"{orig_acc}.fna"
+            existing = cache_path.read_text() if cache_path.exists() else ""
+            if len(seq) > len(existing):
+                cache_path.write_text(seq if seq else "")
+            elif not cache_path.exists():
+                cache_path.write_text(seq if seq else "")
+            if seq:
+                count += 1
+        return count
+
     def _fetch_cds_batch_direct(batch: list[str]) -> int:
-        """Fetch fasta_cds_na for a batch of protein accessions directly.
-        Returns count of CDS sequences written to cache.
-        """
-        params = {
-            "db": "protein",
-            "id": ",".join(batch),
-            "rettype": "fasta_cds_na",
-            "retmode": "text",
-        }
-        if api_key:
-            params["api_key"] = api_key
-        try:
-            req = Request(
-                base_url + "efetch.fcgi",
-                data=urlencode(params).encode(),
-                method="POST",
-            )
-            with urlopen(req, timeout=120) as resp:
-                text = resp.read().decode("utf-8", errors="replace")
-            written = 0
-            current_acc = None
-            current_lines: list[str] = []
+        """Fetch fasta_cds_na for a batch of protein accessions with retry on 429."""
+        _MAX_RETRIES = 5
+        for attempt in range(_MAX_RETRIES):
+            params = {
+                "db": "protein",
+                "id": ",".join(batch),
+                "rettype": "fasta_cds_na",
+                "retmode": "text",
+            }
+            if api_key:
+                params["api_key"] = api_key
+            try:
+                req = Request(
+                    base_url + "efetch.fcgi",
+                    data=urlencode(params).encode(),
+                    method="POST",
+                )
+                with urlopen(req, timeout=120) as resp:
+                    text = resp.read().decode("utf-8", errors="replace")
+                written = 0
+                current_fetch_acc = None
+                current_lines: list[str] = []
 
-            def _flush(acc: str, lines: list[str]) -> int:
-                seq = "".join(lines)
-                (cache_dir / f"{acc}.fna").write_text(seq if seq else "")
-                return 1 if seq else 0
+                for line in text.splitlines():
+                    if line.startswith(">"):
+                        if current_fetch_acc and current_lines:
+                            written += _flush_cds(current_fetch_acc, current_lines)
+                        current_lines = []
+                        current_fetch_acc = None
+                        m = _pid_pat.search(line)
+                        if m:
+                            pid = m.group(1)
+                            if pid in batch:
+                                current_fetch_acc = pid
+                            else:
+                                pid_base = pid.rsplit(".", 1)[0]
+                                for b in batch:
+                                    if b.rsplit(".", 1)[0] == pid_base:
+                                        current_fetch_acc = b
+                                        break
+                    else:
+                        if current_fetch_acc:
+                            current_lines.append(line.strip())
 
-            for line in text.splitlines():
-                if line.startswith(">"):
-                    if current_acc and current_lines:
-                        written += _flush(current_acc, current_lines)
-                    current_lines = []
-                    current_acc = None
-                    m = _pid_pat.search(line)
-                    if m:
-                        pid = m.group(1)
-                        if pid in batch:
-                            current_acc = pid
-                        else:
-                            pid_base = pid.rsplit(".", 1)[0]
-                            for b in batch:
-                                if b.rsplit(".", 1)[0] == pid_base:
-                                    current_acc = b
-                                    break
-                else:
-                    if current_acc:
-                        current_lines.append(line.strip())
+                if current_fetch_acc and current_lines:
+                    written += _flush_cds(current_fetch_acc, current_lines)
 
-            if current_acc and current_lines:
-                written += _flush(current_acc, current_lines)
-
-            for acc in batch:
-                if not (cache_dir / f"{acc}.fna").exists():
-                    (cache_dir / f"{acc}.fna").write_text("")
-            return written
-        except Exception as exc:
-            log.warning("efetch direct batch failed: %s", exc)
-            for acc in batch:
-                if not (cache_dir / f"{acc}.fna").exists():
-                    (cache_dir / f"{acc}.fna").write_text("")
-            return 0
+                for fetch_acc in batch:
+                    for orig_acc in fetch_to_originals.get(fetch_acc, [fetch_acc]):
+                        if not (cache_dir / f"{orig_acc}.fna").exists():
+                            (cache_dir / f"{orig_acc}.fna").write_text("")
+                return written
+            except Exception as exc:
+                is_retryable = any(s in str(exc) for s in ("429", "Network is unreachable",
+                    "Connection reset", "timed out", "503", "500", "urlopen error"))
+                if is_retryable and attempt < _MAX_RETRIES - 1:
+                    wait = (2 ** attempt) * 5 + _rng.uniform(0, 5)
+                    log.info("NCBI transient error, retry %d/%d in %.0fs: %s",
+                             attempt + 1, _MAX_RETRIES, wait, exc)
+                    time.sleep(wait)
+                    continue
+                log.warning("efetch batch failed (attempt %d/%d): %s",
+                            attempt + 1, _MAX_RETRIES, exc)
+                for fetch_acc in batch:
+                    for orig_acc in fetch_to_originals.get(fetch_acc, [fetch_acc]):
+                        if not (cache_dir / f"{orig_acc}.fna").exists():
+                            (cache_dir / f"{orig_acc}.fna").write_text("")
+                return 0
+        log.warning("efetch batch exhausted all %d retries", _MAX_RETRIES)
+        return 0
 
     log.info("  CDS pre-fetch: efetch fasta_cds_na from protein db, "
-             "%d accessions, %d workers, batches of %d...",
-             len(to_fetch), _EFETCH_WORKERS, _EFETCH_BATCH)
+             "%d fetch-accessions, %d workers, batches of %d...",
+             len(fetch_ids), _EFETCH_WORKERS, _EFETCH_BATCH)
 
-    efetch_batches = [to_fetch[i:i + _EFETCH_BATCH] for i in range(0, len(to_fetch), _EFETCH_BATCH)]
+    efetch_batches = [fetch_ids[i:i + _EFETCH_BATCH] for i in range(0, len(fetch_ids), _EFETCH_BATCH)]
     with ThreadPoolExecutor(max_workers=_EFETCH_WORKERS) as pool:
         futures2 = {pool.submit(_fetch_cds_batch_direct, b): b for b in efetch_batches}
         for fut in as_completed(futures2):
@@ -200,13 +311,13 @@ def _prefetch_all_cds(aligned_orthogroups: dict[str, dict[str, str]]) -> None:
             with fetch_lock:
                 total_written += written
                 done_fetch += len(futures2[fut])
-                if done_fetch % 2000 == 0 or done_fetch >= len(to_fetch):
+                if done_fetch % 2000 == 0 or done_fetch >= len(fetch_ids):
                     log.info("  efetch: %d / %d done, %d CDS written.",
-                             done_fetch, len(to_fetch), total_written)
+                             done_fetch, len(fetch_ids), total_written)
             time.sleep(0.02)
 
-    log.info("CDS pre-fetch complete: %d fetched, %d failed/no-CDS, %d already cached.",
-             total_written, len(to_fetch) - total_written, ncbi_total - len(to_fetch))
+    log.info("CDS pre-fetch complete: %d written, %d failed/no-CDS.",
+             total_written, len(fetch_ids) - total_written)
 
 
 def fetch_cds_for_protein(protein_accession: str) -> Optional[str]:
@@ -218,22 +329,19 @@ def fetch_cds_for_protein(protein_accession: str) -> Optional[str]:
     Rate: respects NCBI's 10 req/s limit with API key.
     """
     _setup_entrez()
-    # Strip species prefix (e.g. "human|human|NP_001234.1" → "NP_001234.1")
     acc = protein_accession.split("|")[-1] if "|" in protein_accession else protein_accession
 
-    # Skip non-NCBI accessions: UniProt mnemonics (GENE_SPECIES) and UniProt accessions
-    if re.match(r"^[A-Z0-9]{1,11}_[A-Z]{3,5}$", acc):  # UniProt mnemonic e.g. CENPK_HUMAN
-        return None
-    if re.match(r"^[OPQ][0-9][A-Z0-9]{3}[0-9]|^[A-NR-Z][0-9]([A-Z][A-Z0-9]{2}[0-9])", acc):
-        return None
-
-    # Check disk cache first — avoids all network I/O on resume/re-run
     cache_dir = Path(get_local_storage_root()) / "cds"
     cache_dir.mkdir(parents=True, exist_ok=True)
     cache_file = cache_dir / f"{acc}.fna"
     if cache_file.exists():
         cds = cache_file.read_text().strip()
-        return cds if cds else None   # empty file = previously confirmed "no CDS"
+        return cds if cds else None
+
+    if re.match(r"^[A-Z0-9]{1,11}_[A-Z]{3,5}$", acc):
+        return None
+    if re.match(r"^[OPQ][0-9][A-Z0-9]{3}[0-9]|^[A-NR-Z][0-9]([A-Z][A-Z0-9]{2}[0-9])", acc):
+        return None
 
     try:
         # Link protein → nucleotide
@@ -283,34 +391,41 @@ def fetch_cds_for_protein(protein_accession: str) -> Optional[str]:
 def protein_to_codon_alignment(
     protein_alignment: dict[str, str],
     cds_seqs: dict[str, str],
+    min_coverage: float = 0.60,
+    min_seqs: int = 3,
 ) -> Optional[dict[str, str]]:
     """Build a codon alignment from a protein alignment and CDS sequences.
 
-    Each amino acid in the protein alignment maps to exactly 3 nucleotides
-    in the CDS. Gap characters in the protein alignment become '---' in the
-    codon alignment.
+    Resilient: skips individual sequences whose CDS length doesn't match
+    (different isoform, trimmed protein, etc.) and proceeds with the rest
+    as long as coverage and count thresholds are met.
 
     Args:
         protein_alignment: {label: aligned_protein_seq} — contains gap characters
         cds_seqs: {label: cds_nucleotide_seq} — no gaps, raw CDS
+        min_coverage: fraction of sequences that must succeed (default 0.60)
+        min_seqs: minimum number of valid codon-aligned sequences (default 3)
 
     Returns:
-        {label: codon_aligned_nucleotide_seq} or None if any sequence is invalid.
+        {label: codon_aligned_nucleotide_seq} or None if thresholds not met.
     """
     codon_aln: dict[str, str] = {}
+    skipped: list[str] = []
+
     for label, prot_aln in protein_alignment.items():
         cds = cds_seqs.get(label)
         if not cds:
-            return None  # Missing CDS for this species — can't build codon alignment
+            skipped.append(label)
+            continue
 
-        # Remove gaps from protein to count non-gap positions
         non_gap_count = sum(1 for aa in prot_aln if aa != "-")
         expected_cds_len = non_gap_count * 3
 
-        # Allow CDS to be slightly longer (stop codon) but not shorter
         if len(cds) < expected_cds_len:
-            log.debug("CDS too short for %s: expected ≥%d, got %d", label, expected_cds_len, len(cds))
-            return None
+            log.info("Codon skip %s: CDS len %d < expected %d (protein has %d non-gap AAs)",
+                     label, len(cds), expected_cds_len, non_gap_count)
+            skipped.append(label)
+            continue
 
         cds_pos = 0
         codon_seq = []
@@ -323,11 +438,21 @@ def protein_to_codon_alignment(
 
         codon_aln[label] = "".join(codon_seq)
 
-    # Verify all sequences have the same length
+    if skipped:
+        log.info("Codon alignment: %d/%d succeeded, %d skipped",
+                 len(codon_aln), len(protein_alignment), len(skipped))
+
+    coverage = len(codon_aln) / len(protein_alignment) if protein_alignment else 0
+    if len(codon_aln) < min_seqs or coverage < min_coverage:
+        log.info("Codon alignment below threshold: %d seqs (need %d), %.0f%% (need %.0f%%)",
+                 len(codon_aln), min_seqs, coverage * 100, min_coverage * 100)
+        return None
+
     lengths = {len(v) for v in codon_aln.values()}
     if len(lengths) != 1:
-        log.debug("Codon alignment has unequal lengths: %s", lengths)
-        return None
+        log.info("Codon alignment has unequal lengths: %s — trimming to common length", lengths)
+        min_len = min(lengths)
+        codon_aln = {k: v[:min_len] for k, v in codon_aln.items()}
 
     return codon_aln
 
@@ -359,12 +484,20 @@ def run_meme(
     tree_path = meme_dir / "species.treefile"
     out_path = meme_dir / "meme.json"
 
-    # Write alignment
+    species_map = {}
     with open(aln_path, "w") as f:
         for label, seq in codon_aln.items():
-            f.write(f">{label}\n{seq}\n")
+            species = label.split("|")[0]
+            if species in species_map:
+                log.warning("Duplicate species %s in OG %s, skipping %s", species, og_id, label)
+                continue
+            species_map[species] = label
+            f.write(f">{species}\n{seq}\n")
 
     tree_path.write_text(tree_newick)
+
+    cpus = os.cpu_count() or 4
+    hyphy_env = {**os.environ, "CPU": str(cpus)}
 
     try:
         cmd = [
@@ -374,26 +507,31 @@ def run_meme(
             "--output", str(out_path),
             "--branches", "All",
         ]
+        log.info("Running MEME for %s (CPU=%d): %s", og_id, cpus, " ".join(cmd[:3]))
         result = subprocess.run(
             cmd,
             capture_output=True,
             text=True,
-            timeout=300,
+            timeout=1800,
+            env=hyphy_env,
         )
         if result.returncode != 0:
-            log.debug("MEME failed for %s: %s", og_id, result.stderr[:500])
+            log.warning("MEME failed for %s (rc=%d): %s",
+                        og_id, result.returncode, result.stderr[:500])
             return None
 
         if not out_path.exists():
+            log.warning("MEME output missing for %s", og_id)
             return None
 
+        log.info("MEME succeeded for %s", og_id)
         return json.loads(out_path.read_text())
 
     except subprocess.TimeoutExpired:
-        log.debug("MEME timed out for %s", og_id)
+        log.warning("MEME timed out for %s (>1800s)", og_id)
         return None
     except Exception as exc:
-        log.debug("MEME error for %s: %s", og_id, exc)
+        log.warning("MEME error for %s: %s", og_id, exc)
         return None
 
 
@@ -509,9 +647,17 @@ def run_fel(
     out_path = fel_dir / "fel.json"
 
     with open(aln_path, "w") as f:
+        seen_species = set()
         for label, seq in codon_aln.items():
-            f.write(f">{label}\n{seq}\n")
+            species = label.split("|")[0]
+            if species in seen_species:
+                continue
+            seen_species.add(species)
+            f.write(f">{species}\n{seq}\n")
     tree_path.write_text(tree_newick)
+
+    cpus = os.cpu_count() or 4
+    hyphy_env = {**os.environ, "CPU": str(cpus)}
 
     try:
         cmd = [
@@ -520,11 +666,12 @@ def run_fel(
             "--tree", str(tree_path),
             "--output", str(out_path),
         ]
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=1800, env=hyphy_env)
         if result.returncode != 0:
-            log.debug("FEL failed for %s: %s", og_id, result.stderr[:300])
+            log.warning("FEL failed for %s (rc=%d): %s", og_id, result.returncode, result.stderr[:300])
             return None
         if not out_path.exists():
+            log.warning("FEL output missing for %s", og_id)
             return None
         return json.loads(out_path.read_text())
     except subprocess.TimeoutExpired:
@@ -593,9 +740,17 @@ def run_busted(
     out_path = busted_dir / "busted.json"
 
     with open(aln_path, "w") as f:
+        seen_species = set()
         for label, seq in codon_aln.items():
-            f.write(f">{label}\n{seq}\n")
+            species = label.split("|")[0]
+            if species in seen_species:
+                continue
+            seen_species.add(species)
+            f.write(f">{species}\n{seq}\n")
     tree_path.write_text(tree_newick)
+
+    cpus = os.cpu_count() or 4
+    hyphy_env = {**os.environ, "CPU": str(cpus)}
 
     try:
         cmd = [
@@ -603,10 +758,11 @@ def run_busted(
             "--alignment", str(aln_path),
             "--tree", str(tree_path),
             "--output", str(out_path),
+            "--srv", "No",
         ]
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=1800, env=hyphy_env)
         if result.returncode != 0:
-            log.debug("BUSTED failed for %s: %s", og_id, result.stderr[:300])
+            log.warning("BUSTED failed for %s (rc=%d): %s", og_id, result.returncode, result.stderr[:300])
             return None
         if not out_path.exists():
             return None
@@ -822,18 +978,28 @@ def run_relax(
         except Exception:
             pass
 
-    # Annotate test branches in tree: append {Test} to resilient species labels
+    species_labels = []
+    with open(aln_path, "w") as f:
+        seen_species = set()
+        for label, seq in codon_aln.items():
+            species = label.split("|")[0]
+            if species in seen_species:
+                continue
+            seen_species.add(species)
+            species_labels.append(species)
+            f.write(f">{species}\n{seq}\n")
+
     if test_branches is None:
-        test_branches = [lbl for lbl in codon_aln if not lbl.startswith("human")]
+        test_branches = [sp for sp in species_labels if sp != "human"]
 
     labeled_tree = tree_newick
     for branch in test_branches:
         labeled_tree = labeled_tree.replace(branch, f"{branch}{{Test}}")
 
-    with open(aln_path, "w") as f:
-        for label, seq in codon_aln.items():
-            f.write(f">{label}\n{seq}\n")
     tree_path.write_text(labeled_tree)
+
+    cpus = os.cpu_count() or 4
+    hyphy_env = {**os.environ, "CPU": str(cpus)}
 
     cmd = [
         hyphy_bin, "relax",
@@ -841,17 +1007,20 @@ def run_relax(
         "--tree", str(tree_path),
         "--output", str(out_path),
         "--test", "Test",
+        "--models", "Minimal",
         "--quiet",
     ]
     try:
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=600, check=False)
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=1800, check=False, env=hyphy_env)
         if result.returncode != 0 or not out_path.exists():
-            log.debug("RELAX failed for %s: %s", og_id, result.stderr[:200])
+            log.warning("RELAX failed for %s (rc=%d): %s",
+                        og_id, result.returncode if hasattr(result, 'returncode') else -1,
+                        result.stderr[:200])
             return None
         with open(out_path) as f:
             return json.load(f)
     except Exception as exc:
-        log.debug("RELAX error for %s: %s", og_id, exc)
+        log.warning("RELAX error for %s: %s", og_id, exc)
         return None
 
 

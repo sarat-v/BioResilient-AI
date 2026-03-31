@@ -1,0 +1,12 @@
+# Copy into ~/.aws/config (merge with any existing [profile ...] blocks).
+#   cp config/aws-config.example ~/.aws/config
+# Or append the [profile seqera-runner] block manually.
+
+[profile seqera-runner]
+region = ap-south-1
+output = json
+
+# Optional default profile
+# [default]
+# region = ap-south-1
+# output = json

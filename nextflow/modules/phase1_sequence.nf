@@ -170,24 +170,91 @@ process domain_and_consequence {
     """
 }
 
-process esm1v_scoring {
+process esm1v_scatter {
+    label 'base'
+    cpus 1
+    memory '4 GB'
+    time '10m'
+
+    input:
+    val motifs_loaded
+
+    output:
+    path 'chunk_*.txt', emit: chunks
+
+    script:
+    """
+    export DATABASE_URL='${params.db_url}'
+    export BIORESILIENT_STORAGE_ROOT='${params.storage_root}'
+    python3 << 'PYEOF'
+import math
+from db.session import get_session
+from db.models import Gene, DivergentMotif, Ortholog
+from sqlalchemy import func
+
+with get_session() as s:
+    gene_ids = [str(r[0]) for r in (
+        s.query(Ortholog.gene_id)
+        .join(DivergentMotif, DivergentMotif.ortholog_id == Ortholog.id)
+        .group_by(Ortholog.gene_id)
+        .having(func.count(DivergentMotif.id) > 0)
+        .all()
+    )]
+
+n_chunks = min(${params.esm_chunks}, max(1, len(gene_ids)))
+chunk_size = math.ceil(len(gene_ids) / n_chunks)
+
+for i in range(n_chunks):
+    chunk = gene_ids[i * chunk_size : (i + 1) * chunk_size]
+    if chunk:
+        with open(f'chunk_{i:03d}.txt', 'w') as f:
+            f.write('\\n'.join(chunk))
+
+import sys
+sys.stderr.write(f'{len(gene_ids)} genes split into {n_chunks} chunks\\n')
+PYEOF
+    """
+}
+
+process esm1v_score_chunk {
     label 'esm'
     cpus params.esm_cpus
     memory params.esm_memory
     time '2h'
+    tag "${chunk_file.baseName}"
+    errorStrategy { task.exitStatus in [137, 143] ? 'retry' : 'finish' }
+    maxRetries 3
 
     input:
-    val motifs_loaded
+    path chunk_file
+
+    output:
+    val true
+
+    script:
+    """
+    python -m scripts.nf_wrappers.run_step \
+        --step step4c_chunk \
+        --gene-id-file '${chunk_file}' \
+        --db-url '${params.db_url}' \
+        --storage-root '${params.storage_root}'
+    """
+}
+
+process esm1v_report {
+    label 'base'
+    cpus 1
+    memory '2 GB'
+    time '5m'
+
+    input:
+    val all_done
 
     output:
     val true, emit: esm_done
 
     script:
     """
-    python -m scripts.nf_wrappers.run_step \
-        --step step4c \
-        --db-url '${params.db_url}' \
-        --storage-root '${params.storage_root}'
     DATABASE_URL='${params.db_url}' BIORESILIENT_STORAGE_ROOT='${params.storage_root}' \
         python -m pipeline.step_reporter --step step4c || true
     """
@@ -275,8 +342,10 @@ workflow PHASE1_SEQUENCE {
     }
 
     if (fromIdx <= SEQ_STEPS.indexOf('step4c') && untilIdx >= SEQ_STEPS.indexOf('step4c')) {
-        esm1v_scoring(motifs_done_ch)
-        esm_done_ch = esm1v_scoring.out.esm_done
+        esm1v_scatter(motifs_done_ch)
+        esm1v_score_chunk(esm1v_scatter.out.chunks.flatten(), )
+        esm1v_report(esm1v_score_chunk.out.collect())
+        esm_done_ch = esm1v_report.out.esm_done
     } else {
         esm_done_ch = Channel.value(true)
     }

@@ -215,36 +215,70 @@ def load_selection_scores(
     return saved
 
 
+def _retry_on_deadlock(fn, max_retries=5):
+    """Retry a DB operation on deadlock with exponential backoff."""
+    import time as _time
+    for attempt in range(max_retries):
+        try:
+            return fn()
+        except Exception as e:
+            if "deadlock" in str(e).lower() and attempt < max_retries - 1:
+                wait = 2 ** attempt + (hash(str(e)) % 1000) / 1000
+                log.warning("Deadlock detected (attempt %d/%d), retrying in %.1fs...",
+                            attempt + 1, max_retries, wait)
+                _time.sleep(wait)
+            else:
+                raise
+
+
 def load_fel_busted_scores(
     fel_busted_results: dict[str, dict],
     gene_by_og: dict[str, str],
 ) -> int:
     """Update EvolutionScore rows with FEL and BUSTED supplementary results.
 
-    Args:
-        fel_busted_results: {og_id: {"fel_sites": int, "busted_pvalue": float}}
-        gene_by_og: {og_id: gene_id}
-
-    Returns:
-        Number of rows updated.
+    Uses batched raw SQL to avoid ORM deadlocks when running concurrently
+    with load_relax_scores.
     """
-    updated = 0
-    with get_session() as session:
-        for og_id, result in fel_busted_results.items():
-            gene_id = gene_by_og.get(og_id)
-            if not gene_id:
-                continue
+    from sqlalchemy import text
 
-            ev = session.get(EvolutionScore, gene_id)
-            if ev is None:
-                # Create a bare row if MEME somehow didn't run yet
-                ev = EvolutionScore(gene_id=gene_id)
-                session.add(ev)
+    updates = []
+    for og_id, result in fel_busted_results.items():
+        gene_id = gene_by_og.get(og_id)
+        if not gene_id:
+            continue
+        updates.append((
+            gene_id,
+            result.get("fel_sites"),
+            result.get("busted_pvalue"),
+        ))
 
-            ev.fel_sites = result.get("fel_sites")
-            ev.busted_pvalue = result.get("busted_pvalue")
-            updated += 1
+    if not updates:
+        log.info("No FEL/BUSTED scores to update.")
+        return 0
 
+    _BATCH = 5000
+
+    def _do_update():
+        total = 0
+        for i in range(0, len(updates), _BATCH):
+            batch = updates[i:i + _BATCH]
+            gids = [u[0] for u in batch]
+            fels = [u[1] for u in batch]
+            busteds = [u[2] for u in batch]
+            with get_session() as session:
+                session.execute(text("""
+                    UPDATE evolution_score AS es SET
+                        fel_sites = v.fel,
+                        busted_pvalue = v.busted
+                    FROM unnest(CAST(:gids AS text[]), CAST(:fels AS int[]), CAST(:busteds AS float8[]))
+                        AS v(gid, fel, busted)
+                    WHERE es.gene_id = v.gid
+                """), {"gids": gids, "fels": fels, "busteds": busteds})
+            total += len(batch)
+        return total
+
+    updated = _retry_on_deadlock(_do_update)
     log.info("Updated FEL/BUSTED scores for %d genes.", updated)
     return updated
 
@@ -255,29 +289,47 @@ def load_relax_scores(
 ) -> int:
     """Update EvolutionScore rows with RELAX branch acceleration results.
 
-    Args:
-        relax_results: {og_id: {"relax_k": float, "relax_pvalue": float}}
-        gene_by_og: {og_id: gene_id}
-
-    Returns:
-        Number of rows updated.
+    Uses batched raw SQL to avoid ORM deadlocks.
     """
-    updated = 0
-    with get_session() as session:
-        for og_id, result in relax_results.items():
-            gene_id = gene_by_og.get(og_id)
-            if not gene_id:
-                continue
+    from sqlalchemy import text
 
-            ev = session.get(EvolutionScore, gene_id)
-            if ev is None:
-                ev = EvolutionScore(gene_id=gene_id)
-                session.add(ev)
+    updates = []
+    for og_id, result in relax_results.items():
+        gene_id = gene_by_og.get(og_id)
+        if not gene_id:
+            continue
+        updates.append((
+            gene_id,
+            result.get("relax_k"),
+            result.get("relax_pvalue"),
+        ))
 
-            ev.relax_k = result.get("relax_k")
-            ev.relax_pvalue = result.get("relax_pvalue")
-            updated += 1
+    if not updates:
+        log.info("No RELAX scores to update.")
+        return 0
 
+    _BATCH = 5000
+
+    def _do_update():
+        total = 0
+        for i in range(0, len(updates), _BATCH):
+            batch = updates[i:i + _BATCH]
+            gids = [u[0] for u in batch]
+            ks = [u[1] for u in batch]
+            pvals = [u[2] for u in batch]
+            with get_session() as session:
+                session.execute(text("""
+                    UPDATE evolution_score AS es SET
+                        relax_k = v.k,
+                        relax_pvalue = v.pv
+                    FROM unnest(CAST(:gids AS text[]), CAST(:ks AS float8[]), CAST(:pvals AS float8[]))
+                        AS v(gid, k, pv)
+                    WHERE es.gene_id = v.gid
+                """), {"gids": gids, "ks": ks, "pvals": pvals})
+            total += len(batch)
+        return total
+
+    updated = _retry_on_deadlock(_do_update)
     log.info("Updated RELAX scores for %d genes.", updated)
     return updated
 

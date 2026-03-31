@@ -53,9 +53,9 @@ process bgee_expression {
 
 process composite_score_phase1 {
     label 'base'
-    cpus 2
-    memory '4 GB'
-    time '30m'
+    cpus 4
+    memory '8 GB'
+    time '1h'
 
     input:
     val bgee_done
@@ -66,6 +66,7 @@ process composite_score_phase1 {
 
     script:
     """
+    echo "rank_product_v3_qval_composite"
     python -m scripts.nf_wrappers.run_step \
         --step step9 \
         --db-url '${params.db_url}' \
@@ -106,7 +107,7 @@ process generate_phase1_reports {
 
     echo ""
     echo "=== Pipeline Health Check ==="
-    python scripts/pipeline_health_check.py --output health_check.md
+    python /app/scripts/pipeline_health_check.py --output health_check.md
     echo "=== Reports complete ==="
     """
 }

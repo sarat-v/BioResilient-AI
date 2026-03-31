@@ -1,271 +1,168 @@
 """True convergent amino acid substitution detection.
 
-Current limitation of the sliding-window approach:
-  Sequence divergence ≠ convergence.
-  A motif that differs in 5 lineages might have 5 *different* substitutions
-  — that's parallel divergence, not convergence.
-
-This module detects *true convergence*: the **same** (or biochemically
-equivalent) amino acid change evolving independently at the same position
-in multiple lineages.
+Detects *true convergence*: the **same** (or biochemically equivalent) amino
+acid change evolving independently at the same position in multiple lineages.
 
 Method:
   For each DivergentMotif, across all species that show divergence at the
   same gene position:
-    - Extract the exact amino acid substitution (human_ref → animal_alt) at
+    - Extract the exact amino acid substitution (human_ref -> animal_alt) at
       each divergent position.
     - Count how many independent *lineages* carry the same substitution
       (identical or Miyata-equivalent alt amino acid) at that position.
     - Store the result as convergent_aa_count on DivergentMotif.
-
-A high convergent_aa_count means: the *same biochemical change* evolved
-independently — strong evidence of adaptive convergence rather than drift.
-
-This supplements (not replaces) the existing lineage-count convergence metric.
 """
 
 import logging
-from collections import defaultdict
+from collections import Counter, defaultdict
 from typing import Optional
 
-from db.models import DivergentMotif, Gene, Ortholog, Species
+from db.models import Gene, Species
 from db.session import get_session
 
 log = logging.getLogger(__name__)
 
-# Miyata biochemical equivalence groups
-_MIYATA_GROUPS: dict[str, int] = {
-    "G": 0, "A": 0, "V": 0, "L": 0, "I": 0,   # nonpolar aliphatic
-    "F": 1, "W": 1, "Y": 1,                      # aromatic
-    "S": 2, "T": 2, "C": 2,                      # polar uncharged small
-    "N": 3, "Q": 3, "H": 3,                      # polar uncharged large
-    "D": 4, "E": 4,                               # negatively charged
-    "K": 5, "R": 5,                               # positively charged
-    "P": 6, "M": 6,                               # special
+# Miyata biochemical equivalence groups — map each AA to its group ID
+_MIYATA: dict[str, int] = {
+    "G": 0, "A": 0, "V": 0, "L": 0, "I": 0,
+    "F": 1, "W": 1, "Y": 1,
+    "S": 2, "T": 2, "C": 2,
+    "N": 3, "Q": 3, "H": 3,
+    "D": 4, "E": 4,
+    "K": 5, "R": 5,
+    "P": 6, "M": 6,
 }
-
-
-def _miyata_group(aa: str) -> Optional[int]:
-    return _MIYATA_GROUPS.get(aa.upper())
-
-
-def _same_biochemical_change(alt1: str, alt2: str) -> bool:
-    """Return True if two amino acid substitution destinations are equivalent."""
-    if alt1 == alt2:
-        return True
-    g1 = _miyata_group(alt1)
-    g2 = _miyata_group(alt2)
-    return g1 is not None and g1 == g2
-
-
-def compute_convergent_aa_count(
-    gene_id: str,
-    species_lineage_map: dict[str, str],
-) -> dict[str, int]:
-    """Count independently-derived convergent amino acid substitutions per motif.
-
-    For a given gene, loads all DivergentMotif rows across all orthologs, then
-    for each alignment position:
-      1. Collects the (human_aa, animal_aa) substitution per species.
-      2. Groups species by lineage.
-      3. Counts how many lineages carry the same alt amino acid (or Miyata-
-         equivalent) at that position.
-
-    Returns {motif_id: convergent_aa_count}.
-    """
-    with get_session() as session:
-        motifs = (
-            session.query(DivergentMotif, Ortholog.species_id)
-            .join(Ortholog, DivergentMotif.ortholog_id == Ortholog.id)
-            .filter(Ortholog.gene_id == gene_id)
-            .all()
-        )
-
-    if not motifs:
-        return {}
-
-    # Build per-position substitution map:
-    # {abs_position: [(lineage, human_aa, animal_aa), ...]}
-    position_subs: dict[int, list[tuple[str, str, str]]] = defaultdict(list)
-
-    motif_obj_by_id: dict[str, DivergentMotif] = {}
-
-    for motif, species_id in motifs:
-        motif_obj_by_id[motif.id] = motif
-        lineage = species_lineage_map.get(species_id, "Other")
-        if lineage in ("Primates", "Other") or species_id == "human":
-            continue
-
-        # Walk through the motif window and extract per-position substitutions
-        for i, (h_aa, a_aa) in enumerate(zip(motif.human_seq, motif.animal_seq)):
-            if h_aa == "-" or a_aa == "-" or h_aa == a_aa:
-                continue
-            abs_pos = motif.start_pos + i
-            position_subs[abs_pos].append((lineage, h_aa, a_aa))
-
-    # For each motif, count how many lineages converge at each of its positions
-    motif_conv_counts: dict[str, int] = {}
-
-    for motif_id, motif in motif_obj_by_id.items():
-        max_lineage_conv = 0
-
-        for i in range(len(motif.human_seq)):
-            abs_pos = motif.start_pos + i
-            subs = position_subs.get(abs_pos, [])
-            if len(subs) < 2:
-                continue
-
-            # Group by alt amino acid (Miyata-equivalent)
-            # Count how many *distinct* lineages share the same biochemical change
-            # Use a representative alt_aa per group and track lineages
-            lineage_seen: dict[str, str] = {}  # lineage → alt_aa
-            for lineage, h_aa, a_aa in subs:
-                if lineage not in lineage_seen:
-                    lineage_seen[lineage] = a_aa
-
-            # Find the most common biochemical change across lineages
-            # Group lineages by whether their alt_aa is Miyata-equivalent
-            best_count = 0
-            lineage_alts = list(lineage_seen.values())
-            for j, aa_ref in enumerate(lineage_alts):
-                count = sum(
-                    1 for aa_other in lineage_alts
-                    if _same_biochemical_change(aa_ref, aa_other)
-                )
-                best_count = max(best_count, count)
-
-            max_lineage_conv = max(max_lineage_conv, best_count)
-
-        motif_conv_counts[motif_id] = max_lineage_conv
-
-    return motif_conv_counts
 
 
 def annotate_convergent_aa(gene_ids: Optional[list[str]] = None) -> int:
     """Annotate all DivergentMotif rows with convergent_aa_count.
 
-    Bulk-loads all motif rows in a single query, computes convergence in
-    memory per gene, then writes results back in a single session commit.
-
-    Args:
-        gene_ids: Optional list of gene IDs to process (default: all genes).
-
-    Returns:
-        Number of motifs with convergent_aa_count >= 2 (true convergence signal).
+    Optimised path: raw SQL load, numpy-free in-memory computation using
+    pre-computed Miyata groups and Counter-based convergence detection,
+    then batched bulk UPDATE via unnest.
     """
+    from sqlalchemy import text
+
     with get_session() as session:
         if gene_ids is None:
             gene_ids = [g.id for g in session.query(Gene).all()]
 
-        # Build species → lineage map from DB
-        species_lineage_map = {
+        species_lineage_map: dict[str, str] = {
             s.id: (s.lineage_group or "Other")
             for s in session.query(Species).all()
         }
 
-        # Bulk-load all motif rows for all target genes in a single query
-        rows = (
-            session.query(DivergentMotif, Ortholog.gene_id, Ortholog.species_id)
-            .join(Ortholog, DivergentMotif.ortholog_id == Ortholog.id)
-            .filter(Ortholog.gene_id.in_(gene_ids))
-            .all()
+        log.info("Loading motif rows for %d genes via raw SQL...", len(gene_ids))
+        result = session.execute(
+            text("""
+                SELECT dm.id, dm.start_pos, dm.human_seq, dm.animal_seq,
+                       o.gene_id, o.species_id
+                FROM divergent_motif dm
+                JOIN ortholog o ON o.id = dm.ortholog_id
+                WHERE o.gene_id = ANY(:gene_ids)
+            """),
+            {"gene_ids": gene_ids},
         )
+        rows = result.fetchall()
 
-    log.info(
-        "Computing convergent amino acid substitutions for %d genes (%d total motif rows)...",
-        len(gene_ids),
-        len(rows),
-    )
+    log.info("Loaded %d motif rows. Grouping by gene...", len(rows))
 
-    # Group rows by gene_id in memory
+    # Group by gene_id — store lightweight tuples, not ORM objects
+    # Each entry: (motif_id, start_pos, human_seq, animal_seq, species_id)
     gene_motifs: dict[str, list[tuple]] = defaultdict(list)
-    for motif, gene_id, species_id in rows:
-        gene_motifs[gene_id].append((motif, species_id))
+    for motif_id, start_pos, human_seq, animal_seq, gene_id, species_id in rows:
+        gene_motifs[gene_id].append((str(motif_id), start_pos, human_seq, animal_seq, species_id))
 
-    # Compute convergence counts purely in memory — no DB per gene
+    del rows
+
+    log.info("Computing convergent AA counts for %d genes...", len(gene_motifs))
+
+    skip_lineages = {"Primates", "Other"}
     motif_counts: dict[str, int] = {}
-    for gene_id in gene_ids:
-        gene_rows = gene_motifs.get(gene_id, [])
-        if not gene_rows:
-            continue
-        # Re-use existing computation logic with in-memory data
-        counts = _compute_from_rows(gene_rows, species_lineage_map)
-        motif_counts.update(counts)
+    genes_done = 0
 
-    # Single bulk write back to DB
-    truly_convergent = 0
-    with get_session() as session:
-        for motif_id, count in motif_counts.items():
-            motif = session.get(DivergentMotif, motif_id)
-            if motif:
-                motif.convergent_aa_count = count
-                if count >= 2:
-                    truly_convergent += 1
-        session.commit()
+    for gene_id, motifs in gene_motifs.items():
+        # Phase 1: build position -> {lineage: miyata_group} map
+        # position_lineage_groups[abs_pos][lineage] = miyata_group_of_alt_aa
+        position_lineage_groups: dict[int, dict[str, int]] = defaultdict(dict)
+        motif_ranges: list[tuple[str, int, int]] = []
+
+        for motif_id, start_pos, human_seq, animal_seq, species_id in motifs:
+            motif_ranges.append((motif_id, start_pos, min(len(human_seq), len(animal_seq))))
+
+            lineage = species_lineage_map.get(species_id, "Other")
+            if lineage in skip_lineages or species_id == "human":
+                continue
+
+            seq_len_cmp = min(len(human_seq), len(animal_seq))
+            for i in range(seq_len_cmp):
+                h_aa = human_seq[i]
+                a_aa = animal_seq[i]
+                if h_aa == "-" or a_aa == "-" or h_aa == a_aa:
+                    continue
+                abs_pos = start_pos + i
+                if lineage not in position_lineage_groups[abs_pos]:
+                    grp = _MIYATA.get(a_aa.upper(), -1)
+                    position_lineage_groups[abs_pos][lineage] = grp
+
+        # Phase 2: for each position, find max lineages sharing same Miyata group
+        # Pre-compute per-position max convergence count
+        pos_max_conv: dict[int, int] = {}
+        for abs_pos, lineage_groups in position_lineage_groups.items():
+            if len(lineage_groups) < 2:
+                continue
+            group_counts = Counter(lineage_groups.values())
+            group_counts.pop(-1, None)
+            if group_counts:
+                pos_max_conv[abs_pos] = max(group_counts.values())
+
+        # Phase 3: for each motif, find the max convergence across its positions
+        for motif_id, start_pos, seq_len in motif_ranges:
+            max_conv = 0
+            for i in range(seq_len):
+                conv = pos_max_conv.get(start_pos + i, 0)
+                if conv > max_conv:
+                    max_conv = conv
+            motif_counts[motif_id] = max_conv
+
+        genes_done += 1
+        if genes_done % 2000 == 0:
+            log.info("  genes processed: %d/%d, motifs so far: %d",
+                     genes_done, len(gene_motifs), len(motif_counts))
+
+    log.info("Computation complete: %d motifs scored. Writing to DB...", len(motif_counts))
+
+    # Bulk write using batched UPDATE with unnest
+    truly_convergent = sum(1 for c in motif_counts.values() if c >= 2)
+    items = list(motif_counts.items())
+    BATCH = 10000
+    updated = 0
+
+    for i in range(0, len(items), BATCH):
+        chunk = items[i : i + BATCH]
+        ids = [mid for mid, _ in chunk]
+        counts = [c for _, c in chunk]
+        with get_session() as session:
+            session.execute(text("SET LOCAL statement_timeout = '0'"))
+            session.execute(
+                text("""
+                    UPDATE divergent_motif
+                    SET convergent_aa_count = data.cnt
+                    FROM (SELECT unnest(:ids) AS id, unnest(:counts) AS cnt) AS data
+                    WHERE divergent_motif.id::text = data.id
+                """),
+                {"ids": ids, "counts": counts},
+            )
+            session.commit()
+        updated += len(chunk)
+        if updated % 100000 == 0 or updated == len(items):
+            log.info("  DB write progress: %d/%d motifs", updated, len(items))
 
     log.info(
-        "Convergent AA annotation complete: %d motifs with true convergence (≥2 lineages, same substitution).",
+        "Convergent AA annotation complete: %d motifs with true convergence (>=2 lineages, same substitution).",
         truly_convergent,
     )
     return truly_convergent
-
-
-def _compute_from_rows(
-    rows: list[tuple],
-    species_lineage_map: dict[str, str],
-) -> dict[str, int]:
-    """Compute convergent_aa_count for one gene from pre-loaded (motif, species_id) tuples.
-
-    Mirrors compute_convergent_aa_count() but works entirely on in-memory objects
-    rather than opening a DB session.
-
-    Returns {motif_id: convergent_aa_count}.
-    """
-    position_subs: dict[int, list[tuple[str, str, str]]] = defaultdict(list)
-    motif_obj_by_id: dict[str, object] = {}
-
-    for motif, species_id in rows:
-        motif_obj_by_id[motif.id] = motif
-        lineage = species_lineage_map.get(species_id, "Other")
-        if lineage in ("Primates", "Other") or species_id == "human":
-            continue
-
-        for i, (h_aa, a_aa) in enumerate(zip(motif.human_seq, motif.animal_seq)):
-            if h_aa == "-" or a_aa == "-" or h_aa == a_aa:
-                continue
-            abs_pos = motif.start_pos + i
-            position_subs[abs_pos].append((lineage, h_aa, a_aa))
-
-    motif_conv_counts: dict[str, int] = {}
-
-    for motif_id, motif in motif_obj_by_id.items():
-        max_lineage_conv = 0
-
-        for i in range(len(motif.human_seq)):
-            abs_pos = motif.start_pos + i
-            subs = position_subs.get(abs_pos, [])
-            if len(subs) < 2:
-                continue
-
-            lineage_seen: dict[str, str] = {}
-            for lineage, h_aa, a_aa in subs:
-                if lineage not in lineage_seen:
-                    lineage_seen[lineage] = a_aa
-
-            best_count = 0
-            lineage_alts = list(lineage_seen.values())
-            for j, aa_ref in enumerate(lineage_alts):
-                count = sum(
-                    1 for aa_other in lineage_alts
-                    if _same_biochemical_change(aa_ref, aa_other)
-                )
-                best_count = max(best_count, count)
-
-            max_lineage_conv = max(max_lineage_conv, best_count)
-
-        motif_conv_counts[motif_id] = max_lineage_conv
-
-    return motif_conv_counts
 
 
 def run_convergent_aa_pipeline(gene_ids: Optional[list[str]] = None) -> int:

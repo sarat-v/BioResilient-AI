@@ -95,6 +95,18 @@ def run_step4c(args):
     step4c_esm1v()
 
 
+def run_step4c_chunk(args):
+    gene_id_file = getattr(args, 'gene_id_file', None)
+    if not gene_id_file:
+        raise ValueError("--gene-id-file required for step4c_chunk")
+    with open(gene_id_file) as f:
+        gene_ids = [line.strip() for line in f if line.strip()]
+    log.info("ESM-1v chunk: %d genes from %s", len(gene_ids), gene_id_file)
+    from pipeline.layer1_sequence.esm1v import run_esm1v_pipeline
+    n = run_esm1v_pipeline(gene_ids=gene_ids)
+    log.info("ESM-1v chunk complete: %d motifs scored.", n)
+
+
 def run_step4d(args):
     from pipeline.orchestrator import step4d_variant_direction
     step4d_variant_direction()
@@ -166,6 +178,16 @@ def run_step6_single_og(args):
 
     result = {"og_id": og_id, "cds_coverage": round(cds_coverage, 3)}
     if codon_aln is not None:
+        seen_sp = set()
+        deduped_aln = {}
+        for label, seq in codon_aln.items():
+            sp = label.split("|")[0]
+            if sp not in seen_sp:
+                seen_sp.add(sp)
+                deduped_aln[sp] = seq
+        codon_aln = deduped_aln
+        codon_species = list(codon_aln.keys())
+        pruned_tree = prune_tree_to_species(treefile, codon_species)
         meme_json = run_meme(codon_aln, pruned_tree, og_id)
         if meme_json is not None:
             result.update(parse_meme_results(meme_json, og_id))
@@ -195,23 +217,321 @@ def run_step6_single_og(args):
         json.dump(result, f)
 
 
+def _find_result_jsons(results_dir: Path) -> list[Path]:
+    """Walk results_dir to find result.json files, following symlinks (needed for Fusion).
+
+    pathlib.glob('**') in Python <3.13 doesn't follow symlinks, which breaks
+    on Fusion-staged directories.  os.walk(followlinks=True) handles them correctly.
+    Falls back to subprocess `find` if os.walk also returns nothing.
+    """
+    import os
+    import subprocess
+    found = []
+    for dirpath, _dirnames, filenames in os.walk(results_dir, followlinks=True):
+        for fname in filenames:
+            if fname == "result.json":
+                found.append(Path(dirpath) / fname)
+    if not found:
+        log.warning("os.walk found 0 result.json in %s — trying `find` fallback", results_dir)
+        try:
+            proc = subprocess.run(
+                ["find", str(results_dir), "-name", "result.json", "-type", "f"],
+                capture_output=True, text=True, timeout=120,
+            )
+            found = [Path(p) for p in proc.stdout.strip().split("\n") if p]
+        except Exception as exc:
+            log.warning("find fallback failed: %s", exc)
+    if not found:
+        log.warning("pathlib.glob fallback for %s", results_dir)
+        found = list(results_dir.glob("**/result.json"))
+    log.info("Found %d result.json files in %s", len(found), results_dir)
+    return found
+
+
 def run_step6_collect(args):
-    """Collect per-OG MEME results and write to DB."""
+    """Collect per-OG MEME results and write to DB. Supports both flat and batch-nested dirs."""
     from pipeline.layer2_evolution.selection import load_selection_scores, build_gene_og_map
 
     results_dir = Path(args.input_dir)
     gene_by_og = build_gene_og_map()
+    all_results = _find_result_jsons(results_dir)
     batch: dict[str, dict] = {}
-    for rfile in results_dir.glob("*/result.json"):
+    for rfile in all_results:
         with open(rfile) as f:
             r = json.load(f)
         og_id = r.get("og_id") or rfile.parent.name
-        if r and r.get("status") not in ("no_codon_alignment", "meme_failed", "skipped"):
+        if r and r.get("status") not in ("no_codon_alignment", "meme_failed", "skipped", "not_in_aligned"):
             batch[og_id] = r
 
+    log.info("MEME collect: %d valid results out of %d total", len(batch), len(all_results))
     if batch:
         load_selection_scores(batch, gene_by_og)
         log.info("Loaded %d MEME results to DB", len(batch))
+    else:
+        log.warning("No valid MEME results found to load")
+
+
+def run_step6_all_collect(args):
+    """Collect all HyPhy results (MEME + FEL+BUSTED + RELAX) from merged output."""
+    from pipeline.layer2_evolution.selection import (
+        load_selection_scores, load_fel_busted_scores, load_relax_scores, build_gene_og_map,
+    )
+
+    results_dir = Path(args.input_dir)
+    gene_by_og = build_gene_og_map()
+    all_results = _find_result_jsons(results_dir)
+
+    meme_batch: dict[str, dict] = {}
+    fb_batch: dict[str, dict] = {}
+    relax_batch: dict[str, dict] = {}
+
+    for rfile in all_results:
+        with open(rfile) as f:
+            r = json.load(f)
+        og_id = r.get("og_id") or rfile.parent.name
+        if r.get("status") in ("no_codon_alignment", "meme_failed", "skipped", "not_in_aligned"):
+            continue
+
+        meme_batch[og_id] = r
+
+        if "fel_sites" in r or "busted_pvalue" in r:
+            fb_batch[og_id] = {
+                "og_id": og_id,
+                "fel_sites": r.get("fel_sites", 0),
+                "busted_pvalue": r.get("busted_pvalue", 1.0),
+            }
+        if "relax_k" in r or "relax_pvalue" in r:
+            relax_batch[og_id] = {
+                "og_id": og_id,
+                "relax_k": r.get("relax_k"),
+                "relax_pvalue": r.get("relax_pvalue"),
+            }
+
+    log.info("All-HyPhy collect: %d MEME, %d FEL+BUSTED, %d RELAX results",
+             len(meme_batch), len(fb_batch), len(relax_batch))
+
+    if meme_batch:
+        load_selection_scores(meme_batch, gene_by_og)
+        log.info("Loaded %d MEME results to DB", len(meme_batch))
+    if fb_batch:
+        load_fel_busted_scores(fb_batch, gene_by_og)
+        log.info("Loaded %d FEL+BUSTED results to DB", len(fb_batch))
+    if relax_batch:
+        load_relax_scores(relax_batch, gene_by_og)
+        log.info("Loaded %d RELAX results to DB", len(relax_batch))
+
+
+def run_step6_batch(args):
+    """Batch HyPhy — loads pkl once, runs MEME+FEL+BUSTED+RELAX for each OG."""
+    import gc
+    import json
+    import shutil
+    from pipeline.layer2_evolution.meme_selection import (
+        _prefetch_all_cds,
+        fetch_cds_for_protein,
+        protein_to_codon_alignment,
+        run_meme, parse_meme_results,
+        run_fel, parse_fel_results,
+        run_busted, parse_busted_results,
+        run_relax, parse_relax_results,
+    )
+    from pipeline.layer2_evolution.selection import write_hyphy_input, run_absrel, parse_absrel_results
+    from pipeline.layer2_evolution.phylo_tree import prune_tree_to_species
+    from pipeline.config import get_local_storage_root
+
+    og_id_file = getattr(args, 'og_id_file', None)
+    if not og_id_file:
+        raise ValueError("--og-id-file required for step6_batch")
+    with open(og_id_file) as f:
+        og_ids = [line.strip() for line in f if line.strip()]
+    log.info("HyPhy batch: %d OGs from %s", len(og_ids), og_id_file)
+
+    data = _load_aligned(args.input_pkl)
+    aligned = data.get("aligned", data)
+    treefile = Path(args.treefile)
+    out_dir = Path(args.output_dir or ".")
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    batch_aligned = {og_id: aligned[og_id] for og_id in og_ids if og_id in aligned}
+    if batch_aligned:
+        log.info("Pre-fetching CDS for %d OGs using bulk efetch...", len(batch_aligned))
+        _prefetch_all_cds(batch_aligned)
+        log.info("CDS pre-fetch complete.")
+
+    for og_id in og_ids:
+        og_out = out_dir / og_id
+        og_out.mkdir(parents=True, exist_ok=True)
+
+        if og_id not in aligned:
+            log.warning("OG %s not in aligned data, skipping", og_id)
+            with open(og_out / "result.json", "w") as f:
+                json.dump({"og_id": og_id, "status": "not_in_aligned"}, f)
+            continue
+
+        seqs = dict(aligned[og_id])
+        species_ids = [label.split("|")[0] for label in seqs]
+        pruned_tree = prune_tree_to_species(treefile, species_ids)
+
+        cds_seqs: dict[str, str] = {}
+        for label in seqs:
+            parts = label.split("|")
+            accession = parts[-1] if parts else label
+            cds = fetch_cds_for_protein(accession)
+            if cds:
+                cds_seqs[label] = cds
+
+        codon_aln = None
+        cds_coverage = len(cds_seqs) / len(seqs) if seqs else 0
+        log.info("OG %s: CDS coverage %d/%d (%.0f%%)", og_id, len(cds_seqs), len(seqs), cds_coverage * 100)
+
+        if cds_coverage >= 0.60 and len(cds_seqs) >= 3:
+            seqs_with_cds = {label: seq for label, seq in seqs.items() if label in cds_seqs}
+            codon_aln = protein_to_codon_alignment(seqs_with_cds, cds_seqs)
+
+        result = {"og_id": og_id, "cds_coverage": round(cds_coverage, 3)}
+        if codon_aln is not None:
+            seen_sp = set()
+            deduped_aln = {}
+            for label, seq in codon_aln.items():
+                sp = label.split("|")[0]
+                if sp not in seen_sp:
+                    seen_sp.add(sp)
+                    deduped_aln[sp] = seq
+            codon_aln = deduped_aln
+            codon_species = list(codon_aln.keys())
+            pruned_tree = prune_tree_to_species(treefile, codon_species)
+
+            meme_json = run_meme(codon_aln, pruned_tree, og_id)
+            if meme_json is not None:
+                result.update(parse_meme_results(meme_json, og_id))
+                result["selection_model"] = "meme"
+                meme_local = Path(get_local_storage_root()) / "meme" / og_id
+                for fname in ("codon_aln.fna", "meme.json", "species.treefile"):
+                    src = meme_local / fname
+                    if src.exists():
+                        shutil.copy2(src, og_out / fname)
+            else:
+                result["status"] = "meme_failed"
+                meme_local = Path(get_local_storage_root()) / "meme" / og_id
+                src = meme_local / "codon_aln.fna"
+                if src.exists():
+                    shutil.copy2(src, og_out / "codon_aln.fna")
+
+            # FEL + BUSTED + RELAX on the same codon alignment
+            fel_json = run_fel(codon_aln, pruned_tree, og_id)
+            result["fel_sites"] = parse_fel_results(fel_json).get("fel_sites", 0) if fel_json else 0
+
+            busted_json = run_busted(codon_aln, pruned_tree, og_id)
+            result["busted_pvalue"] = parse_busted_results(busted_json).get("busted_pvalue", 1.0) if busted_json else 1.0
+
+            relax_json = run_relax(codon_aln, pruned_tree, og_id)
+            if relax_json:
+                relax_parsed = parse_relax_results(relax_json)
+                result["relax_k"] = relax_parsed.get("relax_k")
+                result["relax_pvalue"] = relax_parsed.get("relax_pvalue")
+            else:
+                result["relax_k"] = None
+                result["relax_pvalue"] = None
+        else:
+            aln_path, tree_path = write_hyphy_input(og_id, seqs, pruned_tree)
+            raw = run_absrel(aln_path, tree_path, og_id)
+            if raw is not None:
+                result.update(parse_absrel_results(raw))
+                result["selection_model"] = "proxy"
+            else:
+                result["status"] = "no_codon_alignment"
+
+        with open(og_out / "result.json", "w") as f:
+            json.dump(result, f)
+
+        gc.collect()
+
+    log.info("HyPhy batch complete: %d OGs processed", len(og_ids))
+
+
+def run_step6b_batch(args):
+    """Batch FEL+BUSTED — reads codon alignments from MEME output dir, runs per-OG."""
+    import json
+    from Bio import SeqIO
+    from pipeline.layer2_evolution.meme_selection import (
+        run_fel, run_busted,
+        parse_fel_results, parse_busted_results,
+    )
+    from pipeline.layer2_evolution.phylo_tree import prune_tree_to_species
+
+    meme_dir = Path(args.input_dir)
+    treefile = Path(args.treefile)
+    out_dir = Path(args.output_dir or ".")
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    og_dirs = [d for d in meme_dir.iterdir() if d.is_dir()]
+    log.info("FEL+BUSTED batch: %d OG dirs in %s", len(og_dirs), meme_dir)
+
+    for og_dir in og_dirs:
+        og_id = og_dir.name
+        og_out = out_dir / og_id
+        og_out.mkdir(parents=True, exist_ok=True)
+
+        codon_aln_path = og_dir / "codon_aln.fna"
+        if not codon_aln_path.exists():
+            log.info("OG %s: no codon alignment, skipping FEL+BUSTED", og_id)
+            with open(og_out / "result.json", "w") as f:
+                json.dump({"og_id": og_id, "status": "skipped"}, f)
+            continue
+
+        codon_aln = {r.id: str(r.seq) for r in SeqIO.parse(str(codon_aln_path), "fasta")}
+        species_ids = [label.split("|")[0] for label in codon_aln]
+        pruned_tree = prune_tree_to_species(treefile, species_ids)
+
+        fel_json = run_fel(codon_aln, pruned_tree, og_id)
+        busted_json = run_busted(codon_aln, pruned_tree, og_id)
+        fel_result = parse_fel_results(fel_json) if fel_json else {"fel_sites": 0}
+        busted_result = parse_busted_results(busted_json) if busted_json else {"busted_pvalue": 1.0}
+
+        with open(og_out / "result.json", "w") as f:
+            json.dump({"og_id": og_id, **fel_result, **busted_result}, f)
+
+    log.info("FEL+BUSTED batch complete: %d OGs processed", len(og_dirs))
+
+
+def run_step6c_batch(args):
+    """Batch RELAX — reads codon alignments from MEME output dir, runs per-OG."""
+    import json
+    from Bio import SeqIO
+    from pipeline.layer2_evolution.meme_selection import run_relax, parse_relax_results
+    from pipeline.layer2_evolution.phylo_tree import prune_tree_to_species
+
+    meme_dir = Path(args.input_dir)
+    treefile = Path(args.treefile)
+    out_dir = Path(args.output_dir or ".")
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    og_dirs = [d for d in meme_dir.iterdir() if d.is_dir()]
+    log.info("RELAX batch: %d OG dirs in %s", len(og_dirs), meme_dir)
+
+    for og_dir in og_dirs:
+        og_id = og_dir.name
+        og_out = out_dir / og_id
+        og_out.mkdir(parents=True, exist_ok=True)
+
+        codon_aln_path = og_dir / "codon_aln.fna"
+        if not codon_aln_path.exists():
+            log.info("OG %s: no codon alignment, skipping RELAX", og_id)
+            with open(og_out / "result.json", "w") as f:
+                json.dump({"og_id": og_id, "status": "skipped"}, f)
+            continue
+
+        codon_aln = {r.id: str(r.seq) for r in SeqIO.parse(str(codon_aln_path), "fasta")}
+        species_ids = [label.split("|")[0] for label in codon_aln]
+        pruned_tree = prune_tree_to_species(treefile, species_ids)
+
+        relax_json = run_relax(codon_aln, pruned_tree, og_id)
+        relax_result = parse_relax_results(relax_json) if relax_json else {"relax_k": None, "relax_pvalue": 1.0}
+
+        with open(og_out / "result.json", "w") as f:
+            json.dump({"og_id": og_id, **relax_result}, f)
+
+    log.info("RELAX batch complete: %d OGs processed", len(og_dirs))
 
 
 def run_step6b_single_og(args):
@@ -278,41 +598,47 @@ def run_step6c_single_og(args):
 
 
 def run_step6b_collect(args):
-    """Collect per-OG FEL+BUSTED results and write to DB."""
+    """Collect per-OG FEL+BUSTED results and write to DB. Supports both flat and batch-nested dirs."""
     from pipeline.layer2_evolution.selection import load_fel_busted_scores, build_gene_og_map
 
     results_dir = Path(args.input_dir)
     gene_by_og = build_gene_og_map()
     batch: dict[str, dict] = {}
-    for rfile in results_dir.glob("*/result.json"):
+    for rfile in _find_result_jsons(results_dir):
         with open(rfile) as f:
             r = json.load(f)
         og_id = r.get("og_id") or rfile.parent.name
         if r and r.get("status") != "skipped":
             batch[og_id] = r
 
+    log.info("FEL+BUSTED collect: %d valid results", len(batch))
     if batch:
         load_fel_busted_scores(batch, gene_by_og)
         log.info("Loaded %d FEL+BUSTED results to DB", len(batch))
+    else:
+        log.warning("No valid FEL+BUSTED results found to load")
 
 
 def run_step6c_collect(args):
-    """Collect per-OG RELAX results and write to DB."""
+    """Collect per-OG RELAX results and write to DB. Supports both flat and batch-nested dirs."""
     from pipeline.layer2_evolution.selection import load_relax_scores, build_gene_og_map
 
     results_dir = Path(args.input_dir)
     gene_by_og = build_gene_og_map()
     batch: dict[str, dict] = {}
-    for rfile in results_dir.glob("*/result.json"):
+    for rfile in _find_result_jsons(results_dir):
         with open(rfile) as f:
             r = json.load(f)
         og_id = r.get("og_id") or rfile.parent.name
         if r and r.get("status") != "skipped":
             batch[og_id] = r
 
+    log.info("RELAX collect: %d valid results", len(batch))
     if batch:
         load_relax_scores(batch, gene_by_og)
         log.info("Loaded %d RELAX results to DB", len(batch))
+    else:
+        log.warning("No valid RELAX results found to load")
 
 
 def run_step7(args):
@@ -432,13 +758,18 @@ STEP_MAP = {
     "step4": run_step4,
     "step4b": run_step4b,
     "step4c": run_step4c,
+    "step4c_chunk": run_step4c_chunk,
     "step4d": run_step4d,
     "step5": run_step5,
     "step6_single_og": run_step6_single_og,
+    "step6_batch": run_step6_batch,
     "step6_collect": run_step6_collect,
+    "step6_all_collect": run_step6_all_collect,
     "step6b_single_og": run_step6b_single_og,
+    "step6b_batch": run_step6b_batch,
     "step6b_collect": run_step6b_collect,
     "step6c_single_og": run_step6c_single_og,
+    "step6c_batch": run_step6c_batch,
     "step6c_collect": run_step6c_collect,
     "step7": run_step7,
     "step7b": run_step7b,
@@ -468,11 +799,13 @@ def main():
     parser.add_argument("--storage-root", default=None)
     parser.add_argument("--ncbi-api-key", default=None)
     parser.add_argument("--og-id", default=None)
+    parser.add_argument("--og-id-file", default=None)
     parser.add_argument("--input-pkl", default=None)
     parser.add_argument("--input-dir", default=None)
     parser.add_argument("--output-dir", default=None)
     parser.add_argument("--treefile", default=None)
     parser.add_argument("--codon-aln", default=None)
+    parser.add_argument("--gene-id-file", default=None)
 
     args = parser.parse_args()
     _setup_env(args)

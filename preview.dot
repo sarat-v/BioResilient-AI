@@ -1,0 +1,51 @@
+digraph "preview" {
+rankdir=TB;
+v0 [label="PHASE1_SEQUENCE:validate_environment"];
+v1 [label="PHASE1_SEQUENCE:download_proteomes"];
+v0 -> v1;
+
+v1 [label="PHASE1_SEQUENCE:download_proteomes"];
+v2 [label="PHASE1_SEQUENCE:run_orthofinder"];
+v1 -> v2;
+
+v2 [label="PHASE1_SEQUENCE:run_orthofinder"];
+v3 [label="PHASE1_SEQUENCE:load_orthologs"];
+v2 -> v3;
+
+v3 [label="PHASE1_SEQUENCE:load_orthologs"];
+v4 [label="PHASE1_SEQUENCE:nucleotide_conservation"];
+v3 -> v4 [label="orthologs_loaded_ch"];
+
+v4 [label="PHASE1_SEQUENCE:nucleotide_conservation"];
+v5 [shape=point];
+v4 -> v5 [label="nuc_done_ch"];
+
+v3 [label="PHASE1_SEQUENCE:load_orthologs"];
+v6 [label="PHASE1_SEQUENCE:align_and_divergence"];
+v3 -> v6 [label="orthologs_loaded_ch"];
+
+v6 [label="PHASE1_SEQUENCE:align_and_divergence"];
+v7 [shape=point];
+v6 -> v7 [label="aligned_pkl_ch"];
+
+v6 [label="PHASE1_SEQUENCE:align_and_divergence"];
+v8 [label="PHASE1_SEQUENCE:domain_and_consequence"];
+v6 -> v8 [label="motifs_done_ch"];
+
+v8 [label="PHASE1_SEQUENCE:domain_and_consequence"];
+v10 [label="PHASE1_SEQUENCE:variant_direction"];
+v8 -> v10 [label="domains_done_ch"];
+
+v6 [label="PHASE1_SEQUENCE:align_and_divergence"];
+v9 [label="PHASE1_SEQUENCE:esm1v_scoring"];
+v6 -> v9 [label="motifs_done_ch"];
+
+v9 [label="PHASE1_SEQUENCE:esm1v_scoring"];
+v10 [label="PHASE1_SEQUENCE:variant_direction"];
+v9 -> v10 [label="esm_done_ch"];
+
+v10 [label="PHASE1_SEQUENCE:variant_direction"];
+v11 [shape=point];
+v10 -> v11 [label="directions_done_ch"];
+
+}

@@ -38,7 +38,12 @@ _VERTEBRATE_SPECIES = {
 }
 
 # ── Benchmark cancer-resistance genes used in step9 gate ─────────────────────
-_CANCER_BENCHMARKS = {"TP53", "LIF6", "ATM", "BRCA1", "BRCA2", "CDKN2A", "MDM2", "PTEN", "PCNA", "ERCC1"}
+_CANCER_BENCHMARKS = {
+    "P53_HUMAN", "ATM_HUMAN", "BRCA1_HUMAN", "BRCA2_HUMAN",
+    "CDN2A_HUMAN", "MDM2_HUMAN", "PTEN_HUMAN", "PCNA_HUMAN", "ERCC1_HUMAN",
+    "CASP8_HUMAN", "CASP3_HUMAN", "BCL2_HUMAN", "BAX_HUMAN", "CHK2_HUMAN",
+    "TP53", "LIF6", "ATM", "BRCA1", "BRCA2", "CDKN2A", "MDM2", "PTEN", "PCNA", "ERCC1",
+}
 
 # ── Step explanation text (mirrors the bash explain() blocks) ────────────────
 _EXPLANATIONS: dict[str, str] = {

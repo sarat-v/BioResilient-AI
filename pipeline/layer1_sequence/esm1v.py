@@ -264,51 +264,78 @@ def annotate_esm1v_scores(gene_ids: Optional[list[str]] = None) -> int:
     log.info("Computing ESM-1v scores for %d genes (1 GPU pass per protein)...", len(gene_data))
     scored = 0
     total = len(gene_data)
+    pending_updates: list[tuple[str, float]] = []
+    BATCH_SIZE = 200
 
-    with get_session() as session:
-        for i, (gid, human_seq, motifs) in enumerate(gene_data):
-            # ONE forward pass for this entire protein
-            log_probs = _compute_logprobs_for_protein(human_seq, model_tuple)
-            if log_probs is None:
+    from sqlalchemy import text
+
+    def _flush_updates(batch: list[tuple[str, float]], max_retries: int = 5) -> int:
+        if not batch:
+            return 0
+        import time as _time
+        for attempt in range(max_retries):
+            try:
+                with get_session() as session:
+                    session.execute(text("SET LOCAL statement_timeout = '0'"))
+                    session.execute(
+                        text("""
+                            UPDATE divergent_motif
+                            SET esm1v_score = data.score
+                            FROM (SELECT unnest(:ids) AS id, unnest(:scores) AS score) AS data
+                            WHERE divergent_motif.id::text = data.id
+                        """),
+                        {"ids": [str(mid) for mid, _ in batch],
+                         "scores": [s for _, s in batch]},
+                    )
+                    session.commit()
+                return len(batch)
+            except Exception as exc:
+                if "deadlock" in str(exc).lower() and attempt < max_retries - 1:
+                    wait = 2 ** attempt + _time.monotonic() % 1
+                    log.warning("Deadlock on flush (attempt %d/%d), retrying in %.1fs",
+                                attempt + 1, max_retries, wait)
+                    _time.sleep(wait)
+                else:
+                    raise
+        return 0
+
+    for i, (gid, human_seq, motifs) in enumerate(gene_data):
+        log_probs = _compute_logprobs_for_protein(human_seq, model_tuple)
+        if log_probs is None:
+            continue
+
+        for motif in motifs:
+            substitutions = []
+            for j, (h_aa, a_aa) in enumerate(zip(motif.human_seq, motif.animal_seq)):
+                if h_aa == "-" or a_aa == "-" or h_aa == a_aa:
+                    continue
+                abs_pos = motif.start_pos + j
+                if abs_pos < len(human_seq) and human_seq[abs_pos] != h_aa:
+                    log.debug(
+                        "AA mismatch at pos %d: expected %s, got %s — skipping",
+                        abs_pos, h_aa, human_seq[abs_pos],
+                    )
+                    continue
+                substitutions.append((abs_pos, h_aa, a_aa))
+
+            if not substitutions:
                 continue
 
-            updates: dict[str, float] = {}
-            for motif in motifs:
-                # Build substitution list for this motif
-                substitutions = []
-                for j, (h_aa, a_aa) in enumerate(zip(motif.human_seq, motif.animal_seq)):
-                    if h_aa == "-" or a_aa == "-" or h_aa == a_aa:
-                        continue
-                    abs_pos = motif.start_pos + j
-                    # Validate AA identity (mismatch = alignment/coordinate error)
-                    if abs_pos < len(human_seq) and human_seq[abs_pos] != h_aa:
-                        log.debug(
-                            "AA mismatch at pos %d: expected %s, got %s — skipping",
-                            abs_pos, h_aa, human_seq[abs_pos],
-                        )
-                        continue
-                    substitutions.append((abs_pos, h_aa, a_aa))
+            llr = _score_substitutions_from_logprobs(
+                log_probs, substitutions, alphabet, len(human_seq)
+            )
+            if llr is not None:
+                pending_updates.append((motif.id, llr))
 
-                if not substitutions:
-                    continue
+        if len(pending_updates) >= BATCH_SIZE:
+            scored += _flush_updates(pending_updates)
+            pending_updates = []
 
-                llr = _score_substitutions_from_logprobs(
-                    log_probs, substitutions, alphabet, len(human_seq)
-                )
-                if llr is not None:
-                    updates[motif.id] = llr
+        if (i + 1) % 500 == 0 or (i + 1) == total:
+            log.info("  ESM-1v: %d / %d genes processed, %d motifs scored so far (%.0f%%).",
+                     i + 1, total, scored + len(pending_updates), 100 * (i + 1) / total)
 
-            if updates:
-                for motif in motifs:
-                    if motif.id in updates:
-                        motif.esm1v_score = updates[motif.id]
-                        scored += 1
-                session.commit()
-
-            if (i + 1) % 500 == 0 or (i + 1) == total:
-                log.info("  ESM-1v: %d / %d genes processed (%.0f%%).",
-                         i + 1, total, 100 * (i + 1) / total)
-
+    scored += _flush_updates(pending_updates)
     log.info("ESM-1v scoring complete: %d motifs scored.", scored)
     return scored
 

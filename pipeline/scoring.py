@@ -1,24 +1,26 @@
 """Step 9 — Composite score assembly.
 
-Reads Layer 1 + Layer 2 data from the database, applies scoring weights,
-normalises each sub-score to [0, 1], and writes CandidateScore rows.
+Phase 1 uses a rank-product method instead of arbitrary weighted composites:
 
-Phase 1 weights (from config/scoring_weights.json, phase1 key):
-  convergence:  0.40
-  selection:    0.35
-  expression:   0.25
-  disease:      0.00  (zero-weighted until Phase 2)
-  druggability: 0.00  (zero-weighted until Phase 2)
-  safety:       0.00  (zero-weighted until Phase 2)
+Evidence layers (Phase 1):
+  1. Selection:  MEME p-value (lower = stronger positive selection)
+  2. Convergence: PhyloP score (higher = more convergent evolution)
+  3. Convergent AAs: max convergent_aa_count per gene (higher = more convergent)
 
-Tier assignment:
-  Tier 1: composite_score ≥ 0.70
-  Tier 2: composite_score ≥ 0.40
-  Tier 3: composite_score < 0.40
+Scoring procedure:
+  1. Rank each gene within each evidence layer (best = rank 1)
+  2. Compute rank product: RP = product(rank_i) / n^k (normalised)
+  3. Compute rank-product p-value via permutation (1000 shuffles)
+  4. Apply Benjamini-Hochberg FDR correction
+  5. Assign tiers: Tier1 = FDR < 0.05, Tier2 = FDR < 0.20, Tier3 = rest
+
+Reference: Breitling et al. (2004) "Rank products" FEBS Letters 573:83-92
 """
 
 import logging
 import math
+import random
+from collections import defaultdict
 from datetime import datetime, timezone
 from typing import Optional
 
@@ -27,6 +29,7 @@ from sqlalchemy import func
 from db.models import (
     CandidateScore,
     DiseaseAnnotation,
+    DivergentMotif,
     DrugTarget,
     EvolutionScore,
     Gene,
@@ -38,7 +41,7 @@ from db.models import (
 )
 from db.session import get_session
 from pipeline.config import get_scoring_weights, get_tier_thresholds, get_thresholds
-from pipeline.stats import apply_bh_to_evolution_scores
+from pipeline.stats import apply_bh_correction, apply_bh_to_evolution_scores
 
 log = logging.getLogger(__name__)
 
@@ -394,6 +397,77 @@ def human_genetics_score_from_disease(ann: Optional[DiseaseAnnotation]) -> float
 
 
 # ---------------------------------------------------------------------------
+# Rank-product scoring (Phase 1)
+# ---------------------------------------------------------------------------
+
+def _rank_values(values: list[float], ascending: bool = True) -> list[int]:
+    """Rank values with ties getting the average rank.
+
+    ascending=True: smallest value gets rank 1 (good for p-values).
+    ascending=False: largest value gets rank 1 (good for scores).
+    """
+    n = len(values)
+    indexed = list(enumerate(values))
+    indexed.sort(key=lambda x: x[1], reverse=not ascending)
+
+    ranks = [0] * n
+    i = 0
+    while i < n:
+        j = i
+        while j < n - 1 and indexed[j + 1][1] == indexed[j][1]:
+            j += 1
+        avg_rank = (i + j) / 2.0 + 1
+        for k in range(i, j + 1):
+            ranks[indexed[k][0]] = avg_rank
+        i = j + 1
+    return ranks
+
+
+def _compute_rank_product(ranks_per_layer: list[list[int]], n_genes: int) -> list[float]:
+    """Compute normalized rank product across k evidence layers.
+
+    RP_i = (product of ranks across layers) / n^k
+    """
+    k = len(ranks_per_layer)
+    rp = []
+    for i in range(n_genes):
+        product = 1.0
+        for layer_ranks in ranks_per_layer:
+            product *= layer_ranks[i]
+        rp.append(product / (n_genes ** k))
+    return rp
+
+
+def _rank_product_pvalues(rp_observed: list[float], ranks_per_layer: list[list[int]],
+                          n_genes: int, n_permutations: int = 1000) -> list[float]:
+    """Estimate rank-product p-values via permutation.
+
+    For each permutation, shuffle the ranks independently in each layer,
+    compute the RP, and count how often the permuted RP is <= the observed RP.
+    """
+    k = len(ranks_per_layer)
+    rng = random.Random(42)
+    counts = [0] * n_genes
+
+    for _ in range(n_permutations):
+        perm_layers = []
+        for layer_ranks in ranks_per_layer:
+            shuffled = list(layer_ranks)
+            rng.shuffle(shuffled)
+            perm_layers.append(shuffled)
+
+        for i in range(n_genes):
+            perm_product = 1.0
+            for layer in perm_layers:
+                perm_product *= layer[i]
+            perm_rp = perm_product / (n_genes ** k)
+            if perm_rp <= rp_observed[i]:
+                counts[i] += 1
+
+    return [c / n_permutations for c in counts]
+
+
+# ---------------------------------------------------------------------------
 # Pipeline entry point
 # ---------------------------------------------------------------------------
 
@@ -401,43 +475,174 @@ def human_genetics_score_from_disease(ann: Optional[DiseaseAnnotation]) -> float
 def run_scoring(phase: str = "phase1", trait_id: Optional[str] = None) -> None:
     """Compute and persist CandidateScore for all genes with Layer 1/2 data.
 
-    Args:
-        phase: "phase1" or "phase2" — determines which weights to apply.
-        trait_id: Optional trait identifier (e.g. "cancer_resistance"). Use "" for default/legacy.
+    Phase 1: uses rank-product method across three evidence layers:
+      1. Selection (MEME p-value)
+      2. Convergence (PhyloP score)
+      3. Convergent AAs (max count per gene)
+    Tiers assigned by FDR-corrected rank-product p-value.
+
+    Phase 2: uses weighted composite (when disease/druggability data available).
     """
     weights = get_scoring_weights(phase)
     tier_thresholds = get_tier_thresholds()
     tid = trait_id if trait_id is not None else ""
 
-    log.info("Assembling composite scores (phase=%s, trait_id=%r, weights=%s)", phase, tid, weights)
+    log.info("Assembling composite scores (phase=%s, trait_id=%r)", phase, tid)
+
+    if phase == "phase1":
+        _run_scoring_rank_product(tid)
+    else:
+        _run_scoring_weighted(weights, tier_thresholds, tid)
+
+    apply_bh_to_evolution_scores()
+    log.info("Scoring complete.")
+
+
+def _run_scoring_rank_product(tid: str) -> None:
+    """Phase 1 rank-product scoring across evolution evidence layers."""
 
     with get_session() as session:
         genes = session.query(Gene).all()
-        log.info("Scoring %d genes...", len(genes))
+        gene_ids = [g.id for g in genes]
+        n = len(gene_ids)
+        log.info("Rank-product scoring for %d genes...", n)
 
-        # Pre-fetch all related tables in bulk to avoid N+1 queries
+        if n == 0:
+            return
+
+        ev_map = {r.gene_id: r for r in session.query(EvolutionScore).all()}
+
+        conv_aa_rows = (
+            session.query(
+                Ortholog.gene_id,
+                func.max(DivergentMotif.convergent_aa_count),
+            )
+            .join(DivergentMotif, DivergentMotif.ortholog_id == Ortholog.id)
+            .group_by(Ortholog.gene_id)
+            .all()
+        )
+        conv_aa_map: dict[str, int] = {gid: cnt or 0 for gid, cnt in conv_aa_rows}
+
+        selection_pvals = []
+        convergence_phylop = []
+        convergent_aa_counts = []
+
+        for gid in gene_ids:
+            ev = ev_map.get(gid)
+            pval = ev.dnds_pvalue if ev and ev.dnds_pvalue is not None else 1.0
+            selection_pvals.append(pval)
+
+            phylop = ev.phylop_score if ev and ev.phylop_score is not None else 0.0
+            convergence_phylop.append(phylop)
+
+            aa_count = conv_aa_map.get(gid, 0)
+            convergent_aa_counts.append(float(aa_count))
+
+        sel_ranks = _rank_values(selection_pvals, ascending=True)
+        conv_ranks = _rank_values(convergence_phylop, ascending=False)
+        aa_ranks = _rank_values(convergent_aa_counts, ascending=False)
+
+        available_layers = [sel_ranks]
+        layer_names = ["selection"]
+
+        has_conv = any(v > 0 for v in convergence_phylop)
+        if has_conv:
+            available_layers.append(conv_ranks)
+            layer_names.append("convergence")
+
+        has_aa = any(v > 0 for v in convergent_aa_counts)
+        if has_aa:
+            available_layers.append(aa_ranks)
+            layer_names.append("convergent_aa")
+
+        log.info("Using %d evidence layers: %s", len(available_layers), ", ".join(layer_names))
+
+        rp_values = _compute_rank_product(available_layers, n)
+
+        log.info("Computing rank-product p-values (1000 permutations)...")
+        rp_pvals = _rank_product_pvalues(rp_values, available_layers, n, n_permutations=1000)
+
+        log.info("Applying BH FDR correction...")
+        rp_qvals = apply_bh_correction(rp_pvals)
+
+        cs_map = {
+            r.gene_id: r
+            for r in session.query(CandidateScore).filter_by(trait_id=tid).all()
+        }
+
+        tier_counts = {"Tier1": 0, "Tier2": 0, "Tier3": 0}
+        for idx, gid in enumerate(gene_ids):
+            ev = ev_map.get(gid)
+            qval = rp_qvals[idx] if rp_qvals[idx] is not None else 1.0
+
+            if qval < 0.05:
+                tier = "Tier1"
+            elif qval < 0.20:
+                tier = "Tier2"
+            else:
+                tier = "Tier3"
+            tier_counts[tier] += 1
+
+            composite = round(1.0 - qval, 4)
+
+            conv_score_val = convergence_score(
+                ev.convergence_count if ev else 0,
+                phylo_weight=ev.phylop_score if ev and ev.phylop_score else None,
+            )
+            sel_score_val = selection_score(
+                ev.dnds_ratio if ev else None,
+                ev.dnds_pvalue if ev else None,
+                fel_sites=ev.fel_sites if ev else None,
+                busted_pvalue=ev.busted_pvalue if ev else None,
+                relax_k=ev.relax_k if ev else None,
+                relax_pvalue=ev.relax_pvalue if ev else None,
+            )
+
+            cs = cs_map.get(gid)
+            if cs is None:
+                cs = CandidateScore(gene_id=gid, trait_id=tid)
+                session.add(cs)
+                cs_map[gid] = cs
+
+            cs.convergence_score = conv_score_val
+            cs.selection_score = sel_score_val
+            cs.expression_score = 0.0
+            cs.disease_score = 0.0
+            cs.druggability_score = 0.0
+            cs.safety_score = 1.0
+            cs.regulatory_score = 0.0
+            cs.composite_score = composite
+            cs.tier = tier
+            cs.updated_at = datetime.now(timezone.utc)
+
+    for tier_name in ["Tier1", "Tier2", "Tier3"]:
+        log.info("  %s: %d genes", tier_name, tier_counts[tier_name])
+
+
+def _run_scoring_weighted(weights: dict, tier_thresholds: dict, tid: str) -> None:
+    """Phase 2+ weighted composite scoring (original method)."""
+
+    with get_session() as session:
+        genes = session.query(Gene).all()
+        log.info("Weighted scoring for %d genes...", len(genes))
+
         ev_map  = {r.gene_id: r for r in session.query(EvolutionScore).all()}
         ann_map = {r.gene_id: r for r in session.query(DiseaseAnnotation).all()}
         dt_map  = {r.gene_id: r for r in session.query(DrugTarget).all()}
         sf_map  = {r.gene_id: r for r in session.query(SafetyFlag).all()}
-        # Expression scores stored in CandidateScore trait_id=""
         expr_map = {
             r.gene_id: (r.expression_score or 0.0)
             for r in session.query(CandidateScore).filter_by(trait_id="").all()
         }
-        # Regulatory divergence: max promoter score per gene
         reg_rows_all = session.query(RegulatoryDivergence).all()
         reg_map: dict[str, list] = {}
         for r in reg_rows_all:
             reg_map.setdefault(r.gene_id, []).append(r)
-        # Nucleotide scores (promoter)
         nucl_map = {
             r.gene_id: r
             for r in session.query(NucleotideScore).filter_by(region_type="promoter").all()
         }
-        # PhyloConservationScore
         phylo_map = {r.gene_id: r for r in session.query(PhyloConservationScore).all()}
-        # Pre-fetch existing CandidateScore rows for this trait to avoid per-gene SELECT
         cs_map = {
             r.gene_id: r
             for r in session.query(CandidateScore).filter_by(trait_id=tid).all()
@@ -449,11 +654,11 @@ def run_scoring(phase: str = "phase1", trait_id: Optional[str] = None) -> None:
             dt  = dt_map.get(gene.id)
             sf  = sf_map.get(gene.id)
 
-            conv_score = convergence_score(
+            conv_score_val = convergence_score(
                 ev.convergence_count if ev else 0,
                 phylo_weight=ev.phylop_score if ev and ev.phylop_score else None,
             )
-            sel_score = selection_score(
+            sel_score_val = selection_score(
                 ev.dnds_ratio if ev else None,
                 ev.dnds_pvalue if ev else None,
                 fel_sites=ev.fel_sites if ev else None,
@@ -461,12 +666,11 @@ def run_scoring(phase: str = "phase1", trait_id: Optional[str] = None) -> None:
                 relax_k=ev.relax_k if ev else None,
                 relax_pvalue=ev.relax_pvalue if ev else None,
             )
-            expr_score = expr_map.get(gene.id, 0.0)
+            expr_score_val = expr_map.get(gene.id, 0.0)
             dis_score = disease_score(ann) if weights.get("disease", 0) > 0 else 0.0
             drug_score = druggability_score(dt) if weights.get("druggability", 0) > 0 else 0.0
             safe_score = safety_score(sf) if weights.get("safety", 0) > 0 else 1.0
             if weights.get("regulatory", 0) > 0:
-                # Regulatory score from pre-fetched maps
                 reg_rows_gene = reg_map.get(gene.id, [])
                 if reg_rows_gene:
                     effects = [r.regulatory_score for r in reg_rows_gene if r.regulatory_score is not None]
@@ -474,7 +678,6 @@ def run_scoring(phase: str = "phase1", trait_id: Optional[str] = None) -> None:
                     alpha_score = round(min(max(effects) + 0.05 * lineage_count, 1.0), 4) if effects else 0.0
                 else:
                     alpha_score = 0.0
-                # Nucleotide divergence score from pre-fetched maps
                 ns = nucl_map.get(gene.id)
                 if ns is not None:
                     pcs = phylo_map.get(gene.id)
@@ -491,9 +694,9 @@ def run_scoring(phase: str = "phase1", trait_id: Optional[str] = None) -> None:
                 reg_score = 0.0
 
             sub_scores = {
-                "convergence": conv_score,
-                "selection": sel_score,
-                "expression": expr_score,
+                "convergence": conv_score_val,
+                "selection": sel_score_val,
+                "expression": expr_score_val,
                 "disease": dis_score,
                 "druggability": drug_score,
                 "safety": safe_score,
@@ -510,9 +713,9 @@ def run_scoring(phase: str = "phase1", trait_id: Optional[str] = None) -> None:
                 session.add(cs)
                 cs_map[gene.id] = cs
 
-            cs.convergence_score = conv_score
-            cs.selection_score = sel_score
-            cs.expression_score = expr_score
+            cs.convergence_score = conv_score_val
+            cs.selection_score = sel_score_val
+            cs.expression_score = expr_score_val
             cs.disease_score = dis_score
             cs.druggability_score = drug_score
             cs.safety_score = safe_score
@@ -521,16 +724,10 @@ def run_scoring(phase: str = "phase1", trait_id: Optional[str] = None) -> None:
             cs.tier = tier
             cs.updated_at = datetime.now(timezone.utc)
 
-    # Summary
     with get_session() as session:
         for tier_name in ["Tier1", "Tier2", "Tier3"]:
             count = session.query(CandidateScore).filter_by(tier=tier_name, trait_id=tid).count()
             log.info("  %s: %d genes", tier_name, count)
-
-    # Apply global BH FDR correction across all EvolutionScore p-values
-    apply_bh_to_evolution_scores()
-
-    log.info("Scoring complete.")
 
 
 def get_top_candidates(n: int = 20, tier: Optional[str] = None, trait_id: Optional[str] = None) -> list[dict]:

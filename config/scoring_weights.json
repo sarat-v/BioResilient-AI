@@ -1,9 +1,10 @@
 {
-  "_comment": "Phase 1: only convergence, selection, expression are populated. Disease, druggability, safety, regulatory are zero-weighted until Phase 2.",
+  "_comment_phase1": "Phase 1 uses rank-product method (Breitling et al. 2004) across 3 evidence layers: selection (MEME p-value), convergence (PhyloP), convergent AAs. Tiers assigned by FDR-corrected rank-product p-value. Weights below are retained for Phase 2 only.",
+  "_comment_phase1_tiers": "Tier1: FDR < 0.05, Tier2: FDR < 0.20, Tier3: rest. Expression excluded from Phase 1 (no data available).",
   "phase1": {
     "convergence":      0.40,
     "selection":        0.35,
-    "expression":       0.25,
+    "expression":       0.00,
     "disease":          0.00,
     "druggability":     0.00,
     "safety":           0.00,
@@ -21,5 +22,11 @@
   "tier_thresholds": {
     "tier1": 0.70,
     "tier2": 0.40
+  },
+  "rank_product": {
+    "_comment": "Phase 1 rank-product FDR thresholds for tier assignment",
+    "tier1_fdr": 0.05,
+    "tier2_fdr": 0.20,
+    "n_permutations": 1000
   }
 }
