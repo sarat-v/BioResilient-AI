@@ -389,7 +389,7 @@ def run_step6_batch(args):
             codon_aln = protein_to_codon_alignment(seqs_with_cds, cds_seqs)
 
         result = {"og_id": og_id, "cds_coverage": round(cds_coverage, 3)}
-        if codon_aln is not None:
+        if codon_aln:
             seen_sp = set()
             deduped_aln = {}
             for label, seq in codon_aln.items():
@@ -398,6 +398,13 @@ def run_step6_batch(args):
                     seen_sp.add(sp)
                     deduped_aln[sp] = seq
             codon_aln = deduped_aln
+            codon_species = list(codon_aln.keys())
+
+            if len(codon_species) < 4:
+                log.info("OG %s: only %d species after dedup, too few for HyPhy", og_id, len(codon_species))
+                codon_aln = None
+
+        if codon_aln:
             codon_species = list(codon_aln.keys())
             pruned_tree = prune_tree_to_species(treefile, codon_species)
 

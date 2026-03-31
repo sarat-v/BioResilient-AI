@@ -547,7 +547,6 @@ def run_meme(
             "--tree", str(tree_path),
             "--output", str(out_path),
             "--branches", "All",
-            "--full-model", "No",
         ]
         log.info("Running MEME for %s (CPU=%d): %s", og_id, cpus, " ".join(cmd[:3]))
         result = subprocess.run(

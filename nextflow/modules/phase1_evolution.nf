@@ -166,7 +166,7 @@ process run_meme {
 
     script:
     """
-    echo "hyphy_v10_cached_cds_speedflags"
+    echo "hyphy_v11_meme_flag_fix"
     mkdir -p '${og_batch.baseName}'
     python -m scripts.nf_wrappers.run_step \
         --step step6_batch \
