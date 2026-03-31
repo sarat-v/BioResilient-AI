@@ -246,18 +246,13 @@ def _prefetch_all_cds(aligned_orthogroups: dict[str, dict[str, str]]) -> None:
 
     fetch_ids = list(fetch_to_originals.keys())
 
-    _EFETCH_BATCH = 100
-    _EFETCH_WORKERS = 2
+    _EFETCH_BATCH = 200
+    _EFETCH_WORKERS = 8
     done_fetch = 0
     total_written = 0
     fetch_lock = threading.Lock()
 
     _pid_pat = re.compile(r"\[protein_id=([^\]]+)\]")
-
-    import random as _rng
-    _startup_jitter = _rng.uniform(0, 30)
-    log.info("CDS fetch startup jitter: %.1fs", _startup_jitter)
-    time.sleep(_startup_jitter)
 
     def _flush_cds(fetch_acc: str, lines: list[str]) -> int:
         seq = "".join(lines)
