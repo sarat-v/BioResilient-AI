@@ -110,11 +110,11 @@ def run_orthofinder(proteomes_dir: Path) -> Path:
         "orthofinder",
         "-f", str(input_dir),
         "-S", "diamond",
-        "-M", "dendroblast",   # legacy tree method — more stable than MSA+fasttree for large all-vs-all runs
+        "-M", "dendroblast",
         "-t", str(search_threads),
         "-a", str(align_threads),
         "-o", str(out_dir),
-        "-y",   # split paralogous clades — produces cleaner orthogroups
+        "-y",
     ]
 
     log.info("Running OrthoFinder: %s", " ".join(cmd))
@@ -231,7 +231,7 @@ def load_orthologs_to_db(
     seq_map: dict[str, dict[str, str]],
     human_gene_map: dict[str, tuple[str, str]],
 ) -> int:
-    """Insert orthologs into the database.
+    """Insert orthologs into the database using bulk operations.
 
     Args:
         long_df: Output from parse_orthogroups().
@@ -241,57 +241,68 @@ def load_orthologs_to_db(
     Returns:
         Number of rows inserted.
     """
-    inserted = 0
-
     with get_session() as session:
-        # Group by og_id to find human anchor
-        for og_id, group in long_df.groupby("og_id"):
-            human_rows = group[group["species_id"] == "human"]
-            if human_rows.empty:
+        existing_gene_ids = {g.id for g in session.query(Gene.id).all()}
+        existing_orthologs = {
+            (o.gene_id, o.species_id)
+            for o in session.query(Ortholog.gene_id, Ortholog.species_id).all()
+        }
+
+    genes_to_add = []
+    orthologs_to_add = []
+
+    for og_id, group in long_df.groupby("og_id"):
+        human_rows = group[group["species_id"] == "human"]
+        if human_rows.empty:
+            continue
+
+        human_protein_id = human_rows.iloc[0]["protein_id"]
+        if human_protein_id not in human_gene_map:
+            continue
+
+        gene_db_id, gene_symbol = human_gene_map[human_protein_id]
+
+        if gene_db_id not in existing_gene_ids:
+            genes_to_add.append(Gene(
+                id=gene_db_id,
+                human_gene_id=human_protein_id,
+                gene_symbol=gene_symbol,
+                human_protein=human_protein_id,
+            ))
+            existing_gene_ids.add(gene_db_id)
+
+        for _, row in group.iterrows():
+            sid = row["species_id"]
+            pid = row["protein_id"]
+            if (gene_db_id, sid) in existing_orthologs:
                 continue
+            seq = seq_map.get(sid, {}).get(pid, "")
+            orthologs_to_add.append(Ortholog(
+                gene_id=gene_db_id,
+                species_id=sid,
+                protein_id=pid,
+                protein_seq=seq or None,
+                orthofinder_og=og_id,
+            ))
+            existing_orthologs.add((gene_db_id, sid))
 
-            # Use the first human protein as anchor gene
-            human_protein_id = human_rows.iloc[0]["protein_id"]
-            if human_protein_id not in human_gene_map:
-                continue
+    inserted = 0
+    _BATCH = 5000
+    with get_session() as session:
+        if genes_to_add:
+            session.bulk_save_objects(genes_to_add)
+            session.flush()
+            log.info("  Bulk-inserted %d Gene rows.", len(genes_to_add))
 
-            gene_db_id, gene_symbol = human_gene_map[human_protein_id]
+        for i in range(0, len(orthologs_to_add), _BATCH):
+            batch = orthologs_to_add[i : i + _BATCH]
+            session.bulk_save_objects(batch)
+            session.flush()
+            inserted += len(batch)
+            if inserted % 10000 == 0 or i + _BATCH >= len(orthologs_to_add):
+                log.info("  Ortholog bulk insert: %d / %d", inserted, len(orthologs_to_add))
 
-            # Ensure Gene row exists
-            gene = session.query(Gene).filter(Gene.id == gene_db_id).first()
-            if gene is None:
-                gene = Gene(
-                    id=gene_db_id,
-                    human_gene_id=human_protein_id,
-                    gene_symbol=gene_symbol,
-                    human_protein=human_protein_id,
-                )
-                session.add(gene)
-                session.flush()
-
-            # Insert orthologs for all species
-            for _, row in group.iterrows():
-                sid = row["species_id"]
-                pid = row["protein_id"]
-                seq = seq_map.get(sid, {}).get(pid, "")
-
-                existing = (
-                    session.query(Ortholog)
-                    .filter_by(gene_id=gene_db_id, species_id=sid)
-                    .first()
-                )
-                if existing:
-                    continue
-
-                ortholog = Ortholog(
-                    gene_id=gene_db_id,
-                    species_id=sid,
-                    protein_id=pid,
-                    protein_seq=seq or None,
-                    orthofinder_og=og_id,
-                )
-                session.add(ortholog)
-                inserted += 1
+        session.commit()
 
     log.info("Inserted %d ortholog rows.", inserted)
     return inserted

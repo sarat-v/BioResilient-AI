@@ -38,8 +38,8 @@ REQUEST_TIMEOUT = 20
 
 
 def _bgee_workers() -> int:
-    """Return number of parallel Bgee API workers from config (default 10)."""
-    return int(get_tool_config().get("bgee_workers", 10))
+    """Return number of parallel Bgee API workers from config (default 15)."""
+    return int(get_tool_config().get("bgee_workers", 15))
 
 # Tissues relevant for each trait (mapped to Uberon or Bgee tissue names)
 TRAIT_TISSUES: dict[str, list[str]] = {
@@ -50,16 +50,31 @@ TRAIT_TISSUES: dict[str, list[str]] = {
     "default":           ["liver", "brain", "heart", "kidney"],
 }
 
-# Bgee species IDs for our panel (NCBI taxon IDs work directly in Bgee)
-BGEE_SUPPORTED_TAXIDS = {
-    9606:   "human",
-    10181:  "naked_mole_rat",
-    9785:   "african_elephant",
-    59463:  "little_brown_bat",
-    13146:  "budgerigar",
-    8296:   "axolotl",
-    30608:  "mouse_lemur",
-}
+_bgee_taxid_cache: Optional[dict[int, str]] = None
+
+
+def _get_bgee_taxids() -> dict[int, str]:
+    """Return {taxid: species_id} for all species in the DB that have a taxid.
+
+    Derived from the Species table so the list stays current when species are
+    added or removed from the registry.  Bgee silently returns no result for
+    species it doesn't cover, so we can safely try all registered species and
+    let the API filter naturally.  Human (taxid 9606) is always included as the
+    anchor for gene-symbol resolution even if it is a baseline/control species.
+    """
+    global _bgee_taxid_cache
+    if _bgee_taxid_cache is not None:
+        return _bgee_taxid_cache
+
+    try:
+        with get_session() as session:
+            rows = session.query(Species.taxid, Species.id).all()
+        _bgee_taxid_cache = {r.taxid: r.id for r in rows if r.taxid}
+    except Exception as exc:
+        log.warning("Could not load species taxids from DB for Bgee; using empty map: %s", exc)
+        _bgee_taxid_cache = {}
+
+    return _bgee_taxid_cache
 
 
 def _bgee_gene_search(gene_symbol: str, species_taxid: int = 9606) -> Optional[str]:
@@ -137,8 +152,8 @@ def _query_bgee_for_gene(
     expression_rows: list[dict] = []
     present_species: list[str] = []
 
-    for taxid, species_id in BGEE_SUPPORTED_TAXIDS.items():
-        if species_id == "human":
+    for taxid, species_id in _get_bgee_taxids().items():
+        if taxid == 9606:
             continue
 
         bgee_species_id = _bgee_gene_search(gene.gene_symbol, species_taxid=taxid)
@@ -175,6 +190,8 @@ def _query_bgee_for_gene(
             "  Bgee: %s expressed in %d species (%s)",
             gene.gene_symbol, len(present_species), ", ".join(present_species[:4]),
         )
+    else:
+        expression_rows = []
 
     return gene.id, expression_rows
 

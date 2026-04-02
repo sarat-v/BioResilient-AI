@@ -549,10 +549,19 @@ def enrich_phylop_scores(chrom_map: dict[str, tuple[str, int]]) -> None:
 # ---------------------------------------------------------------------------
 
 def _get_control_species_ids() -> set[str]:
-    """Return set of species_ids flagged as negative controls."""
+    """Return set of species_ids that are negative controls or baseline references.
+
+    Includes both is_control=True species (rat, macaque) and species with
+    'baseline' in their phenotypes (human), so that divergence common to any
+    non-resilient species is correctly penalised regardless of which phenotype
+    the pipeline is currently targeting.
+    """
     with get_session() as session:
-        rows = session.query(Species.id).filter_by(is_control=True).all()
-    return {r.id for r in rows}
+        rows = session.query(Species.id, Species.phenotypes, Species.is_control).all()
+    return {
+        r.id for r in rows
+        if r.is_control or "baseline" in (r.phenotypes or [])
+    }
 
 
 def compute_control_divergence_fractions() -> dict[str, float]:

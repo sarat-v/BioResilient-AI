@@ -38,9 +38,36 @@ from db.models import (
     PhyloConservationScore,
     RegulatoryDivergence,
     SafetyFlag,
+    Species,
 )
 from db.session import get_session
 from pipeline.config import get_scoring_weights, get_tier_thresholds, get_thresholds
+
+_test_species_cache: Optional[frozenset[str]] = None
+
+
+def _get_test_species() -> frozenset[str]:
+    """Return the set of test (target-phenotype) species IDs from the DB.
+
+    Excludes baseline, control, and outgroup species — the same classification
+    used by RELAX branch labeling.  Cached for the process lifetime.
+    """
+    global _test_species_cache
+    if _test_species_cache is not None:
+        return _test_species_cache
+    try:
+        with get_session() as session:
+            rows = session.query(Species.id, Species.phenotypes, Species.is_control).all()
+        _test_species_cache = frozenset(
+            r.id for r in rows
+            if (r.phenotypes or [])
+            and "outgroup" not in (r.phenotypes or [])
+            and not r.is_control
+            and "baseline" not in (r.phenotypes or [])
+        )
+    except Exception:
+        _test_species_cache = frozenset()
+    return _test_species_cache
 from pipeline.stats import apply_bh_correction, apply_bh_to_evolution_scores
 
 log = logging.getLogger(__name__)
@@ -80,6 +107,7 @@ def selection_score(
     busted_pvalue: Optional[float] = None,
     relax_k: Optional[float] = None,
     relax_pvalue: Optional[float] = None,
+    branches_under_selection: Optional[list[str]] = None,
 ) -> float:
     """Score in [0, 1] combining MEME dN/dS, FEL, BUSTED, and RELAX signals.
 
@@ -88,6 +116,14 @@ def selection_score(
 
     RELAX component rewards significant branch-specific acceleration (k > 1):
         relax_score = min(-log10(p) / 10, 1.0) × min((k - 1) / 2.0, 1.0)  if k > 1
+
+    Phenotype specificity (branches_under_selection):
+        If provided, the MEME sub-score is scaled by a specificity weight
+        = 0.5 + 0.5 × (resistant_branches / total_branches_under_selection).
+        Range [0.5, 1.0]: full score when all branches are target-phenotype species;
+        50% floor when none are (keeps evolvable-but-non-specific genes visible in
+        the raw output while pushing them down in the ranking).  When
+        branches_under_selection is empty or None the multiplier is 1.0 (no change).
     """
     # --- MEME component ---
     if dnds_ratio is None or dnds_pvalue is None:
@@ -102,9 +138,19 @@ def selection_score(
             pval_weight = min(-math.log10(dnds_pvalue) / 10.0, 1.0)
         meme_score = round(0.5 * dnds_norm + 0.5 * pval_weight, 4)
 
-    # If no supplementary tests available, return MEME score alone
+    # Phenotype-specificity multiplier: reward MEME signal on target-phenotype branches.
+    # Raw MEME output (dnds_ratio, dnds_pvalue, full branches list) is preserved in DB
+    # exactly as HyPhy produced it — only the scoring weight changes.
+    if meme_score > 0 and branches_under_selection:
+        test_set = _get_test_species()
+        if test_set:
+            resistant_count = sum(1 for b in branches_under_selection if b in test_set)
+            resistant_frac = resistant_count / len(branches_under_selection)
+            meme_score = round(meme_score * (0.5 + 0.5 * resistant_frac), 4)
+
+    # If no supplementary tests available, scale by MEME weight to avoid inflation
     if fel_sites is None and busted_pvalue is None and relax_k is None:
-        return meme_score
+        return round(meme_score * 0.65, 4)
 
     # --- FEL component ---
     fel_score = round(min(fel_sites / 10.0, 1.0), 4) if fel_sites and fel_sites > 0 else 0.0
@@ -186,7 +232,7 @@ def safety_score(sf: Optional[SafetyFlag]) -> float:
       - gtex_max_tpm > 5000: extreme expression in any tissue → modest penalty
     """
     if sf is None:
-        return 1.0
+        return 0.5
     s = 1.0
     if sf.hub_risk:
         s -= 0.3
@@ -596,6 +642,7 @@ def _run_scoring_rank_product(tid: str) -> None:
                 busted_pvalue=ev.busted_pvalue if ev else None,
                 relax_k=ev.relax_k if ev else None,
                 relax_pvalue=ev.relax_pvalue if ev else None,
+                branches_under_selection=ev.branches_under_selection if ev else None,
             )
 
             cs = cs_map.get(gid)
@@ -609,7 +656,7 @@ def _run_scoring_rank_product(tid: str) -> None:
             cs.expression_score = 0.0
             cs.disease_score = 0.0
             cs.druggability_score = 0.0
-            cs.safety_score = 1.0
+            cs.safety_score = 0.5
             cs.regulatory_score = 0.0
             cs.composite_score = composite
             cs.tier = tier
@@ -665,11 +712,12 @@ def _run_scoring_weighted(weights: dict, tier_thresholds: dict, tid: str) -> Non
                 busted_pvalue=ev.busted_pvalue if ev else None,
                 relax_k=ev.relax_k if ev else None,
                 relax_pvalue=ev.relax_pvalue if ev else None,
+                branches_under_selection=ev.branches_under_selection if ev else None,
             )
             expr_score_val = expr_map.get(gene.id, 0.0)
             dis_score = disease_score(ann) if weights.get("disease", 0) > 0 else 0.0
             drug_score = druggability_score(dt) if weights.get("druggability", 0) > 0 else 0.0
-            safe_score = safety_score(sf) if weights.get("safety", 0) > 0 else 1.0
+            safe_score = safety_score(sf) if weights.get("safety", 0) > 0 else 0.5
             if weights.get("regulatory", 0) > 0:
                 reg_rows_gene = reg_map.get(gene.id, [])
                 if reg_rows_gene:

@@ -1,10 +1,10 @@
 {
-  "_comment_phase1": "Phase 1 uses rank-product method (Breitling et al. 2004) across 3 evidence layers: selection (MEME p-value), convergence (PhyloP), convergent AAs. Tiers assigned by FDR-corrected rank-product p-value. Weights below are retained for Phase 2 only.",
-  "_comment_phase1_tiers": "Tier1: FDR < 0.05, Tier2: FDR < 0.20, Tier3: rest. Expression excluded from Phase 1 (no data available).",
+  "_comment_phase1": "Phase 1 uses rank-product method (Breitling et al. 2004) across 4 evidence layers: selection (MEME p-value), convergence (PhyloP), convergent AAs, expression (Bgee). Tiers assigned by FDR-corrected rank-product p-value.",
+  "_comment_phase1_tiers": "Tier1: FDR < 0.05, Tier2: FDR < 0.20, Tier3: rest. Expression weight is small (0.10) to add tissue-specificity without overriding evolution signal.",
   "phase1": {
     "convergence":      0.40,
     "selection":        0.35,
-    "expression":       0.00,
+    "expression":       0.10,
     "disease":          0.00,
     "druggability":     0.00,
     "safety":           0.00,

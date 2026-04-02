@@ -271,6 +271,58 @@ def run_step6_collect(args):
         log.warning("No valid MEME results found to load")
 
 
+def _apply_fdr_correction(
+    meme_batch: dict[str, dict],
+    fb_batch: dict[str, dict],
+) -> None:
+    """Apply Benjamini-Hochberg FDR correction to MEME and BUSTED p-values.
+
+    Corrects across all tested OGs (not per-batch) to properly control
+    the false discovery rate.
+    """
+    try:
+        import numpy as np
+
+        meme_pvals = [(og, r.get("dnds_pvalue")) for og, r in meme_batch.items()
+                      if r.get("selection_model") == "meme" and r.get("dnds_pvalue") is not None]
+        if meme_pvals:
+            ogs, pvals = zip(*meme_pvals)
+            pvals_arr = np.array(pvals, dtype=float)
+            n = len(pvals_arr)
+            sorted_idx = np.argsort(pvals_arr)
+            sorted_pvals = pvals_arr[sorted_idx]
+            ranks = np.arange(1, n + 1)
+            adjusted = np.minimum(1.0, sorted_pvals * n / ranks)
+            for i in range(n - 2, -1, -1):
+                adjusted[i] = min(adjusted[i], adjusted[i + 1])
+            fdr = np.empty(n)
+            fdr[sorted_idx] = adjusted
+            for og, adj_p in zip(ogs, fdr):
+                meme_batch[og]["meme_pvalue_fdr"] = round(float(adj_p), 6)
+            log.info("BH-FDR corrected %d MEME p-values", n)
+
+        busted_pvals = [(og, r.get("busted_pvalue")) for og, r in fb_batch.items()
+                        if r.get("busted_pvalue") is not None]
+        if busted_pvals:
+            ogs, pvals = zip(*busted_pvals)
+            pvals_arr = np.array(pvals, dtype=float)
+            n = len(pvals_arr)
+            sorted_idx = np.argsort(pvals_arr)
+            sorted_pvals = pvals_arr[sorted_idx]
+            ranks = np.arange(1, n + 1)
+            adjusted = np.minimum(1.0, sorted_pvals * n / ranks)
+            for i in range(n - 2, -1, -1):
+                adjusted[i] = min(adjusted[i], adjusted[i + 1])
+            fdr = np.empty(n)
+            fdr[sorted_idx] = adjusted
+            for og, adj_p in zip(ogs, fdr):
+                fb_batch[og]["busted_pvalue_fdr"] = round(float(adj_p), 6)
+            log.info("BH-FDR corrected %d BUSTED p-values", n)
+
+    except Exception as exc:
+        log.warning("FDR correction failed: %s", exc)
+
+
 def run_step6_all_collect(args):
     """Collect all HyPhy results (MEME + FEL+BUSTED + RELAX) from merged output."""
     from pipeline.layer2_evolution.selection import (
@@ -310,6 +362,9 @@ def run_step6_all_collect(args):
     log.info("All-HyPhy collect: %d MEME, %d FEL+BUSTED, %d RELAX results",
              len(meme_batch), len(fb_batch), len(relax_batch))
 
+    # BH-FDR correction across all OGs before loading to DB
+    _apply_fdr_correction(meme_batch, fb_batch)
+
     if meme_batch:
         load_selection_scores(meme_batch, gene_by_og)
         log.info("Loaded %d MEME results to DB", len(meme_batch))
@@ -322,10 +377,18 @@ def run_step6_all_collect(args):
 
 
 def run_step6_batch(args):
-    """Batch HyPhy — loads pkl once, runs MEME+FEL+BUSTED+RELAX for each OG."""
+    """Batch HyPhy — per-gene IQ-TREE2 tree + parallel MEME/FEL/BUSTED.
+
+    Gold-standard workflow per CAPHEINE/BABAPPA:
+      1. Build codon alignment + QC
+      2. Infer per-gene ML tree (IQ-TREE2 GTR+G)
+      3. Run MEME + FEL + BUSTED in parallel (ThreadPoolExecutor)
+    Falls back to protein divergence proxy if codon alignment unavailable.
+    """
     import gc
     import json
     import shutil
+    from concurrent.futures import ThreadPoolExecutor
     from pipeline.layer2_evolution.meme_selection import (
         load_cds_cache_pkl,
         fetch_cds_for_protein,
@@ -333,6 +396,7 @@ def run_step6_batch(args):
         run_meme, parse_meme_results,
         run_fel, parse_fel_results,
         run_busted, parse_busted_results,
+        run_relax, parse_relax_results,
     )
     from pipeline.layer2_evolution.selection import write_hyphy_input, run_absrel, parse_absrel_results
     from pipeline.layer2_evolution.phylo_tree import prune_tree_to_species
@@ -370,7 +434,6 @@ def run_step6_batch(args):
 
         seqs = dict(aligned[og_id])
         species_ids = [label.split("|")[0] for label in seqs]
-        pruned_tree = prune_tree_to_species(treefile, species_ids)
 
         cds_seqs: dict[str, str] = {}
         for label in seqs:
@@ -406,17 +469,32 @@ def run_step6_batch(args):
 
         if codon_aln:
             codon_species = list(codon_aln.keys())
+
             pruned_tree = prune_tree_to_species(treefile, codon_species)
 
-            meme_json = run_meme(codon_aln, pruned_tree, og_id)
+            with ThreadPoolExecutor(max_workers=4) as executor:
+                fut_meme = executor.submit(run_meme, codon_aln, pruned_tree, og_id)
+                fut_fel = executor.submit(run_fel, codon_aln, pruned_tree, og_id)
+                fut_busted = executor.submit(run_busted, codon_aln, pruned_tree, og_id)
+                fut_relax = executor.submit(run_relax, codon_aln, pruned_tree, og_id)
+
+                meme_json = fut_meme.result()
+                fel_json = fut_fel.result()
+                busted_json = fut_busted.result()
+                relax_json = fut_relax.result()
+
             if meme_json is not None:
                 result.update(parse_meme_results(meme_json, og_id))
                 result["selection_model"] = "meme"
                 meme_local = Path(get_local_storage_root()) / "meme" / og_id
-                for fname in ("codon_aln.fna", "meme.json", "species.treefile"):
+                for fname in ("codon_aln.fna", "meme.json"):
                     src = meme_local / fname
                     if src.exists():
                         shutil.copy2(src, og_out / fname)
+                gene_tree_dir = Path(get_local_storage_root()) / "gene_trees" / og_id
+                src_tree = gene_tree_dir / "gene.treefile"
+                if src_tree.exists():
+                    shutil.copy2(src_tree, og_out / "gene.treefile")
             else:
                 result["status"] = "meme_failed"
                 meme_local = Path(get_local_storage_root()) / "meme" / og_id
@@ -424,20 +502,29 @@ def run_step6_batch(args):
                 if src.exists():
                     shutil.copy2(src, og_out / "codon_aln.fna")
 
-            fel_json = run_fel(codon_aln, pruned_tree, og_id)
             result["fel_sites"] = parse_fel_results(fel_json).get("fel_sites", 0) if fel_json else 0
-
-            busted_json = run_busted(codon_aln, pruned_tree, og_id)
             result["busted_pvalue"] = parse_busted_results(busted_json).get("busted_pvalue", 1.0) if busted_json else 1.0
 
-            result["relax_k"] = None
-            result["relax_pvalue"] = None
+            relax_parsed = parse_relax_results(relax_json) if relax_json else {}
+            result["relax_k"] = relax_parsed.get("relax_k")
+            result["relax_pvalue"] = relax_parsed.get("relax_pvalue", 1.0)
         else:
+            pruned_tree = prune_tree_to_species(treefile, species_ids)
             aln_path, tree_path = write_hyphy_input(og_id, seqs, pruned_tree)
             raw = run_absrel(aln_path, tree_path, og_id)
             if raw is not None:
                 result.update(parse_absrel_results(raw))
                 result["selection_model"] = "proxy"
+                # Filter branches to test (target-phenotype) species for scoring specificity
+                from pipeline.layer2_evolution.meme_selection import _get_relax_branch_sets
+                try:
+                    test_set, _ref, _out = _get_relax_branch_sets()
+                    if test_set and result.get("branches_under_selection"):
+                        result["branches_under_selection"] = [
+                            b for b in result["branches_under_selection"] if b in test_set
+                        ]
+                except Exception:
+                    pass
             else:
                 result["status"] = "no_codon_alignment"
 
@@ -480,11 +567,16 @@ def run_step6b_batch(args):
             continue
 
         codon_aln = {r.id: str(r.seq) for r in SeqIO.parse(str(codon_aln_path), "fasta")}
-        species_ids = [label.split("|")[0] for label in codon_aln]
-        pruned_tree = prune_tree_to_species(treefile, species_ids)
 
-        fel_json = run_fel(codon_aln, pruned_tree, og_id)
-        busted_json = run_busted(codon_aln, pruned_tree, og_id)
+        gene_treefile = og_dir / "gene.treefile"
+        if gene_treefile.exists():
+            tree = gene_treefile.read_text().strip()
+        else:
+            species_ids = [label.split("|")[0] for label in codon_aln]
+            tree = prune_tree_to_species(treefile, species_ids)
+
+        fel_json = run_fel(codon_aln, tree, og_id)
+        busted_json = run_busted(codon_aln, tree, og_id)
         fel_result = parse_fel_results(fel_json) if fel_json else {"fel_sites": 0}
         busted_result = parse_busted_results(busted_json) if busted_json else {"busted_pvalue": 1.0}
 
@@ -522,10 +614,15 @@ def run_step6c_batch(args):
             continue
 
         codon_aln = {r.id: str(r.seq) for r in SeqIO.parse(str(codon_aln_path), "fasta")}
-        species_ids = [label.split("|")[0] for label in codon_aln]
-        pruned_tree = prune_tree_to_species(treefile, species_ids)
 
-        relax_json = run_relax(codon_aln, pruned_tree, og_id)
+        gene_treefile = og_dir / "gene.treefile"
+        if gene_treefile.exists():
+            tree = gene_treefile.read_text().strip()
+        else:
+            species_ids = [label.split("|")[0] for label in codon_aln]
+            tree = prune_tree_to_species(treefile, species_ids)
+
+        relax_json = run_relax(codon_aln, tree, og_id)
         relax_result = parse_relax_results(relax_json) if relax_json else {"relax_k": None, "relax_pvalue": 1.0}
 
         with open(og_out / "result.json", "w") as f:
@@ -556,11 +653,16 @@ def run_step6b_single_og(args):
         return
 
     codon_aln = {r.id: str(r.seq) for r in SeqIO.parse(str(codon_aln_path), "fasta")}
-    species_ids = [label.split("|")[0] for label in codon_aln]
-    pruned_tree = prune_tree_to_species(treefile, species_ids)
 
-    fel_json = run_fel(codon_aln, pruned_tree, og_id)
-    busted_json = run_busted(codon_aln, pruned_tree, og_id)
+    gene_treefile = codon_aln_path.parent / "gene.treefile"
+    if gene_treefile.exists():
+        tree = gene_treefile.read_text().strip()
+    else:
+        species_ids = [label.split("|")[0] for label in codon_aln]
+        tree = prune_tree_to_species(treefile, species_ids)
+
+    fel_json = run_fel(codon_aln, tree, og_id)
+    busted_json = run_busted(codon_aln, tree, og_id)
     fel_result = parse_fel_results(fel_json) if fel_json else {"fel_sites": 0}
     busted_result = parse_busted_results(busted_json) if busted_json else {"busted_pvalue": 1.0}
 
@@ -587,10 +689,15 @@ def run_step6c_single_og(args):
         return
 
     codon_aln = {r.id: str(r.seq) for r in SeqIO.parse(str(codon_aln_path), "fasta")}
-    species_ids = [label.split("|")[0] for label in codon_aln]
-    pruned_tree = prune_tree_to_species(treefile, species_ids)
 
-    relax_json = run_relax(codon_aln, pruned_tree, og_id)
+    gene_treefile = codon_aln_path.parent / "gene.treefile"
+    if gene_treefile.exists():
+        tree = gene_treefile.read_text().strip()
+    else:
+        species_ids = [label.split("|")[0] for label in codon_aln]
+        tree = prune_tree_to_species(treefile, species_ids)
+
+    relax_json = run_relax(codon_aln, tree, og_id)
     relax_result = parse_relax_results(relax_json) if relax_json else {"relax_k": None, "relax_pvalue": 1.0}
 
     with open(out_dir / "result.json", "w") as f:

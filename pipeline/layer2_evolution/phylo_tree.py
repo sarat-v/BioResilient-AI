@@ -141,10 +141,9 @@ def run_iqtree(concat_alignment: dict[str, str]) -> Path:
     cfg = get_tool_config()
     threads = cfg.get("iqtree_threads", "AUTO")
     bootstrap = cfg.get("iqtree_bootstrap", 1000)
-    # Default model: Q.INSECT+F+I+G4 — best BIC on empirical 18-species panel
-    # (vertebrates + invertebrates). Skipping ModelFinder saves ~30 min per run.
-    # Override via iqtree_model in environment.yml if needed.
-    model = cfg.get("iqtree_model", "Q.INSECT+F+I+G4")
+    # LG+F+I+G4 is the standard model for mixed-taxon vertebrate phylogenomics.
+    # MFP once selected Q.INSECT+F+I+G4 for this dataset; override via config if needed.
+    model = cfg.get("iqtree_model", "LG+F+I+G4")
 
     # IQ-TREE's AUTO thread detection runs a memory-intensive benchmarking phase
     # that can OOM on large alignments. Pin to a safe default when AUTO is set.
@@ -200,24 +199,40 @@ def load_tree(treefile: Path) -> str:
     return treefile.read_text().strip()
 
 
+_PRUNE_CACHE: dict[tuple, str] = {}
+
+
 def prune_tree_to_species(treefile: Path, species_ids: list[str]) -> str:
     """Prune the species tree to only the species present in a given orthogroup.
 
-    Uses ETE3 if available, otherwise returns the full tree.
+    Uses ETE3 tree.prune() which correctly collapses internal nodes after
+    leaf removal, preserving branch lengths and topology.
+
+    Results are cached by (treefile, frozenset(species)) to avoid redundant
+    re-parsing when many OGs share the same species composition.
     """
+    cache_key = (str(treefile), frozenset(species_ids))
+    if cache_key in _PRUNE_CACHE:
+        return _PRUNE_CACHE[cache_key]
+
     try:
         from ete3 import Tree
 
         t = Tree(str(treefile))
-        # Remove leaves not in species_ids
-        leaves_to_remove = [n for n in t.get_leaves() if n.name not in species_ids]
-        for node in leaves_to_remove:
-            node.detach()
-        return t.write(format=1)
+        keep = [n.name for n in t.get_leaves() if n.name in set(species_ids)]
+        if len(keep) < 3:
+            result = load_tree(treefile)
+        else:
+            t.prune(keep, preserve_branch_length=True)
+            result = t.write(format=1)
+
+        _PRUNE_CACHE[cache_key] = result
+        return result
 
     except ImportError:
-        log.debug("ete3 not available — using full tree without pruning.")
+        log.error("ete3 not installed — tree pruning requires ete3. "
+                  "Returning full tree but HyPhy results may be invalid.")
         return load_tree(treefile)
     except Exception as exc:
-        log.warning("Tree pruning failed: %s — using full tree.", exc)
-        return load_tree(treefile)
+        log.error("Tree pruning failed for %d species: %s", len(species_ids), exc)
+        raise RuntimeError(f"Tree pruning failed: {exc}") from exc

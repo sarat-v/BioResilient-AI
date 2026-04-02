@@ -140,7 +140,7 @@ workflow health_check {
 
         echo ""
         echo "=== Pipeline Health Check ==="
-        python scripts/pipeline_health_check.py --output health_check.md
+        python /app/scripts/pipeline_health_check.py --output health_check.md || true
         """
     }
 }

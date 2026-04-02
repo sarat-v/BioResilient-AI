@@ -5,7 +5,7 @@ FROM --platform=linux/amd64 mambaorg/micromamba:1.5.8 AS hyphy-builder
 USER root
 RUN micromamba install -y -n base \
         -c bioconda -c conda-forge \
-        hyphy \
+        hyphy iqtree \
     && micromamba clean -afy
 
 FROM ${BASE_IMAGE}
@@ -17,3 +17,4 @@ ENV PATH="/opt/conda/bin:$PATH"
 RUN pip install ete3
 
 RUN hyphy --version || echo "hyphy version check skipped (cross-compile)"
+RUN iqtree2 --version || iqtree --version || echo "iqtree version check skipped (cross-compile)"

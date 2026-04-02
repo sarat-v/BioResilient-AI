@@ -160,16 +160,84 @@ def _newick_with_branch_lengths(treefile: Path) -> Optional[Path]:
         return None
 
 
+def _build_nucleotide_concat_for_phylofit(treefile: Path) -> Optional[Path]:
+    """Build a concatenated nucleotide CDS alignment for phyloFit training.
+
+    phyloFit requires nucleotide data for nucleotide substitution models.
+    We concatenate CDS regions from the NucleotideRegion table across genes
+    that have coverage in ≥80% of species.
+    """
+    try:
+        species_seqs: dict[str, list[str]] = {}
+        with get_session() as session:
+            genes_with_cds = (
+                session.query(NucleotideRegion.gene_id)
+                .filter_by(region_type="cds")
+                .distinct()
+                .all()
+            )
+            gene_ids = [g[0] for g in genes_with_cds]
+
+            all_species = set()
+            gene_data: list[dict[str, str]] = []
+            for gene_id in gene_ids[:500]:
+                regions = (
+                    session.query(NucleotideRegion)
+                    .filter_by(gene_id=gene_id, region_type="cds")
+                    .all()
+                )
+                seqs = {r.species_id: r.sequence for r in regions if r.sequence and len(r.sequence) >= 30}
+                if len(seqs) >= 3:
+                    gene_data.append(seqs)
+                    all_species.update(seqs.keys())
+
+        if not gene_data or not all_species:
+            log.warning("No suitable CDS regions for phyloFit training.")
+            return None
+
+        n_species = len(all_species)
+        min_coverage = n_species * 0.5
+        valid_genes = [g for g in gene_data if len(g) >= min_coverage]
+
+        if len(valid_genes) < 5:
+            log.warning("Only %d CDS genes with sufficient coverage for phyloFit.", len(valid_genes))
+            valid_genes = gene_data[:50] if gene_data else []
+            if not valid_genes:
+                return None
+
+        concat: dict[str, list[str]] = {sp: [] for sp in all_species}
+        for gene_seqs in valid_genes[:200]:
+            max_len = max(len(s) for s in gene_seqs.values())
+            for sp in all_species:
+                seq = gene_seqs.get(sp, "-" * max_len)
+                concat[sp].append(seq.ljust(max_len, "-"))
+
+        out_path = treefile.parent / "cds_concat_for_phylofit.fna"
+        with open(out_path, "w") as f:
+            for sp, parts in concat.items():
+                f.write(f">{sp}\n{''.join(parts)}\n")
+
+        log.info("Built nucleotide CDS concat for phyloFit: %d species, %d genes.",
+                 len(concat), len(valid_genes))
+        return out_path
+
+    except Exception as exc:
+        log.warning("Failed to build nucleotide concat for phyloFit: %s", exc)
+        return None
+
+
 def _fit_neutral_model(treefile: Path, concat_aln: Path) -> Optional[Path]:
     """Run phyloFit to produce a neutral .mod file for phyloP.
 
-    phyloP requires a pre-fitted neutral evolutionary model (.mod file),
-    not a raw Newick tree.  We fit the model once using the concatenated
-    alignment from step 5 and cache it alongside the species tree.
+    phyloP requires a pre-fitted neutral evolutionary model (.mod file).
+    We train phyloFit on a concatenated nucleotide CDS alignment using the
+    REV (general reversible) nucleotide substitution model.
 
     Args:
         treefile: IQ-TREE2 species treefile (Newick with branch lengths).
-        concat_aln: Concatenated protein alignment FASTA from step 5.
+        concat_aln: Concatenated protein alignment FASTA from step 5
+                    (used only as fallback species list; nucleotide CDS
+                    alignment is built from NucleotideRegion table).
 
     Returns:
         Path to the fitted .mod file, or None if phyloFit fails.
@@ -187,16 +255,21 @@ def _fit_neutral_model(treefile: Path, concat_aln: Path) -> Optional[Path]:
     if nwk_path is None:
         return None
 
+    nt_aln = _build_nucleotide_concat_for_phylofit(treefile)
+    if nt_aln is None:
+        log.warning("Could not build nucleotide alignment for phyloFit — skipping.")
+        return None
+
     try:
-        log.info("Fitting neutral model with phyloFit (this may take a few minutes)...")
+        log.info("Fitting neutral model with phyloFit on nucleotide CDS alignment...")
         result = subprocess.run(
             [
                 "phyloFit",
                 "--tree", str(nwk_path),
                 "--msa-format", "FASTA",
-                "--subst-mod", "SSREV",
+                "--subst-mod", "REV",
                 "--out-root", str(treefile.parent / "neutral"),
-                str(concat_aln),
+                str(nt_aln),
             ],
             capture_output=True, text=True, timeout=1800,
         )

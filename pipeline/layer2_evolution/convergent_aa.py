@@ -1,24 +1,23 @@
-"""True convergent amino acid substitution detection.
+"""True convergent amino acid substitution detection with ancestral state reconstruction.
 
-Detects *true convergence*: the **same** (or biochemically equivalent) amino
-acid change evolving independently at the same position in multiple lineages.
+Detects *true convergence*: amino acid substitutions that evolved *independently*
+at the same position in multiple lineages, as confirmed by ancestral state
+reconstruction (ASR). A substitution is convergent only if the inferred
+ancestral amino acid at the most recent common ancestor (MRCA) differs from
+the derived state — ruling out shared inheritance.
 
-Method:
-  For each DivergentMotif, across all species that show divergence at the
-  same gene position:
-    - Extract the exact amino acid substitution (human_ref -> animal_alt) at
-      each divergent position.
-    - Count how many independent *lineages* carry the same substitution
-      (identical or Miyata-equivalent alt amino acid) at that position.
-    - Store the result as convergent_aa_count on DivergentMotif.
+Miyata biochemical equivalence groups are used as a secondary signal to
+identify functionally equivalent (but not identical) convergent substitutions.
 """
 
 import logging
 from collections import Counter, defaultdict
+from pathlib import Path
 from typing import Optional
 
 from db.models import Gene, Species
 from db.session import get_session
+from pipeline.config import get_local_storage_root
 
 log = logging.getLogger(__name__)
 
@@ -32,6 +31,143 @@ _MIYATA: dict[str, int] = {
     "K": 5, "R": 5,
     "P": 6, "M": 6,
 }
+
+
+def _load_species_tree_newick() -> Optional[str]:
+    """Load the species tree Newick from step 5 output."""
+    root = Path(get_local_storage_root())
+    treefile = root / "phylo" / "species.treefile"
+    if treefile.exists():
+        return treefile.read_text().strip()
+    return None
+
+
+def _infer_ancestral_aa(tree_newick: str, species_aa: dict[str, str]) -> dict[str, str]:
+    """Infer ancestral amino acids at internal nodes using maximum parsimony.
+
+    Uses Fitch's algorithm (downpass + uppass) for parsimony-based ASR.
+    Returns a dict mapping species_id to "ancestral" AA at the parent node —
+    only species whose AA differs from their parent's inferred state represent
+    true independent substitutions.
+    """
+    try:
+        from ete3 import Tree
+    except ImportError:
+        return {}
+
+    if not tree_newick or len(species_aa) < 3:
+        return {}
+
+    try:
+        t = Tree(tree_newick)
+        present = [n.name for n in t.get_leaves() if n.name in species_aa]
+        if len(present) < 3:
+            return {}
+        t.prune(present, preserve_branch_length=True)
+    except Exception:
+        return {}
+
+    # Fitch downpass: assign sets of possible AAs bottom-up
+    for node in t.traverse("postorder"):
+        if node.is_leaf():
+            aa = species_aa.get(node.name, "-")
+            node.add_feature("fitch_set", {aa} if aa != "-" else set())
+        else:
+            child_sets = [c.fitch_set for c in node.children if c.fitch_set]
+            if not child_sets:
+                node.add_feature("fitch_set", set())
+            elif len(child_sets) == 1:
+                node.add_feature("fitch_set", child_sets[0])
+            else:
+                intersection = child_sets[0]
+                for cs in child_sets[1:]:
+                    intersection = intersection & cs
+                if intersection:
+                    node.add_feature("fitch_set", intersection)
+                else:
+                    union = set()
+                    for cs in child_sets:
+                        union = union | cs
+                    node.add_feature("fitch_set", union)
+
+    # Fitch uppass: resolve ambiguities top-down
+    for node in t.traverse("preorder"):
+        if node.is_root():
+            node.add_feature("fitch_aa", min(node.fitch_set) if node.fitch_set else "-")
+        else:
+            parent_aa = node.up.fitch_aa
+            if parent_aa in node.fitch_set:
+                node.add_feature("fitch_aa", parent_aa)
+            else:
+                node.add_feature("fitch_aa", min(node.fitch_set) if node.fitch_set else parent_aa)
+
+    # For each leaf, record the parent's inferred AA
+    parent_aa_map = {}
+    for leaf in t.get_leaves():
+        if leaf.up is not None:
+            parent_aa_map[leaf.name] = leaf.up.fitch_aa
+        else:
+            parent_aa_map[leaf.name] = leaf.fitch_aa
+
+    return parent_aa_map
+
+
+def _infer_ancestral_aa_cached(pruned_tree, species_aa: dict[str, str]) -> dict[str, str]:
+    """Infer ancestral AAs using an already-pruned ete3 Tree object.
+
+    Avoids re-parsing the Newick string and re-pruning for every position.
+    """
+    if pruned_tree is None or len(species_aa) < 3:
+        return {}
+
+    try:
+        from ete3 import Tree
+        t = pruned_tree.copy()
+    except Exception:
+        return {}
+
+    # Fitch downpass
+    for node in t.traverse("postorder"):
+        if node.is_leaf():
+            aa = species_aa.get(node.name, "-")
+            node.add_feature("fitch_set", {aa} if aa != "-" else set())
+        else:
+            child_sets = [c.fitch_set for c in node.children if c.fitch_set]
+            if not child_sets:
+                node.add_feature("fitch_set", set())
+            elif len(child_sets) == 1:
+                node.add_feature("fitch_set", child_sets[0])
+            else:
+                intersection = child_sets[0]
+                for cs in child_sets[1:]:
+                    intersection = intersection & cs
+                if intersection:
+                    node.add_feature("fitch_set", intersection)
+                else:
+                    union = set()
+                    for cs in child_sets:
+                        union = union | cs
+                    node.add_feature("fitch_set", union)
+
+    # Fitch uppass
+    for node in t.traverse("preorder"):
+        if node.is_root():
+            node.add_feature("fitch_aa", min(node.fitch_set) if node.fitch_set else "-")
+        else:
+            parent_aa_val = node.up.fitch_aa
+            if parent_aa_val in node.fitch_set:
+                node.add_feature("fitch_aa", parent_aa_val)
+            else:
+                node.add_feature("fitch_aa", min(node.fitch_set) if node.fitch_set else parent_aa_val)
+
+    parent_aa_map = {}
+    for leaf in t.get_leaves():
+        if leaf.up is not None:
+            parent_aa_map[leaf.name] = leaf.up.fitch_aa
+        else:
+            parent_aa_map[leaf.name] = leaf.fitch_aa
+
+    return parent_aa_map
 
 
 def annotate_convergent_aa(gene_ids: Optional[list[str]] = None) -> int:
@@ -81,10 +217,38 @@ def annotate_convergent_aa(gene_ids: Optional[list[str]] = None) -> int:
     motif_counts: dict[str, int] = {}
     genes_done = 0
 
+    tree_newick = _load_species_tree_newick()
+    if tree_newick:
+        log.info("Loaded species tree for ancestral state reconstruction.")
+    else:
+        log.warning("No species tree found — falling back to Miyata-only convergence (no ASR).")
+
+    # Cache pruned ete3 trees keyed by frozenset of species to avoid
+    # re-parsing + re-pruning the same tree thousands of times.
+    _pruned_tree_cache: dict[frozenset, object] = {}
+
+    def _get_pruned_tree(species_set: frozenset):
+        if species_set in _pruned_tree_cache:
+            return _pruned_tree_cache[species_set]
+        try:
+            from ete3 import Tree
+            t = Tree(tree_newick)
+            present = [n.name for n in t.get_leaves() if n.name in species_set]
+            if len(present) < 3:
+                _pruned_tree_cache[species_set] = None
+                return None
+            t.prune(present, preserve_branch_length=True)
+            _pruned_tree_cache[species_set] = t
+            return t
+        except Exception:
+            _pruned_tree_cache[species_set] = None
+            return None
+
     for gene_id, motifs in gene_motifs.items():
-        # Phase 1: build position -> {lineage: miyata_group} map
-        # position_lineage_groups[abs_pos][lineage] = miyata_group_of_alt_aa
+        # Phase 1: build position -> {species: alt_aa} and {lineage: miyata_group}
+        position_species_aa: dict[int, dict[str, str]] = defaultdict(dict)
         position_lineage_groups: dict[int, dict[str, int]] = defaultdict(dict)
+        position_human_aa: dict[int, str] = {}
         motif_ranges: list[tuple[str, int, int]] = []
 
         for motif_id, start_pos, human_seq, animal_seq, species_id in motifs:
@@ -92,6 +256,11 @@ def annotate_convergent_aa(gene_ids: Optional[list[str]] = None) -> int:
 
             lineage = species_lineage_map.get(species_id, "Other")
             if lineage in skip_lineages or species_id == "human":
+                if species_id == "human":
+                    seq_len_cmp = min(len(human_seq), len(animal_seq))
+                    for i in range(seq_len_cmp):
+                        if human_seq[i] != "-":
+                            position_human_aa[start_pos + i] = human_seq[i]
                 continue
 
             seq_len_cmp = min(len(human_seq), len(animal_seq))
@@ -101,20 +270,48 @@ def annotate_convergent_aa(gene_ids: Optional[list[str]] = None) -> int:
                 if h_aa == "-" or a_aa == "-" or h_aa == a_aa:
                     continue
                 abs_pos = start_pos + i
+                position_species_aa[abs_pos][species_id] = a_aa.upper()
                 if lineage not in position_lineage_groups[abs_pos]:
                     grp = _MIYATA.get(a_aa.upper(), -1)
                     position_lineage_groups[abs_pos][lineage] = grp
 
-        # Phase 2: for each position, find max lineages sharing same Miyata group
-        # Pre-compute per-position max convergence count
+        # Phase 2: ASR-corrected convergence counting
         pos_max_conv: dict[int, int] = {}
         for abs_pos, lineage_groups in position_lineage_groups.items():
             if len(lineage_groups) < 2:
                 continue
-            group_counts = Counter(lineage_groups.values())
-            group_counts.pop(-1, None)
-            if group_counts:
-                pos_max_conv[abs_pos] = max(group_counts.values())
+
+            if tree_newick and abs_pos in position_species_aa:
+                species_aa = dict(position_species_aa[abs_pos])
+                h_aa = position_human_aa.get(abs_pos)
+                if h_aa:
+                    species_aa["human"] = h_aa.upper()
+                species_key = frozenset(species_aa.keys())
+                parent_aa = _infer_ancestral_aa_cached(
+                    _get_pruned_tree(species_key), species_aa
+                )
+
+                # Only count species where the substitution is independent
+                # (leaf AA differs from its inferred parent AA)
+                independent_lineages: dict[str, int] = {}
+                for sp_id, alt_aa in position_species_aa[abs_pos].items():
+                    anc_aa = parent_aa.get(sp_id)
+                    if anc_aa and anc_aa.upper() != alt_aa.upper():
+                        lineage = species_lineage_map.get(sp_id, "Other")
+                        if lineage not in skip_lineages and lineage not in independent_lineages:
+                            grp = _MIYATA.get(alt_aa, -1)
+                            independent_lineages[lineage] = grp
+
+                if len(independent_lineages) >= 2:
+                    group_counts = Counter(independent_lineages.values())
+                    group_counts.pop(-1, None)
+                    if group_counts:
+                        pos_max_conv[abs_pos] = max(group_counts.values())
+            else:
+                group_counts = Counter(lineage_groups.values())
+                group_counts.pop(-1, None)
+                if group_counts:
+                    pos_max_conv[abs_pos] = max(group_counts.values())
 
         # Phase 3: for each motif, find the max convergence across its positions
         for motif_id, start_pos, seq_len in motif_ranges:

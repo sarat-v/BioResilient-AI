@@ -117,6 +117,29 @@ def _get_ncbi_gene_id(gene_symbol: str) -> Optional[str]:
         return None
 
 
+def _get_ortholog_gene_id(gene_symbol: str, taxid: int) -> Optional[str]:
+    """Return NCBI Gene ID for a gene symbol in a non-human species."""
+    try:
+        r = requests.get(
+            NCBI_ESEARCH,
+            params={
+                **_ncbi_base_params(),
+                "db": "gene",
+                "term": f"{gene_symbol}[Gene Name] AND {taxid}[Taxonomy ID]",
+                "retmax": 1,
+                "retmode": "json",
+            },
+            timeout=15,
+        )
+        if r.status_code != 200:
+            return None
+        ids = r.json().get("esearchresult", {}).get("idlist", [])
+        return ids[0] if ids else None
+    except Exception as exc:
+        log.debug("NCBI ortholog search %s taxid=%d: %s", gene_symbol, taxid, exc)
+        return None
+
+
 def _fetch_promoter_sequence(
     ncbi_gene_id: str,
     taxid: int = 9606,
@@ -355,7 +378,11 @@ def run_alphagenome_track(
             continue
 
         for species in species_list:
-            alt_seq = _fetch_promoter_sequence(ncbi_gene_id, taxid=species.taxid)
+            ortholog_gene_id = _get_ortholog_gene_id(gene.gene_symbol, species.taxid)
+            if ortholog_gene_id:
+                alt_seq = _fetch_promoter_sequence(ortholog_gene_id, taxid=species.taxid)
+            else:
+                alt_seq = None
             if not alt_seq:
                 continue
 

@@ -108,6 +108,22 @@ if not og_list:
     og_list = sorted(og for og in motifs if og in aligned)
     sys.stderr.write(f'Fallback OGs from pkl: {len(og_list)}\\n')
 
+# Pre-filter: skip OGs with < 4 unique species (HyPhy minimum)
+filtered = []
+skipped = 0
+for og in og_list:
+    seqs = aligned[og]
+    species = set()
+    for label_seq_pair in seqs:
+        label = label_seq_pair[0] if isinstance(label_seq_pair, (list, tuple)) else label_seq_pair
+        species.add(label.split('|')[0])
+    if len(species) >= 4:
+        filtered.append(og)
+    else:
+        skipped += 1
+sys.stderr.write(f'Pre-filter: {len(filtered)} OGs with >=4 species, {skipped} skipped\\n')
+og_list = filtered
+
 n_batches = math.ceil(len(og_list) / batch_size)
 for i in range(n_batches):
     chunk = og_list[i * batch_size : (i + 1) * batch_size]
@@ -122,8 +138,8 @@ PYEOF
 
 process prefetch_cds {
     label 'base'
-    cpus 4
-    memory '32 GB'
+    cpus 2
+    memory '16 GB'
     time '2h'
 
     input:
@@ -150,9 +166,9 @@ process run_meme {
     label 'hyphy'
     cpus params.hyphy_cpus
     memory { (params.hyphy_memory as nextflow.util.MemoryUnit) * task.attempt }
-    time '6h'
+    time '3h'
     tag "${og_batch.baseName}"
-    errorStrategy { task.exitStatus in [137, 143] ? 'retry' : 'finish' }
+    errorStrategy { task.attempt <= 3 ? 'retry' : 'finish' }
     maxRetries 3
 
     input:
@@ -166,7 +182,9 @@ process run_meme {
 
     script:
     """
-    echo "hyphy_v11_meme_flag_fix"
+    echo "hyphy_v17_spot_4cpu_batch10"
+    export HYPHY_CPUS=1          # 1 CPU per tool: 4 tools × 1 = 4 total (matches task.cpus=4)
+    export MEME_TIMEOUT=600      # 10 min per OG; dedicated CPU so it can complete within 2h batch limit
     mkdir -p '${og_batch.baseName}'
     python -m scripts.nf_wrappers.run_step \
         --step step6_batch \
@@ -215,7 +233,7 @@ process run_fel_busted {
     memory { (params.hyphy_memory as nextflow.util.MemoryUnit) * task.attempt }
     time '12h'
     tag "${meme_out.baseName}"
-    errorStrategy { task.exitStatus in [137, 143] ? 'retry' : 'finish' }
+    errorStrategy { task.attempt <= 3 ? 'retry' : 'finish' }
     maxRetries 3
 
     input:
@@ -244,7 +262,7 @@ process run_relax {
     memory { (params.hyphy_memory as nextflow.util.MemoryUnit) * task.attempt }
     time '12h'
     tag "${meme_out.baseName}"
-    errorStrategy { task.exitStatus in [137, 143] ? 'retry' : 'finish' }
+    errorStrategy { task.attempt <= 3 ? 'retry' : 'finish' }
     maxRetries 3
 
     input:

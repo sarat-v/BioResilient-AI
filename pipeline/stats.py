@@ -105,9 +105,9 @@ def apply_bh_to_meme_results(meme_results: dict[str, dict]) -> dict[str, dict]:
 def apply_bh_to_evolution_scores() -> None:
     """Compute BH-adjusted q-values for all EvolutionScore rows and store them.
 
-    Uses dnds_pvalue as the per-gene p-value to correct.  The corrected q-value
-    is written to EvolutionScore.meme_qvalue so downstream scoring and tier
-    assignment can gate on q < 0.05.
+    Corrects the gene-level MEME p-value (dnds_pvalue) across all genes using
+    BH FDR. The corrected q-value is stored in meme_qvalue for downstream
+    tier assignment (q < 0.05 for Tier 1).
     """
     from db.models import EvolutionScore
     from db.session import get_session

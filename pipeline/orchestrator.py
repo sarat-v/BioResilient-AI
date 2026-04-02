@@ -153,13 +153,24 @@ def _load_species_registry(phenotype: str | None = None) -> list[dict]:
 
 
 def step1_validate_environment() -> None:
-    """Validate that all required tools are installed and the DB is reachable."""
+    """Validate that all required tools are installed and the DB is reachable.
+
+    In containerized (Nextflow) mode, bioinformatics tools live in separate
+    Docker images so missing tools are logged as warnings instead of errors.
+    """
     log.info("Step 1: Validating environment...")
-    # Each entry is (canonical_name, [accepted_binary_names])
+
+    containerized = (
+        os.environ.get("NXF_TASK_WORKDIR")
+        or os.environ.get("FUSION_ENABLED")
+        or os.environ.get("AWS_BATCH_JOB_ID")
+        or os.environ.get("FUSION_GPU_USED") is not None
+    )
+
     tools = [
         ("orthofinder", ["orthofinder"]),
         ("mafft",       ["mafft"]),
-        ("iqtree2",     ["iqtree2", "iqtree"]),   # bioconda installs as either name
+        ("iqtree2",     ["iqtree2", "iqtree"]),
         ("hyphy",       ["hyphy", "HYPHYMP"]),
         ("diamond",     ["diamond"]),
     ]
@@ -171,12 +182,14 @@ def step1_validate_environment() -> None:
         )
         if not found:
             missing.append(name)
-            log.error("  ✗ %s not found", name)
+            log.warning("  ✗ %s not found", name)
         else:
             log.info("  ✓ %s", name)
 
-    if missing:
+    if missing and not containerized:
         raise RuntimeError(f"Missing tools: {missing}. Run setup_local.sh first.")
+    elif missing:
+        log.info("  Containerized mode — %d tools not in this image (OK, each has its own container)", len(missing))
 
     # Validate DB connection
     from sqlalchemy import text
@@ -215,13 +228,47 @@ def step3_run_orthofinder(dry_run: bool = False) -> Path:
         log.info("  [dry-run] skipping OrthoFinder")
         return Path("/tmp/mock_orthofinder_results")
 
-    from pipeline.config import get_local_storage_root
+    from pipeline.config import get_local_storage_root, get_storage_root
     from pipeline.layer1_sequence.orthofinder import run_orthofinder
 
     proteomes_dir = Path(get_local_storage_root()) / "proteomes"
+
+    if not any(proteomes_dir.glob("*.reheadered.faa")):
+        _sync_proteomes_from_s3(proteomes_dir, get_storage_root())
+
     results_dir = run_orthofinder(proteomes_dir)
     log.info("  OrthoFinder results at: %s", results_dir)
     return results_dir
+
+
+def _sync_proteomes_from_s3(proteomes_dir: Path, storage_root: str) -> None:
+    """Pull all reheadered proteome FASTAs from S3 when running in a fresh container."""
+    env_root = os.environ.get("BIORESILIENT_STORAGE_ROOT", "")
+    if env_root.startswith("s3://"):
+        storage_root = env_root
+    if not storage_root.startswith("s3://"):
+        return
+    import boto3
+    bucket = storage_root.replace("s3://", "").rstrip("/").split("/")[0]
+    prefix = "proteomes/"
+    proteomes_dir.mkdir(parents=True, exist_ok=True)
+
+    s3 = boto3.client("s3")
+    paginator = s3.get_paginator("list_objects_v2")
+    count = 0
+    for page in paginator.paginate(Bucket=bucket, Prefix=prefix):
+        for obj in page.get("Contents", []):
+            key = obj["Key"]
+            fname = key[len(prefix):]
+            if not fname.endswith(".reheadered.faa") or fname.startswith("."):
+                continue
+            dest = proteomes_dir / fname
+            if dest.exists() and dest.stat().st_size > 0:
+                continue
+            log.info("  S3 → %s (%s MB)", fname, round(obj["Size"] / 1e6, 1))
+            s3.download_file(bucket, key, str(dest))
+            count += 1
+    log.info("  Synced %d proteome files from s3://%s/%s", count, bucket, prefix)
 
 
 def step3b_load_orthologs(results_dir: Path, dry_run: bool = False) -> None:
@@ -230,7 +277,7 @@ def step3b_load_orthologs(results_dir: Path, dry_run: bool = False) -> None:
     if dry_run:
         return
 
-    from pipeline.config import get_local_storage_root
+    from pipeline.config import get_local_storage_root, get_storage_root
     from pipeline.layer1_sequence.orthofinder import (
         flag_one_to_one_orthogroups,
         load_orthologs_to_db,
@@ -239,6 +286,8 @@ def step3b_load_orthologs(results_dir: Path, dry_run: bool = False) -> None:
     )
 
     proteomes_dir = Path(get_local_storage_root()) / "proteomes"
+    if not any(proteomes_dir.glob("*.reheadered.faa")):
+        _sync_proteomes_from_s3(proteomes_dir, get_storage_root())
     long_df = parse_orthogroups(results_dir, proteomes_dir)
     seq_map = load_sequence_map(proteomes_dir)
 
@@ -992,8 +1041,16 @@ def run_pipeline(
             except Exception as _e:
                 log.warning("Could not recover aligned_orthogroups from DB: %s", _e)
 
-    # If resuming past step5, recover treefile from disk
+    # If resuming past step5, recover treefile from disk or S3
     _tree_candidate = Path(get_local_storage_root()) / "phylo" / "species.treefile"
+    if not _tree_candidate.exists():
+        _tree_candidate.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            from pipeline.config import sync_from_s3
+            sync_from_s3("cache/species.treefile", _tree_candidate)
+            log.info("Synced species.treefile from S3")
+        except Exception:
+            pass
     if _tree_candidate.exists():
         treefile = _tree_candidate
 

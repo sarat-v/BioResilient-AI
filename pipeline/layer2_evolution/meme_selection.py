@@ -27,6 +27,7 @@ import json
 import logging
 import os
 import pickle
+import random
 import re
 import subprocess
 import tempfile
@@ -37,8 +38,12 @@ from typing import Optional
 from urllib.parse import urlencode
 from urllib.request import urlopen, Request
 
+_rng = random.Random(42)
+
 from Bio import Entrez, SeqIO
 
+from db.models import Species
+from db.session import get_session
 from pipeline.config import get_ncbi_api_key, get_ncbi_email, get_local_storage_root, get_tool_config
 
 log = logging.getLogger(__name__)
@@ -481,6 +486,25 @@ def protein_to_codon_alignment(
         log.info("Codon alignment: %d/%d succeeded, %d skipped",
                  len(codon_aln), len(protein_alignment), len(skipped))
 
+    _STOP_CODONS = {"TAA", "TAG", "TGA"}
+    clean_aln: dict[str, str] = {}
+    for label, seq in codon_aln.items():
+        has_internal_stop = False
+        last_codon_start = max(0, len(seq) - 3)
+        for i in range(0, last_codon_start, 3):
+            codon = seq[i:i + 3].upper().replace("-", "")
+            if codon in _STOP_CODONS:
+                has_internal_stop = True
+                break
+        if has_internal_stop:
+            log.info("Codon alignment: dropping %s (internal stop codon)", label)
+        else:
+            clean_aln[label] = seq
+    if len(clean_aln) < len(codon_aln):
+        log.info("Dropped %d seqs with stop codons, %d remain",
+                 len(codon_aln) - len(clean_aln), len(clean_aln))
+    codon_aln = clean_aln
+
     coverage = len(codon_aln) / len(protein_alignment) if protein_alignment else 0
     if len(codon_aln) < min_seqs or coverage < min_coverage:
         log.info("Codon alignment below threshold: %d seqs (need %d), %.0f%% (need %.0f%%)",
@@ -493,7 +517,102 @@ def protein_to_codon_alignment(
         min_len = min(lengths)
         codon_aln = {k: v[:min_len] for k, v in codon_aln.items()}
 
+    # --- Sequence QC ---
+
+    # Remove sequences with >50% gap characters
+    gap_filtered = {}
+    for label, seq in codon_aln.items():
+        gap_frac = seq.count("-") / len(seq) if seq else 1.0
+        if gap_frac <= 0.50:
+            gap_filtered[label] = seq
+        else:
+            log.info("Codon QC: dropping %s (%.0f%% gaps)", label, gap_frac * 100)
+    codon_aln = gap_filtered
+
+    # Remove sequences with >5% ambiguous bases
+    _VALID_BASES = set("ATGCatgc-")
+    clean2 = {}
+    for label, seq in codon_aln.items():
+        ambig_count = sum(1 for c in seq if c not in _VALID_BASES)
+        ambig_frac = ambig_count / len(seq) if seq else 1.0
+        if ambig_frac <= 0.05:
+            clean2[label] = seq
+        else:
+            log.info("Codon QC: dropping %s (%.1f%% ambiguous bases)", label, ambig_frac * 100)
+    codon_aln = clean2
+
+    # Remove duplicate sequences (identical codons = same evolutionary signal)
+    seen_seqs: dict[str, str] = {}
+    deduped: dict[str, str] = {}
+    for label, seq in codon_aln.items():
+        seq_upper = seq.upper()
+        if seq_upper not in seen_seqs:
+            seen_seqs[seq_upper] = label
+            deduped[label] = seq
+        else:
+            log.info("Codon QC: dropping %s (identical to %s)", label, seen_seqs[seq_upper])
+    codon_aln = deduped
+
+    if len(codon_aln) < min_seqs:
+        log.info("Codon QC: only %d sequences remain after QC (need %d)", len(codon_aln), min_seqs)
+        return None
+
     return codon_aln
+
+
+def infer_gene_tree(codon_aln: dict[str, str], og_id: str) -> Optional[str]:
+    """Infer a per-gene ML tree using IQ-TREE2 on the codon alignment.
+
+    Uses GTR+G (general time-reversible + gamma rate heterogeneity) with
+    single-threaded execution for efficiency when parallelised across genes.
+
+    Returns the Newick tree string, or None on failure.
+    """
+    import shutil as _shutil
+
+    root = Path(get_local_storage_root())
+    tree_dir = root / "gene_trees" / og_id
+    tree_dir.mkdir(parents=True, exist_ok=True)
+
+    aln_path = tree_dir / "codon_aln.fna"
+    with open(aln_path, "w") as f:
+        for label, seq in codon_aln.items():
+            species = label.split("|")[0]
+            f.write(f">{species}\n{seq}\n")
+
+    prefix = str(tree_dir / "gene")
+    treefile = Path(f"{prefix}.treefile")
+
+    if treefile.exists() and treefile.stat().st_size > 0:
+        return treefile.read_text().strip()
+
+    iqtree_bin = "iqtree2" if _shutil.which("iqtree2") else "iqtree"
+    if not _shutil.which(iqtree_bin):
+        log.warning("IQ-TREE2 not found — cannot infer gene tree for %s", og_id)
+        return None
+
+    cmd = [
+        iqtree_bin,
+        "-s", str(aln_path),
+        "-m", "GTR+G",
+        "-T", "1",
+        "--prefix", prefix,
+        "--redo",
+        "-quiet",
+    ]
+
+    try:
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
+        if result.returncode == 0 and treefile.exists():
+            return treefile.read_text().strip()
+        log.warning("IQ-TREE failed for %s (rc=%d): %s",
+                    og_id, result.returncode, result.stderr[:200])
+    except subprocess.TimeoutExpired:
+        log.warning("IQ-TREE timed out for %s (>120s)", og_id)
+    except Exception as exc:
+        log.warning("IQ-TREE error for %s: %s", og_id, exc)
+
+    return None
 
 
 # ---------------------------------------------------------------------------
@@ -535,8 +654,9 @@ def run_meme(
 
     tree_path.write_text(tree_newick)
 
-    cpus = os.cpu_count() or 4
+    cpus = int(os.environ.get("HYPHY_CPUS", 1))
     hyphy_env = {**os.environ, "CPU": str(cpus)}
+    meme_timeout = int(os.environ.get("MEME_TIMEOUT", 180))
 
     try:
         cmd = [
@@ -546,12 +666,12 @@ def run_meme(
             "--output", str(out_path),
             "--branches", "All",
         ]
-        log.info("Running MEME for %s (CPU=%d): %s", og_id, cpus, " ".join(cmd[:3]))
+        log.info("Running MEME for %s (CPU=%d, timeout=%ds): %s", og_id, cpus, meme_timeout, " ".join(cmd[:3]))
         result = subprocess.run(
             cmd,
             capture_output=True,
             text=True,
-            timeout=1800,
+            timeout=meme_timeout,
             env=hyphy_env,
         )
         if result.returncode != 0:
@@ -567,7 +687,7 @@ def run_meme(
         return json.loads(out_path.read_text())
 
     except subprocess.TimeoutExpired:
-        log.warning("MEME timed out for %s (>1800s)", og_id)
+        log.warning("MEME timed out for %s (>%ds)", og_id, meme_timeout)
         return None
     except Exception as exc:
         log.warning("MEME error for %s: %s", og_id, exc)
@@ -578,6 +698,50 @@ def run_meme(
 # MEME result parsing
 # ---------------------------------------------------------------------------
 
+def _extract_meme_resistant_branches(meme_json: dict) -> list[str]:
+    """Return species IDs of test (resistant/target) branches with elevated dN/dS in MEME.
+
+    Reads the `branch attributes` section of the MEME JSON — HyPhy always writes
+    per-branch MG94 omega estimates there.  We intersect the elevated-omega branches
+    with the registry-derived test-species set so the filter is phenotype-agnostic.
+
+    This is the raw MEME output preserved for reference; the caller decides how to
+    use this list (e.g. as a phenotype-specificity weight in scoring).
+    """
+    test_set, _ref, _out = _get_relax_branch_sets()
+    if not test_set:
+        return []
+
+    elevated: list[str] = []
+    branch_attrs = meme_json.get("branch attributes", {})
+    # Branch attributes may be nested under a model key "0"
+    if isinstance(branch_attrs, dict) and "0" in branch_attrs:
+        branch_attrs = branch_attrs["0"]
+
+    for branch_name, attrs in branch_attrs.items():
+        if not isinstance(attrs, dict):
+            continue
+        # Try various key names HyPhy uses for per-branch omega across versions
+        omega = (
+            attrs.get("MG94xREV with separate rates for branch sets")
+            or attrs.get("omega")
+            or attrs.get("dN/dS")
+            or attrs.get("Omega")
+        )
+        if omega is None:
+            continue
+        try:
+            if float(omega) > 1.0:
+                # Strip any HyPhy branch annotations like "{Test}" or "{Reference}"
+                clean = branch_name.split("{")[0].strip()
+                if clean in test_set:
+                    elevated.append(clean)
+        except (ValueError, TypeError):
+            continue
+
+    return elevated
+
+
 def parse_meme_results(meme_json: dict, og_id: str) -> dict:
     """Extract selection statistics from HyPhy MEME output.
 
@@ -586,7 +750,11 @@ def parse_meme_results(meme_json: dict, og_id: str) -> dict:
       - beta-: purifying selection intensity
       - beta+: positive selection intensity
       - p-value: episodic diversification p-value per site
-      - Episodic selection detected at N% of sites
+
+    Also extracts which test (resistant/target) species branches show elevated
+    omega (dN/dS > 1) from the `branch attributes` section, stored in
+    `branches_under_selection`.  Raw MEME output is preserved in full; the
+    scoring layer uses branch specificity as a phenotype-relevance multiplier.
 
     Returns a dict compatible with load_selection_scores().
     """
@@ -616,11 +784,7 @@ def parse_meme_results(meme_json: dict, og_id: str) -> dict:
         fraction_selected = len(selected_sites) / n_sites
         mean_beta_plus = sum(beta_plus_values) / len(beta_plus_values) if beta_plus_values else 0.0
 
-        # Map to pseudo dN/dS: use fraction_selected × normalised beta+
-        # beta+ is the non-synonymous rate under positive selection;
-        # values >> 1 indicate strong positive selection
         pseudo_dnds = fraction_selected * min(mean_beta_plus / 5.0, 2.0)
-        # p-value: geometric mean of site p-values under selection (penalised if none)
         if selected_sites:
             import math
             log_sum = sum(math.log(p) for p in selected_sites if p > 0)
@@ -628,14 +792,20 @@ def parse_meme_results(meme_json: dict, og_id: str) -> dict:
         else:
             pseudo_pvalue = 1.0
 
-        log.debug("  MEME %s: %d/%d sites selected, mean_beta+=%.2f, pseudo_dnds=%.3f",
-                  og_id, len(selected_sites), n_sites, mean_beta_plus, pseudo_dnds)
+        # Identify which resistant/target branches carry the elevated signal.
+        # Kept separate from per-site filtering so raw MEME output is untouched.
+        resistant_branches = _extract_meme_resistant_branches(meme_json)
+
+        log.debug("  MEME %s: %d/%d sites selected, mean_beta+=%.2f, pseudo_dnds=%.3f, "
+                  "resistant_branches=%s",
+                  og_id, len(selected_sites), n_sites, mean_beta_plus, pseudo_dnds,
+                  resistant_branches)
 
         return {
             "dnds_ratio": round(pseudo_dnds, 4),
             "dnds_pvalue": round(pseudo_pvalue, 6),
             "selection_model": "MEME_episodic",
-            "branches_under_selection": [],  # MEME is site-level, not branch-level
+            "branches_under_selection": resistant_branches,
             "fraction_sites_selected": round(fraction_selected, 4),
             "n_sites_selected": len(selected_sites),
             "mean_beta_plus": round(mean_beta_plus, 4),
@@ -656,6 +826,125 @@ def _meme_null_result(og_id: str) -> dict:
         "n_sites_selected": 0,
         "mean_beta_plus": 0.0,
     }
+
+
+# ---------------------------------------------------------------------------
+# FUBAR — Fast Unconstrained Bayesian AppRoximation (pervasive selection pre-screen)
+# ---------------------------------------------------------------------------
+
+def run_fubar(
+    codon_aln: dict[str, str],
+    tree_newick: str,
+    og_id: str,
+) -> Optional[dict]:
+    """Run HyPhy FUBAR on a codon alignment.
+
+    FUBAR is ~10-20x faster than MEME and detects *pervasive* positive selection.
+    Used as a pre-screen: only OGs where FUBAR finds signal are sent to MEME.
+    """
+    tools = get_tool_config()
+    hyphy_bin = tools.get("hyphy_bin", "hyphy")
+
+    root = Path(get_local_storage_root())
+    fubar_dir = root / "fubar" / og_id
+    fubar_dir.mkdir(parents=True, exist_ok=True)
+
+    aln_path = fubar_dir / "codon_aln.fna"
+    tree_path = fubar_dir / "species.treefile"
+    out_path = fubar_dir / "fubar.json"
+
+    if out_path.exists() and out_path.stat().st_size > 0:
+        try:
+            return json.loads(out_path.read_text())
+        except Exception:
+            pass
+
+    with open(aln_path, "w") as f:
+        seen_species = set()
+        for label, seq in codon_aln.items():
+            species = label.split("|")[0]
+            if species in seen_species:
+                continue
+            seen_species.add(species)
+            f.write(f">{species}\n{seq}\n")
+    tree_path.write_text(tree_newick)
+
+    cpus = int(os.environ.get("HYPHY_CPUS", 1))
+    hyphy_env = {**os.environ, "CPU": str(cpus)}
+
+    try:
+        cmd = [
+            hyphy_bin, "fubar",
+            "--alignment", str(aln_path),
+            "--tree", str(tree_path),
+            "--output", str(out_path),
+        ]
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=120, env=hyphy_env)
+        if result.returncode != 0:
+            log.debug("FUBAR failed for %s (rc=%d)", og_id, result.returncode)
+            return None
+        if not out_path.exists():
+            return None
+        return json.loads(out_path.read_text())
+    except subprocess.TimeoutExpired:
+        log.debug("FUBAR timed out for %s", og_id)
+        return None
+    except Exception as exc:
+        log.debug("FUBAR error for %s: %s", og_id, exc)
+        return None
+
+
+def parse_fubar_results(fubar_json: dict) -> dict:
+    """Count sites under pervasive positive selection from HyPhy FUBAR output.
+
+    Returns {"fubar_pos_sites": int, "fubar_neg_sites": int}.
+    Positive selection: posterior probability > 0.9 that beta > alpha.
+    """
+    try:
+        mle = fubar_json.get("MLE", {})
+        mle_content = mle.get("content", {}).get("0", [])
+        if not mle_content:
+            return {"fubar_pos_sites": 0, "fubar_neg_sites": 0}
+
+        pos_sites = 0
+        neg_sites = 0
+        for site_data in mle_content:
+            if len(site_data) < 5:
+                continue
+            # FUBAR columns: [alpha, beta, beta-alpha, Prob(alpha<beta), Prob(alpha>beta)]
+            prob_pos = site_data[3] if len(site_data) > 3 else 0
+            prob_neg = site_data[4] if len(site_data) > 4 else 0
+            if prob_pos is not None and prob_pos > 0.9:
+                pos_sites += 1
+            if prob_neg is not None and prob_neg > 0.9:
+                neg_sites += 1
+
+        return {"fubar_pos_sites": pos_sites, "fubar_neg_sites": neg_sites}
+    except Exception as exc:
+        log.debug("FUBAR parse error: %s", exc)
+        return {"fubar_pos_sites": 0, "fubar_neg_sites": 0}
+
+
+def _codon_aln_passes_qc(codon_aln: dict[str, str], og_id: str) -> bool:
+    """Pre-flight QC: reject alignments that will waste time in MEME."""
+    if len(codon_aln) < 3:
+        log.debug("Skipping %s: only %d sequences", og_id, len(codon_aln))
+        return False
+
+    aln_len = len(next(iter(codon_aln.values()), ""))
+    n_codons = aln_len // 3
+    if n_codons < 100:
+        log.debug("Skipping %s: only %d codons (need ≥100)", og_id, n_codons)
+        return False
+
+    total_chars = sum(len(s) for s in codon_aln.values())
+    total_gaps = sum(s.count("-") for s in codon_aln.values())
+    gap_frac = total_gaps / total_chars if total_chars else 1.0
+    if gap_frac > 0.40:
+        log.debug("Skipping %s: %.0f%% gaps in alignment", og_id, gap_frac * 100)
+        return False
+
+    return True
 
 
 # ---------------------------------------------------------------------------
@@ -695,7 +984,7 @@ def run_fel(
             f.write(f">{species}\n{seq}\n")
     tree_path.write_text(tree_newick)
 
-    cpus = os.cpu_count() or 4
+    cpus = int(os.environ.get("HYPHY_CPUS", 1))
     hyphy_env = {**os.environ, "CPU": str(cpus)}
 
     try:
@@ -706,7 +995,7 @@ def run_fel(
             "--output", str(out_path),
             "--full-model", "No",
         ]
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=1800, env=hyphy_env)
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=600, env=hyphy_env)
         if result.returncode != 0:
             log.warning("FEL failed for %s (rc=%d): %s", og_id, result.returncode, result.stderr[:300])
             return None
@@ -725,23 +1014,41 @@ def run_fel(
 def parse_fel_results(fel_json: dict) -> dict:
     """Count sites under pervasive positive selection from HyPhy FEL output.
 
+    Dynamically detects column positions from FEL JSON headers to handle
+    format differences across HyPhy versions (2.5.33+ added an extra column).
+
     Returns {"fel_sites": int} — count of sites with dN > dS at p < 0.05.
     """
     try:
-        mle_content = fel_json.get("MLE", {}).get("content", {}).get("0", [])
+        mle = fel_json.get("MLE", {})
+        mle_content = mle.get("content", {}).get("0", [])
         if not mle_content:
             return {"fel_sites": 0}
 
+        headers = mle.get("headers", [])
+        header_names = [h[0].lower() if isinstance(h, list) else str(h).lower() for h in headers]
+
+        alpha_idx = 0
+        beta_idx = 1
+        pvalue_idx = 4
+
+        for i, name in enumerate(header_names):
+            if "alpha" in name:
+                alpha_idx = i
+            elif "beta" in name and "alpha" not in name:
+                beta_idx = i
+            elif "p-value" in name or name == "p-value" or "p_value" in name:
+                pvalue_idx = i
+
         pos_sites = 0
         for site_data in mle_content:
-            # FEL MLE columns: [alpha (dS), beta (dN), LRT, p-value, ...]
-            if len(site_data) < 4:
+            if len(site_data) <= max(alpha_idx, beta_idx, pvalue_idx):
                 continue
-            alpha = site_data[0]  # synonymous rate
-            beta = site_data[1]   # non-synonymous rate
-            pvalue = site_data[3]
+            alpha = site_data[alpha_idx]
+            beta = site_data[beta_idx]
+            pvalue = site_data[pvalue_idx]
             if pvalue is not None and pvalue < 0.05 and beta is not None and alpha is not None:
-                if beta > alpha:  # dN > dS = positive selection
+                if beta > alpha:
                     pos_sites += 1
 
         return {"fel_sites": pos_sites}
@@ -789,7 +1096,7 @@ def run_busted(
             f.write(f">{species}\n{seq}\n")
     tree_path.write_text(tree_newick)
 
-    cpus = os.cpu_count() or 4
+    cpus = int(os.environ.get("HYPHY_CPUS", 1))
     hyphy_env = {**os.environ, "CPU": str(cpus)}
 
     try:
@@ -798,9 +1105,9 @@ def run_busted(
             "--alignment", str(aln_path),
             "--tree", str(tree_path),
             "--output", str(out_path),
-            "--srv", "No",
+            "--srv", "Yes",
         ]
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=1800, env=hyphy_env)
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=600, env=hyphy_env)
         if result.returncode != 0:
             log.warning("BUSTED failed for %s (rc=%d): %s", og_id, result.returncode, result.stderr[:300])
             return None
@@ -847,8 +1154,6 @@ def _fel_busted_worker(args: tuple) -> tuple[str, dict]:
     from Bio import SeqIO as _SeqIO
 
     root = get_local_storage_root()
-    species_ids = [label.split("|")[0] for label in aligned_seqs]
-    pruned_tree = prune_tree_to_species(_Path(species_treefile_str), species_ids)
 
     codon_aln_path = _Path(root) / "meme" / og_id / "codon_aln.fna"
     codon_aln = None
@@ -872,8 +1177,11 @@ def _fel_busted_worker(args: tuple) -> tuple[str, dict]:
     if codon_aln is None:
         return og_id, {}
 
-    fel_json = run_fel(codon_aln, pruned_tree, og_id)
-    busted_json = run_busted(codon_aln, pruned_tree, og_id)
+    species_ids = [label.split("|")[0] for label in codon_aln]
+    tree = prune_tree_to_species(_Path(species_treefile_str), species_ids)
+
+    fel_json = run_fel(codon_aln, tree, og_id)
+    busted_json = run_busted(codon_aln, tree, og_id)
     fel_result = parse_fel_results(fel_json) if fel_json else {"fel_sites": 0}
     busted_result = parse_busted_results(busted_json) if busted_json else {"busted_pvalue": 1.0}
     return og_id, {**fel_result, **busted_result}
@@ -979,23 +1287,71 @@ def _get_already_scored_fel_busted_ogs(og_ids: list[str]) -> set[str]:
 # RELAX — Branch-specific rate acceleration / relaxation
 # ---------------------------------------------------------------------------
 
+_relax_branch_cache: Optional[tuple[set[str], set[str], set[str]]] = None
+
+
+def _get_relax_branch_sets() -> tuple[set[str], set[str], set[str]]:
+    """Return (test_set, reference_set, outgroup_set) derived from the Species DB table.
+
+    Classification is driven entirely by the species registry — no hardcoded
+    species names — so this works correctly when the phenotype or species panel
+    changes.
+
+    Test      = species with the target phenotype (not baseline / control / outgroup)
+    Reference = species with is_control=True OR 'baseline' in phenotypes
+    Outgroup  = species with 'outgroup' in phenotypes (folded into Reference for RELAX,
+                which requires every branch to be labeled)
+    """
+    global _relax_branch_cache
+    if _relax_branch_cache is not None:
+        return _relax_branch_cache
+
+    test: set[str] = set()
+    reference: set[str] = set()
+    outgroup: set[str] = set()
+
+    try:
+        with get_session() as session:
+            rows = session.query(Species.id, Species.phenotypes, Species.is_control).all()
+        for sp_id, phenotypes, is_ctrl in rows:
+            phenotypes = phenotypes or []
+            if "outgroup" in phenotypes:
+                outgroup.add(sp_id)
+            elif is_ctrl or "baseline" in phenotypes:
+                reference.add(sp_id)
+            else:
+                test.add(sp_id)
+    except Exception as exc:
+        log.warning("Could not load RELAX branch sets from DB: %s", exc)
+
+    _relax_branch_cache = (test, reference, outgroup)
+    return _relax_branch_cache
+
+
 def run_relax(
     codon_aln: dict[str, str],
     tree_newick: str,
     og_id: str,
     test_branches: Optional[list[str]] = None,
+    reference_branches: Optional[list[str]] = None,
 ) -> Optional[dict]:
     """Run HyPhy RELAX on a codon alignment to detect branch-specific rate shifts.
 
     RELAX compares the *intensity* of selection (the k parameter) between
-    test branches (resilient species) and reference branches (human + outgroups).
-    k > 1 → selection intensified (acceleration); k < 1 → relaxation.
+    Test branches (trait-selected species) and Reference branches
+    (baseline + control + outgroup species).
+    k > 1 → selection intensified; k < 1 → relaxation.
+
+    Branch classification is registry-driven: Test = species carrying the target
+    phenotype; Reference = baseline / control / outgroup species.  HyPhy requires
+    every branch to be labeled, so outgroup species are folded into Reference.
 
     Args:
         codon_aln: {label: codon_sequence}
         tree_newick: newick tree string
         og_id: orthogroup ID (for output directory)
-        test_branches: species labels to mark as 'test'; defaults to all non-human
+        test_branches: override Test labels (default: registry-derived)
+        reference_branches: override Reference labels (default: registry-derived)
 
     Returns:
         Raw RELAX JSON dict or None on failure.
@@ -1029,16 +1385,34 @@ def run_relax(
             species_labels.append(species)
             f.write(f">{species}\n{seq}\n")
 
+    test_set, reference_set, outgroup_set = _get_relax_branch_sets()
     if test_branches is None:
-        test_branches = [sp for sp in species_labels if sp != "human"]
+        test_branches = [sp for sp in species_labels if sp in test_set]
+    if reference_branches is None:
+        # Outgroups fold into Reference: HyPhy errors on unlabeled branches.
+        reference_branches = [sp for sp in species_labels if sp in reference_set | outgroup_set]
+        # Any remaining species not in either set default to Reference (safe fallback).
+        labeled = set(test_branches) | set(reference_branches)
+        unlabeled = [sp for sp in species_labels if sp not in labeled]
+        if unlabeled:
+            log.debug("RELAX %s: %d unlabeled species defaulting to Reference: %s",
+                      og_id, len(unlabeled), unlabeled)
+            reference_branches.extend(unlabeled)
+
+    if len(test_branches) < 1 or len(reference_branches) < 1:
+        log.info("RELAX %s: need ≥1 test and ≥1 reference branch, got %d/%d",
+                 og_id, len(test_branches), len(reference_branches))
+        return None
 
     labeled_tree = tree_newick
     for branch in sorted(test_branches, key=len, reverse=True):
         labeled_tree = labeled_tree.replace(f"{branch}:", f"{branch}{{Test}}:")
+    for branch in sorted(reference_branches, key=len, reverse=True):
+        labeled_tree = labeled_tree.replace(f"{branch}:", f"{branch}{{Reference}}:")
 
     tree_path.write_text(labeled_tree)
 
-    cpus = os.cpu_count() or 4
+    cpus = int(os.environ.get("HYPHY_CPUS", 1))
     hyphy_env = {**os.environ, "CPU": str(cpus)}
 
     cmd = [
@@ -1047,15 +1421,15 @@ def run_relax(
         "--tree", str(tree_path),
         "--output", str(out_path),
         "--test", "Test",
-        "--models", "Minimal",
-        "--quiet",
+        # --models Minimal removed: flag only exists in HyPhy >= 2.5.50; older builds exit rc=1
+        # --quiet removed: was swallowing all HyPhy error output, making failures invisible
     ]
     try:
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=1800, check=False, env=hyphy_env)
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=600, check=False, env=hyphy_env)
         if result.returncode != 0 or not out_path.exists():
-            log.warning("RELAX failed for %s (rc=%d): %s",
+            log.warning("RELAX failed for %s (rc=%d): stdout=%s stderr=%s",
                         og_id, result.returncode if hasattr(result, 'returncode') else -1,
-                        result.stderr[:200])
+                        result.stdout[:300], result.stderr[:300])
             return None
         with open(out_path) as f:
             return json.load(f)
@@ -1100,9 +1474,10 @@ def _relax_worker(args: tuple) -> tuple[str, Optional[dict]]:
     if not codon_aln:
         return og_id, None
 
-    species_ids = [label.split("|")[0] for label in aligned_seqs]
-    pruned_tree = prune_tree_to_species(_Path(species_treefile_str), species_ids)
-    relax_json = run_relax(codon_aln, pruned_tree, og_id)
+    species_ids = [label.split("|")[0] for label in codon_aln]
+    tree = prune_tree_to_species(_Path(species_treefile_str), species_ids)
+
+    relax_json = run_relax(codon_aln, tree, og_id)
     if relax_json is not None:
         return og_id, parse_relax_results(relax_json)
     return og_id, None
@@ -1208,14 +1583,23 @@ def _get_already_scored_relax_ogs(og_ids: list[str]) -> set[str]:
 # ---------------------------------------------------------------------------
 
 def _meme_worker(args: tuple) -> tuple[str, Optional[dict]]:
-    """Top-level worker: run MEME (or aBSREL proxy) for one orthogroup."""
+    """Top-level worker: FUBAR pre-screen → MEME (or aBSREL proxy).
+
+    Two-tier strategy:
+      1. Run FUBAR (~10-30s) to detect pervasive selection signal.
+      2. Only run MEME (~2-10min) if FUBAR finds ≥1 positively selected site,
+         OR if the alignment passes QC but FUBAR is inconclusive.
+      3. Fall back to protein aBSREL proxy if CDS unavailable.
+
+    Uses pruned species tree — HyPhy re-optimizes branch lengths internally,
+    so the species tree topology (well-resolved with 1000 bootstraps) is
+    sufficient and avoids noisy per-gene tree inference on small alignments.
+    """
     og_id, aligned_seqs, species_treefile_str, motifs_by_og = args
     from pipeline.layer2_evolution.phylo_tree import prune_tree_to_species
     from pipeline.layer2_evolution.selection import (
         _should_run_hyphy, parse_absrel_results, run_absrel, write_hyphy_input,
     )
-    species_ids = [label.split("|")[0] for label in aligned_seqs]
-    pruned_tree = prune_tree_to_species(Path(species_treefile_str), species_ids)
 
     cds_seqs: dict[str, str] = {}
     for label in aligned_seqs:
@@ -1225,15 +1609,52 @@ def _meme_worker(args: tuple) -> tuple[str, Optional[dict]]:
         if cds:
             cds_seqs[label] = cds
 
+    cds_coverage = len(cds_seqs) / max(len(aligned_seqs), 1)
+    if len(cds_seqs) < len(aligned_seqs):
+        missing = [lbl for lbl in aligned_seqs if lbl not in cds_seqs]
+        log.debug(
+            "%s: CDS fetched for %d/%d species (%.0f%%); missing: %s — "
+            "building partial codon alignment",
+            og_id, len(cds_seqs), len(aligned_seqs), 100 * cds_coverage,
+            [lbl.split("|")[0] for lbl in missing],
+        )
+
+    # Build codon alignment from whatever species have CDS.
+    # protein_to_codon_alignment enforces min_coverage=0.60 and min_seqs=3 internally,
+    # so partial inputs are safe — it returns None if thresholds aren't met.
+    # Previously required ALL species to have CDS (strict equality), which silently
+    # skipped the entire orthogroup whenever any reference species CDS failed.
     codon_aln = None
-    if len(cds_seqs) == len(aligned_seqs):
+    if cds_seqs:
         codon_aln = protein_to_codon_alignment(aligned_seqs, cds_seqs)
 
     if codon_aln is not None:
-        meme_json = run_meme(codon_aln, pruned_tree, og_id)
-        if meme_json is not None:
-            return og_id, ("meme", parse_meme_results(meme_json, og_id))
+        if not _codon_aln_passes_qc(codon_aln, og_id):
+            return og_id, None
 
+        species_ids = [label.split("|")[0] for label in codon_aln]
+        gene_tree = prune_tree_to_species(Path(species_treefile_str), species_ids)
+
+        # FUBAR pre-screen: fast Bayesian scan for any selection signal
+        fubar_json = run_fubar(codon_aln, gene_tree, og_id)
+        fubar_result = parse_fubar_results(fubar_json) if fubar_json else {"fubar_pos_sites": 0}
+        run_full_meme = fubar_result.get("fubar_pos_sites", 0) > 0
+
+        if run_full_meme:
+            meme_json = run_meme(codon_aln, gene_tree, og_id)
+            if meme_json is not None:
+                return og_id, ("meme", parse_meme_results(meme_json, og_id))
+        else:
+            log.debug("FUBAR found no signal for %s — skipping MEME", og_id)
+
+        # If FUBAR found no signal but we have good codon alignment, still record
+        # the FUBAR result as a weak negative
+        if not run_full_meme:
+            return og_id, ("fubar_only", _meme_null_result(og_id))
+
+    # Fallback: protein-based aBSREL proxy
+    species_ids = [label.split("|")[0] for label in aligned_seqs]
+    pruned_tree = prune_tree_to_species(Path(species_treefile_str), species_ids)
     aln_path, tree_path = write_hyphy_input(og_id, aligned_seqs, pruned_tree)
     raw_result = run_absrel(aln_path, tree_path, og_id)
     if raw_result is not None:
@@ -1272,6 +1693,7 @@ def run_meme_pipeline(
     total = len(candidates)
     all_results: dict[str, dict] = {}
     meme_success = 0
+    fubar_only = 0
     proxy_fallback = 0
     done = 0
     pending_flush: dict[str, dict] = {}
@@ -1293,13 +1715,15 @@ def run_meme_pipeline(
                 all_results[og_id] = parsed
                 if kind == "meme":
                     meme_success += 1
+                elif kind == "fubar_only":
+                    fubar_only += 1
                 else:
                     proxy_fallback += 1
             if done % 100 == 0 or done == total:
-                log.info("  MEME: %d / %d orthogroups (%.0f%%) — %d MEME, %d proxy, %d failed.",
+                log.info("  MEME: %d / %d (%.0f%%) — %d MEME, %d FUBAR-only, %d proxy, %d failed.",
                          done, total, 100 * done / total,
-                         meme_success, proxy_fallback, done - meme_success - proxy_fallback)
-            # Flush to DB periodically
+                         meme_success, fubar_only, proxy_fallback,
+                         done - meme_success - fubar_only - proxy_fallback)
             if flush_callback and len(pending_flush) >= _FLUSH_INTERVAL:
                 try:
                     flush_callback(pending_flush)
@@ -1315,8 +1739,9 @@ def run_meme_pipeline(
         except Exception as exc:
             log.warning("MEME final flush failed: %s", exc)
 
-    log.info("MEME complete: %d MEME, %d proxy fallback, %d failed.",
-             meme_success, proxy_fallback, total - meme_success - proxy_fallback)
+    log.info("MEME complete: %d MEME, %d FUBAR-only, %d proxy, %d failed.",
+             meme_success, fubar_only, proxy_fallback,
+             total - meme_success - fubar_only - proxy_fallback)
 
     # Apply Benjamini-Hochberg FDR correction across all site-level p-values
     from pipeline.stats import apply_bh_to_meme_results
