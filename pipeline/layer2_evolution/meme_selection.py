@@ -1143,6 +1143,123 @@ def parse_busted_results(busted_json: dict) -> dict:
 
 
 # ---------------------------------------------------------------------------
+# BUSTED-PH — BUSTED restricted to foreground (phenotype-bearing) branches
+# ---------------------------------------------------------------------------
+
+def run_busted_ph(
+    codon_aln: dict[str, str],
+    tree_newick: str,
+    og_id: str,
+) -> Optional[dict]:
+    """Run HyPhy BUSTED restricted to test (phenotype-bearing) foreground branches.
+
+    This is the phenotype-specific equivalent of MEME — ~50-200x faster because
+    it computes a single gene-level LRT instead of per-site tests.  It answers:
+    "Is there evidence of positive selection specifically in the species that carry
+    the phenotype of interest?"
+
+    Implemented as standard HyPhy BUSTED with `--branches Test`, where test-species
+    branches are annotated `{Test}` in the Newick tree.  The LRT compares:
+      H0: the foreground rate distribution = background
+      H1: foreground is allowed a positive ω component (ω > 1)
+
+    Returns the parsed BUSTED JSON, or None on failure.
+    """
+    tools = get_tool_config()
+    hyphy_bin = tools.get("hyphy_bin", "hyphy")
+
+    root = Path(get_local_storage_root())
+    bph_dir = root / "busted_ph" / og_id
+    bph_dir.mkdir(parents=True, exist_ok=True)
+
+    aln_path = bph_dir / "codon_aln.fna"
+    tree_path = bph_dir / "species.treefile"
+    out_path = bph_dir / "busted_ph.json"
+
+    if out_path.exists() and out_path.stat().st_size > 0:
+        try:
+            return json.loads(out_path.read_text())
+        except Exception:
+            pass
+
+    with open(aln_path, "w") as f:
+        seen_species = set()
+        for label, seq in codon_aln.items():
+            species = label.split("|")[0]
+            if species in seen_species:
+                continue
+            seen_species.add(species)
+            f.write(f">{species}\n{seq}\n")
+
+    # Label test-phenotype branches with {Test} so BUSTED can restrict to them.
+    # Reference and outgroup branches are unlabeled (treated as background).
+    test_set, _ref, _out = _get_relax_branch_sets()
+    species_in_aln = [label.split("|")[0] for label in codon_aln if label.split("|")[0] not in
+                      {s for s, _ in [(lbl.split("|")[0], 1) for lbl in list(codon_aln.keys())[1:]]}]
+    # Use all species names that appear in the alignment
+    all_aln_species = list({label.split("|")[0] for label in codon_aln})
+    test_branches = [sp for sp in all_aln_species if sp in test_set]
+
+    if not test_branches:
+        log.info("BUSTED-PH %s: no test branches in alignment — skipping", og_id)
+        return None
+
+    labeled_tree = tree_newick
+    for branch in sorted(test_branches, key=len, reverse=True):
+        labeled_tree = labeled_tree.replace(f"{branch}:", f"{branch}{{Test}}:")
+    tree_path.write_text(labeled_tree)
+
+    cpus = int(os.environ.get("HYPHY_CPUS", 1))
+    hyphy_env = {**os.environ, "CPU": str(cpus)}
+
+    try:
+        cmd = [
+            hyphy_bin, "busted",
+            "--alignment", str(aln_path),
+            "--tree", str(tree_path),
+            "--output", str(out_path),
+            "--branches", "Test",
+            "--srv", "Yes",
+        ]
+        log.info("Running BUSTED-PH for %s (CPU=%d)", og_id, cpus)
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=600, env=hyphy_env)
+        if result.returncode != 0:
+            log.warning("BUSTED-PH failed for %s (rc=%d): %s",
+                        og_id, result.returncode, result.stderr[:300])
+            return None
+        if not out_path.exists():
+            log.warning("BUSTED-PH output missing for %s", og_id)
+            return None
+        return json.loads(out_path.read_text())
+    except subprocess.TimeoutExpired:
+        log.warning("BUSTED-PH timed out for %s (>600s)", og_id)
+        return None
+    except Exception as exc:
+        log.warning("BUSTED-PH error for %s: %s", og_id, exc)
+        return None
+
+
+def parse_busted_ph_results(busted_ph_json: dict) -> dict:
+    """Extract phenotype-specific gene-level p-value from BUSTED-PH output.
+
+    Returns {"busted_ph_pvalue": float} — p-value for positive selection
+    specifically in the foreground (phenotype-bearing) branches.
+    """
+    try:
+        pvalue = (
+            busted_ph_json
+            .get("test results", {})
+            .get("p-value")
+        )
+        if pvalue is None:
+            return {"busted_ph_pvalue": 1.0}
+        return {"busted_ph_pvalue": round(float(pvalue), 6)}
+    except Exception as exc:
+        log.debug("BUSTED-PH parse error: %s", exc)
+        return {"busted_ph_pvalue": 1.0}
+
+
+# ---------------------------------------------------------------------------
 # FEL + BUSTED pipeline entry point
 # ---------------------------------------------------------------------------
 

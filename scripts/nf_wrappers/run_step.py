@@ -344,6 +344,12 @@ def run_step6_all_collect(args):
         if r.get("status") in ("no_codon_alignment", "meme_failed", "skipped", "not_in_aligned"):
             continue
 
+        # Map busted_ph_pvalue → dnds_pvalue so it scores via existing DB field.
+        # selection_model="busted_ph" lets scoring.py distinguish from MEME results.
+        if "busted_ph_pvalue" in r:
+            r["dnds_pvalue"] = r["busted_ph_pvalue"]
+            r["dnds_ratio"] = 0.0  # not applicable for BUSTED-PH
+
         meme_batch[og_id] = r
 
         if "fel_sites" in r or "busted_pvalue" in r:
@@ -393,7 +399,7 @@ def run_step6_batch(args):
         load_cds_cache_pkl,
         fetch_cds_for_protein,
         protein_to_codon_alignment,
-        run_meme, parse_meme_results,
+        run_busted_ph, parse_busted_ph_results,
         run_fel, parse_fel_results,
         run_busted, parse_busted_results,
         run_relax, parse_relax_results,
@@ -473,34 +479,19 @@ def run_step6_batch(args):
             pruned_tree = prune_tree_to_species(treefile, codon_species)
 
             with ThreadPoolExecutor(max_workers=4) as executor:
-                fut_meme = executor.submit(run_meme, codon_aln, pruned_tree, og_id)
+                fut_busted_ph = executor.submit(run_busted_ph, codon_aln, pruned_tree, og_id)
                 fut_fel = executor.submit(run_fel, codon_aln, pruned_tree, og_id)
                 fut_busted = executor.submit(run_busted, codon_aln, pruned_tree, og_id)
                 fut_relax = executor.submit(run_relax, codon_aln, pruned_tree, og_id)
 
-                meme_json = fut_meme.result()
+                busted_ph_json = fut_busted_ph.result()
                 fel_json = fut_fel.result()
                 busted_json = fut_busted.result()
                 relax_json = fut_relax.result()
 
-            if meme_json is not None:
-                result.update(parse_meme_results(meme_json, og_id))
-                result["selection_model"] = "meme"
-                meme_local = Path(get_local_storage_root()) / "meme" / og_id
-                for fname in ("codon_aln.fna", "meme.json"):
-                    src = meme_local / fname
-                    if src.exists():
-                        shutil.copy2(src, og_out / fname)
-                gene_tree_dir = Path(get_local_storage_root()) / "gene_trees" / og_id
-                src_tree = gene_tree_dir / "gene.treefile"
-                if src_tree.exists():
-                    shutil.copy2(src_tree, og_out / "gene.treefile")
-            else:
-                result["status"] = "meme_failed"
-                meme_local = Path(get_local_storage_root()) / "meme" / og_id
-                src = meme_local / "codon_aln.fna"
-                if src.exists():
-                    shutil.copy2(src, og_out / "codon_aln.fna")
+            busted_ph_parsed = parse_busted_ph_results(busted_ph_json) if busted_ph_json else {"busted_ph_pvalue": 1.0}
+            result["busted_ph_pvalue"] = busted_ph_parsed.get("busted_ph_pvalue", 1.0)
+            result["selection_model"] = "busted_ph" if busted_ph_json is not None else "no_busted_ph"
 
             result["fel_sites"] = parse_fel_results(fel_json).get("fel_sites", 0) if fel_json else 0
             result["busted_pvalue"] = parse_busted_results(busted_json).get("busted_pvalue", 1.0) if busted_json else 1.0

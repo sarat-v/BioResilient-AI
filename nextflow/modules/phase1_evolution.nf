@@ -182,9 +182,8 @@ process run_meme {
 
     script:
     """
-    echo "hyphy_v17_spot_4cpu_batch10"
-    export HYPHY_CPUS=1          # 1 CPU per tool: 4 tools × 1 = 4 total (matches task.cpus=4)
-    export MEME_TIMEOUT=600      # 10 min per OG; dedicated CPU so it can complete within 2h batch limit
+    echo "hyphy_v18_spot_bustedph_batch10"
+    export HYPHY_CPUS=1          # 1 CPU per tool: 4 tools × 1 = 4 total (BUSTED-PH+FEL+BUSTED+RELAX)
     mkdir -p '${og_batch.baseName}'
     python -m scripts.nf_wrappers.run_step \
         --step step6_batch \

@@ -108,27 +108,31 @@ def selection_score(
     relax_k: Optional[float] = None,
     relax_pvalue: Optional[float] = None,
     branches_under_selection: Optional[list[str]] = None,
+    selection_model: Optional[str] = None,
 ) -> float:
-    """Score in [0, 1] combining MEME dN/dS, FEL, BUSTED, and RELAX signals.
+    """Score in [0, 1] combining BUSTED-PH, FEL, BUSTED, and RELAX signals.
 
-    Combined formula (when all tests present):
-        selection_score = 0.40 × meme + 0.25 × fel + 0.20 × busted + 0.15 × relax
+    Weights (BUSTED-PH replaces MEME as the primary phenotype-specific signal):
+        FEL       35%  — pervasive positive selection (site-level, all lineages)
+        BUSTED    30%  — gene-wide episodic selection (any lineage)
+        BUSTED-PH 25%  — phenotype-specific episodic selection (foreground only)
+        RELAX     10%  — selection intensity shift in test vs reference branches
+
+    BUSTED-PH p-value is stored in dnds_pvalue when selection_model="busted_ph".
+    Legacy MEME results (selection_model="meme") are scored with MEME weight for
+    backward compatibility, but weighted at 25% (same slot as BUSTED-PH).
 
     RELAX component rewards significant branch-specific acceleration (k > 1):
-        relax_score = min(-log10(p) / 10, 1.0) × min((k - 1) / 2.0, 1.0)  if k > 1
-
-    Phenotype specificity (branches_under_selection):
-        If provided, the MEME sub-score is scaled by a specificity weight
-        = 0.5 + 0.5 × (resistant_branches / total_branches_under_selection).
-        Range [0.5, 1.0]: full score when all branches are target-phenotype species;
-        50% floor when none are (keeps evolvable-but-non-specific genes visible in
-        the raw output while pushing them down in the ranking).  When
-        branches_under_selection is empty or None the multiplier is 1.0 (no change).
+        relax_score = min(-log10(p) / 10, 1.0) × min((k - 1) / 2.0, 1.0)
     """
-    # --- MEME component ---
-    if dnds_ratio is None or dnds_pvalue is None:
-        meme_score = 0.0
-    else:
+    # --- BUSTED-PH / MEME component (phenotype-specific, stored in dnds_pvalue) ---
+    # New runs: selection_model="busted_ph", dnds_pvalue = BUSTED-PH foreground p-value
+    # Legacy:   selection_model="meme",      dnds_pvalue = MEME pseudo p-value
+    pheno_score = 0.0
+    if dnds_pvalue is not None and 0 < dnds_pvalue <= 1:
+        pheno_score = round(min(-math.log10(dnds_pvalue) / 10.0, 1.0), 4)
+    elif selection_model == "meme" and dnds_ratio is not None and dnds_pvalue is not None:
+        # Legacy MEME: blend ratio + p-value
         dnds_norm = min(dnds_ratio / 5.0, 1.0)
         if dnds_pvalue <= 0:
             pval_weight = 1.0
@@ -136,32 +140,29 @@ def selection_score(
             pval_weight = 0.0
         else:
             pval_weight = min(-math.log10(dnds_pvalue) / 10.0, 1.0)
-        meme_score = round(0.5 * dnds_norm + 0.5 * pval_weight, 4)
+        pheno_score = round(0.5 * dnds_norm + 0.5 * pval_weight, 4)
+        # Legacy MEME specificity multiplier
+        if pheno_score > 0 and branches_under_selection:
+            test_set = _get_test_species()
+            if test_set:
+                resistant_count = sum(1 for b in branches_under_selection if b in test_set)
+                resistant_frac = resistant_count / len(branches_under_selection)
+                pheno_score = round(pheno_score * (0.5 + 0.5 * resistant_frac), 4)
 
-    # Phenotype-specificity multiplier: reward MEME signal on target-phenotype branches.
-    # Raw MEME output (dnds_ratio, dnds_pvalue, full branches list) is preserved in DB
-    # exactly as HyPhy produced it — only the scoring weight changes.
-    if meme_score > 0 and branches_under_selection:
-        test_set = _get_test_species()
-        if test_set:
-            resistant_count = sum(1 for b in branches_under_selection if b in test_set)
-            resistant_frac = resistant_count / len(branches_under_selection)
-            meme_score = round(meme_score * (0.5 + 0.5 * resistant_frac), 4)
-
-    # If no supplementary tests available, scale by MEME weight to avoid inflation
+    # If no supplementary tests, return phenotype score scaled down
     if fel_sites is None and busted_pvalue is None and relax_k is None:
-        return round(meme_score * 0.65, 4)
+        return round(pheno_score * 0.65, 4)
 
-    # --- FEL component ---
+    # --- FEL component (35%) ---
     fel_score = round(min(fel_sites / 10.0, 1.0), 4) if fel_sites and fel_sites > 0 else 0.0
 
-    # --- BUSTED component ---
+    # --- BUSTED gene-wide component (30%) ---
     if busted_pvalue is not None and 0 < busted_pvalue <= 1:
         busted_score = round(min(-math.log10(busted_pvalue) / 10.0, 1.0), 4)
     else:
         busted_score = 0.0
 
-    # --- RELAX component: intensification (k>1) with p-value significance ---
+    # --- RELAX component (10%): intensification (k>1) with p-value significance ---
     if relax_k is not None and relax_k > 1.0 and relax_pvalue is not None and 0 < relax_pvalue <= 1:
         k_component = min((relax_k - 1.0) / 2.0, 1.0)
         p_component = min(-math.log10(relax_pvalue) / 10.0, 1.0)
@@ -169,7 +170,7 @@ def selection_score(
     else:
         relax_score = 0.0
 
-    return round(0.40 * meme_score + 0.25 * fel_score + 0.20 * busted_score + 0.15 * relax_score, 4)
+    return round(0.35 * fel_score + 0.30 * busted_score + 0.25 * pheno_score + 0.10 * relax_score, 4)
 
 
 def expression_score_from_db(gene_id: str, session) -> float:
