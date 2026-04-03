@@ -43,13 +43,15 @@ process download_proteomes {
         --db-url '${params.db_url}' \
         --storage-root '${params.storage_root}' \
         --ncbi-api-key '${params.ncbi_api_key ?: ""}'
-    # Ensure proteomes dir exists (may be empty symlink if step was skipped)
-    STORAGE=\$(python -c "from pipeline.config import get_local_storage_root; print(get_local_storage_root())" 2>/dev/null || echo ".")
-    if [ -d "\$STORAGE/proteomes" ]; then
-        ln -sf "\$STORAGE/proteomes" proteomes
-    else
-        mkdir -p proteomes
-    fi
+    # Sync proteomes from S3 storage so downstream processes have real FASTA files.
+    # S3 has no real directories — an empty mkdir has no objects and Nextflow Fusion
+    # cannot find the output. Syncing (or placing a sentinel) creates real S3 objects.
+    mkdir -p proteomes
+    aws s3 sync '${params.storage_root}/proteomes/' proteomes/ \
+        --quiet 2>/dev/null \
+        || echo "proteomes S3 sync skipped (will use sentinel)"
+    # Guarantee at least one S3 object so Nextflow recognises the prefix
+    [ "\$(ls proteomes/ 2>/dev/null | wc -l)" -gt 0 ] || echo "skipped" > proteomes/.step_skipped
     DATABASE_URL='${params.db_url}' BIORESILIENT_STORAGE_ROOT='${params.storage_root}' \
         python -m pipeline.step_reporter --step step2 || true
     """
@@ -74,12 +76,13 @@ process run_orthofinder {
         --skip-if-done \
         --db-url '${params.db_url}' \
         --storage-root '${params.storage_root}'
-    STORAGE=\$(python -c "from pipeline.config import get_local_storage_root; print(get_local_storage_root())" 2>/dev/null || echo ".")
-    if [ -d "\$STORAGE/orthofinder_out" ]; then
-        ln -sf "\$STORAGE/orthofinder_out" orthofinder_results
-    else
-        mkdir -p orthofinder_results
-    fi
+    # Provide orthofinder output dir for downstream (same S3-sentinel pattern as proteomes).
+    # Only sync the Orthogroups sub-dir — the full results tree can be many GB.
+    mkdir -p orthofinder_results
+    aws s3 sync '${params.storage_root}/orthofinder_out/OrthoFinder/' orthofinder_results/ \
+        --quiet --exclude '*' --include 'Results_*/Orthogroups/*' 2>/dev/null \
+        || echo "orthofinder S3 sync skipped"
+    [ "\$(ls orthofinder_results/ 2>/dev/null | wc -l)" -gt 0 ] || echo "skipped" > orthofinder_results/.step_skipped
     DATABASE_URL='${params.db_url}' BIORESILIENT_STORAGE_ROOT='${params.storage_root}' \
         python -m pipeline.step_reporter --step step3 || true
     """
