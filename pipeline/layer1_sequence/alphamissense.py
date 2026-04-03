@@ -419,15 +419,29 @@ def annotate_motif_consequences(
 ) -> int:
     """Annotate DivergentMotif rows with AlphaMissense consequence_score.
 
+    Two-phase approach to prevent deadlocks with concurrently-running steps
+    (e.g. step 4c ESM scoring also updates divergent_motif rows):
+
+      Phase 1 — read-only: compute scores in Python from in-memory AM index.
+                            No DB writes, no ORM autoflush, no row locks held.
+      Phase 2 — single atomic write: COPY scores to a temp table, then issue
+                            one bulk UPDATE.  Lock window is milliseconds, not
+                            minutes, eliminating circular-wait deadlocks.
+
     Args:
         am_index: Full in-memory AM index (from build_am_index()).
         gene_ids: Optional filter — only process these gene IDs.
 
     Returns number of motifs that received a consequence_score.
     """
-    scored = 0
+    import io
+    import os
 
-    # Build gene_id → accession map once (handles mnemonic resolution)
+    import psycopg2
+
+    # ── Phase 1: compute all scores in Python (zero DB writes) ──────────────
+
+    scored_pairs: list[tuple[str, float]] = []   # (motif_id, score)
     gene_accession_map = _get_gene_accession_map()
 
     with get_session() as session:
@@ -440,8 +454,8 @@ def annotate_motif_consequences(
         no_acc = 0
         no_data = 0
 
-        # Pre-fetch ALL human protein sequences in one query — avoids a per-gene
-        # Ortholog lookup that would issue 12,000+ round-trips to the DB.
+        # Pre-fetch ALL human protein sequences in one query — avoids 12,000+
+        # per-gene DB round-trips.
         human_prot_q = (
             session.query(Ortholog.gene_id, Ortholog.protein_seq)
             .filter(Ortholog.species_id == "human", Ortholog.protein_seq.isnot(None))
@@ -485,16 +499,51 @@ def annotate_motif_consequences(
                     protein_am,
                 )
                 if score is not None:
-                    motif.consequence_score = score
-                    scored += 1
+                    scored_pairs.append((str(motif.id), score))
 
-        session.commit()
+        # Session closes here with NO commits — only reads happened.
 
     if no_acc:
         log.info("  %d genes had no resolvable UniProt accession.", no_acc)
     if no_data:
         log.info("  %d genes had no AlphaMissense data (accession not in TSV).", no_data)
-    log.info("AlphaMissense annotation complete: %d motifs scored.", scored)
+
+    scored = len(scored_pairs)
+    if not scored_pairs:
+        log.info("AlphaMissense annotation: no motifs scored.")
+        return 0
+
+    # ── Phase 2: COPY → temp table → single bulk UPDATE ─────────────────────
+    log.info("Writing %d consequence scores via bulk COPY + UPDATE...", scored)
+
+    db_url = os.environ["DATABASE_URL"]
+    conn = psycopg2.connect(db_url)
+    try:
+        with conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "CREATE TEMP TABLE _am_scores "
+                    "(motif_id UUID, score DOUBLE PRECISION) ON COMMIT DROP"
+                )
+                buf = io.StringIO()
+                for motif_id, score in scored_pairs:
+                    buf.write(f"{motif_id}\t{score}\n")
+                buf.seek(0)
+                cur.copy_from(buf, "_am_scores", columns=("motif_id", "score"))
+                cur.execute(
+                    "UPDATE divergent_motif dm "
+                    "SET consequence_score = s.score "
+                    "FROM _am_scores s "
+                    "WHERE dm.id = s.motif_id"
+                )
+                updated = cur.rowcount
+    finally:
+        conn.close()
+
+    log.info(
+        "AlphaMissense annotation complete: %d motifs scored (%d DB rows updated).",
+        scored, updated,
+    )
     return scored
 
 
