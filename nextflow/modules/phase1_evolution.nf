@@ -20,18 +20,19 @@ process build_species_tree {
 
     script:
     """
-    # If treefile already exists in S3/storage, copy it and skip rebuilding
-    STORAGE=\$(python -c "from pipeline.config import get_local_storage_root; print(get_local_storage_root())" 2>/dev/null || echo ".")
-    if [ -f "\$STORAGE/phylo/species.treefile" ]; then
-        echo "step5: treefile already exists — skipping IQ-TREE2 rebuild."
-        cp "\$STORAGE/phylo/species.treefile" species.treefile
+    # If treefile already exists in S3 storage, download it and skip IQ-TREE2.
+    # STORAGE is an S3 URL on Fusion — use aws s3 cp, never plain cp/test -f.
+    if aws s3 cp '${params.storage_root}/phylo/species.treefile' species.treefile \
+           --quiet 2>/dev/null; then
+        echo "step5: treefile already in S3 — skipping IQ-TREE2 rebuild."
     else
         python -m scripts.nf_wrappers.run_step \
             --step step5 \
             --input-pkl '${aligned_pkl}' \
             --db-url '${params.db_url}' \
             --storage-root '${params.storage_root}'
-        cp "\$STORAGE/phylo/species.treefile" species.treefile
+        aws s3 cp '${params.storage_root}/phylo/species.treefile' species.treefile --quiet \
+            || { echo "ERROR: species.treefile not found after step5" >&2; exit 1; }
     fi
     DATABASE_URL='${params.db_url}' BIORESILIENT_STORAGE_ROOT='${params.storage_root}' \
         python -m pipeline.step_reporter --step step5 || true

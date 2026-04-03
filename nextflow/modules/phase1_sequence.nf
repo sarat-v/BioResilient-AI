@@ -161,16 +161,12 @@ process align_and_divergence {
         --db-url '${params.db_url}' \
         --storage-root '${params.storage_root}' \
         --output-dir '.'
-    # If skip-if-done exits 0 (step already complete), the pkl may already be in S3.
-    # Ensure the output file exists so Nextflow's output declaration is satisfied.
+    # If skip-if-done exited early, fetch the pkl from S3 storage.
+    # STORAGE is an S3 URL on Fusion — use aws s3 cp, never plain cp.
     if [ ! -f aligned_orthogroups.pkl ]; then
-        STORAGE=\$(python -c "from pipeline.config import get_local_storage_root; print(get_local_storage_root())" 2>/dev/null || echo ".")
-        if [ -f "\$STORAGE/cache/aligned_orthogroups.pkl" ]; then
-            cp "\$STORAGE/cache/aligned_orthogroups.pkl" aligned_orthogroups.pkl
-        else
-            echo "ERROR: aligned_orthogroups.pkl not found after step4 skip" >&2
-            exit 1
-        fi
+        aws s3 cp '${params.storage_root}/cache/aligned_orthogroups.pkl' aligned_orthogroups.pkl \
+            --quiet 2>/dev/null \
+            || { echo "ERROR: aligned_orthogroups.pkl not found in ${params.storage_root}/cache/" >&2; exit 1; }
     fi
     DATABASE_URL='${params.db_url}' BIORESILIENT_STORAGE_ROOT='${params.storage_root}' \
         python -m pipeline.step_reporter --step step4 || true
