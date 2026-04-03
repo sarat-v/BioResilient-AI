@@ -366,73 +366,64 @@ def classify_motif_direction(
 # ---------------------------------------------------------------------------
 
 def _bulk_update_via_sql(conn, loeuf_map: dict[str, Optional[float]]) -> int:
-    """Classify all motifs and write results in a single SQL UPDATE.
+    """Classify all motifs and write results via fetch → Python classify → COPY → UPDATE.
 
-    Strategy:
-      1. COPY loeuf values into a temp table _loeuf(gene_symbol TEXT, loeuf DOUBLE).
-      2. Run a single UPDATE divergent_motif SET motif_direction = CASE ... END
-         joined against the temp table.
+    Strategy (optimised for db.t4g.micro with 1GB RAM):
+      1. SELECT motif_id + scores + gene_symbol in one sequential scan (no JOIN in UPDATE).
+      2. Classify each row in Python using the fast classify_motif_direction() function.
+      3. COPY (motif_id, direction) into a temp table.
+      4. UPDATE divergent_motif by joining on motif_id (PK lookup — instant).
 
-    This avoids Python-level row iteration for the write path completely.
-    On 1.69M rows this takes ~30–60s on RDS vs ~3h for executemany.
-
-    Returns the number of rows updated.
+    This is faster than a SQL CTE UPDATE with 3-way JOIN on a bloated table because:
+    - The SELECT does one sequential scan; the UPDATE is pure PK index lookups.
+    - No 3-way JOIN in the UPDATE path — avoids repeated ortholog/gene scans.
+    - Python classification is trivial (~1μs/row for 1.69M rows ≈ 1-2s).
     """
     with conn.cursor() as cur:
-        # Build the LOEUF temp table
+        # Step 1: read all motifs + gene_symbol in one pass.
+        log.info("Fetching all motifs + gene_symbol for classification...")
         cur.execute("""
-            CREATE TEMP TABLE IF NOT EXISTS _loeuf_tmp (
-                gene_symbol TEXT PRIMARY KEY,
-                loeuf       DOUBLE PRECISION
+            SELECT dm.id, dm.esm1v_score, dm.consequence_score, g.gene_symbol
+            FROM   divergent_motif dm
+            JOIN   ortholog o ON o.id   = dm.ortholog_id
+            JOIN   gene     g ON g.id   = o.gene_id
+        """)
+        rows = cur.fetchall()
+        log.info("Fetched %d motifs. Classifying in Python...", len(rows))
+
+    # Step 2: classify in Python — trivial CPU cost.
+    buf = io.StringIO()
+    dist: dict[str, int] = {}
+    for motif_id, esm_score, am_score, gene_symbol in rows:
+        loeuf = loeuf_map.get(gene_symbol) if gene_symbol else None
+        direction = classify_motif_direction(esm_score, am_score, loeuf)
+        buf.write(f"{motif_id}\t{direction}\n")
+        dist[direction] = dist.get(direction, 0) + 1
+    buf.seek(0)
+    log.info("Classification complete. Distribution: %s", dist)
+
+    # Step 3 + 4: COPY into temp table, then UPDATE by PK — no JOIN needed.
+    with conn.cursor() as cur:
+        cur.execute("""
+            CREATE TEMP TABLE _dir_bulk (
+                motif_id  TEXT,
+                direction TEXT
             ) ON COMMIT DROP
         """)
-        buf = io.StringIO()
-        for sym, val in loeuf_map.items():
-            if val is None:
-                buf.write(f"{sym}\t\\N\n")
-            else:
-                buf.write(f"{sym}\t{val}\n")
-        buf.seek(0)
-        cur.copy_from(buf, "_loeuf_tmp", columns=("gene_symbol", "loeuf"), null="\\N")
-        log.info("LOEUF temp table populated: %d rows.", len(loeuf_map))
+        cur.copy_from(buf, "_dir_bulk", columns=("motif_id", "direction"))
+        log.info("COPY to temp table complete. Running bulk UPDATE by PK...")
 
-        # Single UPDATE using a CTE that LEFT JOINs loeuf onto each motif.
-        # The CASE mirrors classify_motif_direction() exactly.
-        cur.execute(f"""
-            WITH motif_loeuf AS (
-                SELECT dm.id AS motif_id,
-                       dm.esm1v_score,
-                       dm.consequence_score,
-                       lt.loeuf
-                FROM   divergent_motif dm
-                JOIN   ortholog o        ON o.id          = dm.ortholog_id
-                JOIN   gene     g        ON g.id          = o.gene_id
-                LEFT JOIN _loeuf_tmp lt  ON lt.gene_symbol = g.gene_symbol
-            )
-            UPDATE divergent_motif AS dm
-            SET motif_direction = CASE
-                -- ESM destabilising + AM high → branch on LOEUF
-                WHEN ml.esm1v_score < {_ESM_DESTAB_THRESHOLD}
-                  AND ml.consequence_score > {_AM_PATHOGENIC_THRESHOLD}
-                THEN
-                    CASE
-                        WHEN ml.loeuf IS NULL                        THEN 'functional_shift'
-                        WHEN ml.loeuf > {_LOEUF_INTOLERANT_THRESHOLD} THEN 'loss_of_function'
-                        ELSE                                              'functional_shift'
-                    END
-                -- AM high only (ESM neutral or missing) → gain_of_function
-                WHEN ml.consequence_score > {_AM_PATHOGENIC_THRESHOLD}
-                THEN 'gain_of_function'
-                -- Everything else → neutral
-                ELSE 'neutral'
-            END
-            FROM motif_loeuf ml
-            WHERE dm.id = ml.motif_id
+        cur.execute("""
+            UPDATE divergent_motif dm
+            SET    motif_direction = u.direction
+            FROM   _dir_bulk u
+            WHERE  dm.id = u.motif_id
         """)
         updated = cur.rowcount
         conn.commit()
-        log.info("SQL UPDATE complete: %d motif rows classified.", updated)
-        return updated
+
+    log.info("SQL UPDATE complete: %d motif rows classified.", updated)
+    return updated
 
 
 def _get_direction_distribution(conn) -> dict[str, int]:
@@ -495,7 +486,16 @@ def annotate_variant_directions(gene_ids: Optional[list[str]] = None) -> int:
             # do a targeted UPDATE by motif_id — keeps scatter tasks isolated.
             updated = _scatter_update(conn, loeuf_map, gene_ids)
         else:
-            # Full-table fast SQL path.
+            # Full-table path: vacuum dead tuples first to shrink scan cost,
+            # then raise work_mem for the session to speed up hash joins.
+            # VACUUM must run outside a transaction block.
+            log.info("Running VACUUM on divergent_motif to clear dead tuples before UPDATE...")
+            conn.autocommit = True
+            with conn.cursor() as cur:
+                cur.execute("SET work_mem = '256MB'")
+                cur.execute("VACUUM ANALYZE divergent_motif")
+            conn.autocommit = False
+            log.info("VACUUM complete.")
             updated = _bulk_update_via_sql(conn, loeuf_map)
 
         dist = _get_direction_distribution(conn)
