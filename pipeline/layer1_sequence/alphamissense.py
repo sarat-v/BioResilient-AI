@@ -371,7 +371,7 @@ def build_am_index(
 def _consequence_for_motif(
     human_seq: str,
     animal_seq: str,
-    motif_start_pos: int,
+    human_protein: str,
     am_index: dict[int, dict[str, float]],
 ) -> Optional[float]:
     """Compute mean AlphaMissense score for all divergent positions in a motif.
@@ -379,20 +379,32 @@ def _consequence_for_motif(
     Args:
         human_seq: Human residues in the motif window (may contain gaps '-').
         animal_seq: Animal residues in the motif window (aligned, same length).
-        motif_start_pos: 0-indexed start position of the motif in the full alignment.
+        human_protein: Full human protein sequence (gap-stripped, no '*').
         am_index: {position_1indexed: {alt_aa: am_score}} for the human protein.
 
     Returns mean score, or None if no variants could be looked up.
     """
-    scores = []
-    human_residue_pos = motif_start_pos  # running 0-indexed alignment position
+    # Find the true 0-indexed start position of this motif in the human protein.
+    # motif.start_pos is an alignment column coordinate and must NOT be used
+    # directly as a residue position — alignments may have many gaps before the
+    # motif, making the column number much larger than the residue index.
+    h_seq_stripped = human_seq.replace("-", "")
+    if not h_seq_stripped:
+        return None
 
-    for i, (h_aa, a_aa) in enumerate(zip(human_seq, animal_seq)):
+    # Search near the rough alignment position first, then fall back to full search.
+    protein_start = human_protein.find(h_seq_stripped)
+    if protein_start < 0:
+        return None  # motif not locatable in the human protein
+
+    scores = []
+    human_residue_pos = protein_start  # 0-indexed position of first non-gap residue
+
+    for h_aa, a_aa in zip(human_seq, animal_seq):
         if h_aa == "-":
-            continue  # gap in human — skip
-        human_residue_pos_1 = human_residue_pos + 1  # convert to 1-indexed
+            continue  # insertion in animal — no human residue consumed
+        human_residue_pos_1 = human_residue_pos + 1  # AlphaMissense is 1-indexed
         if h_aa != a_aa and a_aa != "-":
-            # Divergent position — look up AM score
             pos_scores = am_index.get(human_residue_pos_1, {})
             if a_aa in pos_scores:
                 scores.append(pos_scores[a_aa])
@@ -439,6 +451,20 @@ def annotate_motif_consequences(
                 no_data += 1
                 continue
 
+            # Fetch the human protein sequence so _consequence_for_motif can
+            # locate each motif by substring search (alignment start_pos is not
+            # a reliable residue coordinate when gaps precede the motif).
+            human_orth = (
+                session.query(Ortholog)
+                .filter(Ortholog.gene_id == gene.id, Ortholog.species_id == "human")
+                .first()
+            )
+            if not human_orth or not human_orth.protein_seq:
+                continue
+            human_protein = human_orth.protein_seq.replace("-", "").replace("*", "")
+            if not human_protein:
+                continue
+
             motifs = (
                 session.query(DivergentMotif)
                 .join(Ortholog, DivergentMotif.ortholog_id == Ortholog.id)
@@ -450,7 +476,7 @@ def annotate_motif_consequences(
                 score = _consequence_for_motif(
                     motif.human_seq,
                     motif.animal_seq,
-                    motif.start_pos,
+                    human_protein,
                     protein_am,
                 )
                 if score is not None:
