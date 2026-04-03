@@ -209,22 +209,24 @@ process esm1v_scatter {
     export DATABASE_URL='${params.db_url}'
     export BIORESILIENT_STORAGE_ROOT='${params.storage_root}'
     python3 << 'PYEOF'
-import math, sys
-from db.session import get_session
-from sqlalchemy import text
+import math, sys, os
+import psycopg2
 
 # Single aggregation query — replaces a per-gene loop that issued 2×N queries
 # (where N = 12,000+ genes), which took 15+ minutes on db.t4g.micro.
-with get_session() as s:
-    rows = s.execute(text("""
-        SELECT o.gene_id::text,
-               COUNT(dm.id)          AS total,
-               COUNT(dm.esm1v_score) AS scored
-        FROM   divergent_motif dm
-        JOIN   ortholog o ON o.id = dm.ortholog_id
-        GROUP  BY o.gene_id
-        HAVING COUNT(dm.id) > 0
-    """)).fetchall()
+# Note: use psycopg2 + single-quoted SQL here; Python triple-quoted strings
+# inside Nextflow script blocks confuse Groovy's GString parser.
+_conn = psycopg2.connect(os.environ['DATABASE_URL'])
+_cur  = _conn.cursor()
+_cur.execute(
+    'SELECT o.gene_id::text, COUNT(dm.id) AS total, COUNT(dm.esm1v_score) AS scored'
+    ' FROM divergent_motif dm'
+    ' JOIN ortholog o ON o.id = dm.ortholog_id'
+    ' GROUP BY o.gene_id'
+    ' HAVING COUNT(dm.id) > 0'
+)
+rows = _cur.fetchall()
+_conn.close()
 
 all_genes    = {r[0] for r in rows}
 fully_scored = {r[0] for r in rows if r[1] > 0 and r[1] == r[2]}
