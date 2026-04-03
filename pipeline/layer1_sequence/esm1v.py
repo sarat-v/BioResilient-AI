@@ -286,10 +286,13 @@ def annotate_esm1v_scores(
             if not human_seq:
                 continue
 
+            # Only fetch motifs that still need scoring for this run.
+            # Motifs already scored (including sentinel 0.0) are skipped by
+            # filtering esm1v_score IS NULL — avoids loading millions of rows.
             motifs = (
                 session.query(DivergentMotif)
                 .join(Ortholog, DivergentMotif.ortholog_id == Ortholog.id)
-                .filter(Ortholog.gene_id == gid)
+                .filter(Ortholog.gene_id == gid, DivergentMotif.esm1v_score.is_(None))
                 .all()
             )
             if motifs:
@@ -339,20 +342,41 @@ def annotate_esm1v_scores(
             continue
 
         for motif in motifs:
+            if motif.esm1v_score is not None:
+                continue  # already scored in a previous run
+
+            h_seq_stripped = motif.human_seq or ""
+
+            # ── Find the true raw-protein position ──────────────────────────
+            # start_pos is the ALIGNMENT coordinate (may include gap columns
+            # inserted for other species).  protein_seq is gap-free.
+            # We locate the motif via string search near start_pos to convert.
+            raw_motif_start: int = -1
+            if h_seq_stripped:
+                # Search within ±300 aa of start_pos (generous gap allowance)
+                lo = max(0, motif.start_pos - 300)
+                hi = min(len(human_seq), motif.start_pos + len(h_seq_stripped) + 100)
+                raw_motif_start = human_seq.find(h_seq_stripped, lo, hi + len(h_seq_stripped))
+                if raw_motif_start < 0:
+                    # Global fallback (handles edge cases near termini)
+                    raw_motif_start = human_seq.find(h_seq_stripped)
+
+            # ── Collect valid substitutions ──────────────────────────────────
             substitutions = []
-            for j, (h_aa, a_aa) in enumerate(zip(motif.human_seq, motif.animal_seq)):
+            for j, (h_aa, a_aa) in enumerate(zip(h_seq_stripped, motif.animal_seq or "")):
                 if h_aa == "-" or a_aa == "-" or h_aa == a_aa:
                     continue
-                abs_pos = motif.start_pos + j
-                if abs_pos < len(human_seq) and human_seq[abs_pos] != h_aa:
-                    log.debug(
-                        "AA mismatch at pos %d: expected %s, got %s — skipping",
-                        abs_pos, h_aa, human_seq[abs_pos],
-                    )
-                    continue
+                if raw_motif_start < 0:
+                    continue  # motif not found in protein; will be sentinel-scored below
+                abs_pos = raw_motif_start + j
                 substitutions.append((abs_pos, h_aa, a_aa))
 
+            # ── Score or assign sentinel ─────────────────────────────────────
             if not substitutions:
+                # Motif has no scorable substitutions (identical sequences,
+                # motif not found in protein, or all positions beyond ESM window).
+                # Write sentinel 0.0 so the scatter stops re-including this gene.
+                pending_updates.append((motif.id, 0.0))
                 continue
 
             llr = _score_substitutions_from_logprobs(
@@ -360,6 +384,9 @@ def annotate_esm1v_scores(
             )
             if llr is not None:
                 pending_updates.append((motif.id, llr))
+            else:
+                # All substitution positions were beyond the ESM window (≥1022).
+                pending_updates.append((motif.id, 0.0))
 
         if len(pending_updates) >= BATCH_SIZE:
             scored += _flush_updates(pending_updates)
