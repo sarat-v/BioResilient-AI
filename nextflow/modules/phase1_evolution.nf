@@ -428,16 +428,16 @@ workflow PHASE1_EVOLUTION {
     if (fromIdx < 0) fromIdx = 0
     if (untilIdx < 0) untilIdx = EVO_STEPS.size() - 1
 
-    // Convert aligned_pkl to a value channel so it can be reused across scatter
-    aligned_pkl_val = aligned_pkl.first()
+    // aligned_pkl is already a value channel in NF 25 (single-output process)
+    aligned_pkl_val = aligned_pkl
 
     // ── Step 5: build species tree ────────────────────────────────────────
     // Skip when resuming from step6 or later — tree already in S3.
     if (fromIdx < 0 || fromIdx <= step5Idx) {
         build_species_tree(aligned_pkl_val)
-        treefile_ch  = build_species_tree.out.treefile.first()
+        treefile_ch  = build_species_tree.out.treefile
     } else {
-        treefile_ch  = Channel.fromPath("s3://${params.s3_bucket}/cache/species.treefile").first()
+        treefile_ch  = Channel.fromPath("s3://${params.s3_bucket}/cache/species.treefile")
     }
 
     if (fromIdx <= EVO_STEPS.indexOf('step3d') && untilIdx >= EVO_STEPS.indexOf('step3d')) {
@@ -450,7 +450,7 @@ workflow PHASE1_EVOLUTION {
     if (fromIdx <= EVO_STEPS.indexOf('step6') && untilIdx >= EVO_STEPS.indexOf('step6')) {
         // Pre-fetch ALL CDS once (single task) — eliminates NCBI bottleneck in scatter
         prefetch_cds(aligned_pkl_val)
-        cds_cache_ch = prefetch_cds.out.cds_cache.first()
+        cds_cache_ch = prefetch_cds.out.cds_cache
 
         extract_og_ids(aligned_pkl_val)
         og_batches_ch = extract_og_ids.out.og_batches.flatten()
