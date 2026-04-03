@@ -440,6 +440,21 @@ def annotate_motif_consequences(
         no_acc = 0
         no_data = 0
 
+        # Pre-fetch ALL human protein sequences in one query — avoids a per-gene
+        # Ortholog lookup that would issue 12,000+ round-trips to the DB.
+        human_prot_q = (
+            session.query(Ortholog.gene_id, Ortholog.protein_seq)
+            .filter(Ortholog.species_id == "human", Ortholog.protein_seq.isnot(None))
+        )
+        if gene_ids:
+            human_prot_q = human_prot_q.filter(Ortholog.gene_id.in_(gene_ids))
+        human_protein_map: dict[str, str] = {
+            row.gene_id: row.protein_seq.replace("-", "").replace("*", "")
+            for row in human_prot_q.all()
+            if row.protein_seq
+        }
+        log.info("Pre-fetched human proteins for %d genes.", len(human_protein_map))
+
         for gene in genes:
             accession = gene_accession_map.get(gene.id)
             if not accession:
@@ -451,17 +466,7 @@ def annotate_motif_consequences(
                 no_data += 1
                 continue
 
-            # Fetch the human protein sequence so _consequence_for_motif can
-            # locate each motif by substring search (alignment start_pos is not
-            # a reliable residue coordinate when gaps precede the motif).
-            human_orth = (
-                session.query(Ortholog)
-                .filter(Ortholog.gene_id == gene.id, Ortholog.species_id == "human")
-                .first()
-            )
-            if not human_orth or not human_orth.protein_seq:
-                continue
-            human_protein = human_orth.protein_seq.replace("-", "").replace("*", "")
+            human_protein = human_protein_map.get(gene.id, "")
             if not human_protein:
                 continue
 

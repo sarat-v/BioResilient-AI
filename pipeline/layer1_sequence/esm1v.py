@@ -246,24 +246,20 @@ def annotate_esm1v_scores(
 
         # Resume: find genes where every motif already has an esm1v_score.
         # We skip those entirely — if even one motif is unscored the gene is included.
+        # Single aggregation query replaces a per-gene loop (2×N queries → 1 query).
         if not force_rerun:
-            from sqlalchemy import func as _func
-            already_done: set[str] = set()
-            for gid in gene_ids:
-                total_motifs = (
-                    session.query(_func.count(DivergentMotif.id))
-                    .join(Ortholog, DivergentMotif.ortholog_id == Ortholog.id)
-                    .filter(Ortholog.gene_id == gid)
-                    .scalar()
-                ) or 0
-                scored_motifs = (
-                    session.query(_func.count(DivergentMotif.id))
-                    .join(Ortholog, DivergentMotif.ortholog_id == Ortholog.id)
-                    .filter(Ortholog.gene_id == gid, DivergentMotif.esm1v_score.isnot(None))
-                    .scalar()
-                ) or 0
-                if total_motifs > 0 and scored_motifs == total_motifs:
-                    already_done.add(gid)
+            from sqlalchemy import text as _text
+            rows = session.execute(_text("""
+                SELECT o.gene_id::text,
+                       COUNT(dm.id)          AS total,
+                       COUNT(dm.esm1v_score) AS scored
+                FROM   divergent_motif dm
+                JOIN   ortholog o ON o.id = dm.ortholog_id
+                WHERE  o.gene_id = ANY(:gids)
+                GROUP  BY o.gene_id
+            """), {"gids": list(gene_ids)}).fetchall()
+
+            already_done: set[str] = {r[0] for r in rows if r[1] > 0 and r[1] == r[2]}
 
             if already_done:
                 gene_ids = [gid for gid in gene_ids if gid not in already_done]

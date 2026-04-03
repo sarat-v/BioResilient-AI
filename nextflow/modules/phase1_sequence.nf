@@ -211,36 +211,23 @@ process esm1v_scatter {
     python3 << 'PYEOF'
 import math, sys
 from db.session import get_session
-from db.models import Gene, DivergentMotif, Ortholog
-from sqlalchemy import func
+from sqlalchemy import text
 
+# Single aggregation query — replaces a per-gene loop that issued 2×N queries
+# (where N = 12,000+ genes), which took 15+ minutes on db.t4g.micro.
 with get_session() as s:
-    # All genes with at least one motif
-    all_genes = set(str(r[0]) for r in (
-        s.query(Ortholog.gene_id)
-        .join(DivergentMotif, DivergentMotif.ortholog_id == Ortholog.id)
-        .group_by(Ortholog.gene_id)
-        .having(func.count(DivergentMotif.id) > 0)
-        .all()
-    ))
+    rows = s.execute(text("""
+        SELECT o.gene_id::text,
+               COUNT(dm.id)          AS total,
+               COUNT(dm.esm1v_score) AS scored
+        FROM   divergent_motif dm
+        JOIN   ortholog o ON o.id = dm.ortholog_id
+        GROUP  BY o.gene_id
+        HAVING COUNT(dm.id) > 0
+    """)).fetchall()
 
-    # Genes where EVERY motif already has esm1v_score — fully done
-    fully_scored = set()
-    for gid in all_genes:
-        total = (
-            s.query(func.count(DivergentMotif.id))
-            .join(Ortholog, DivergentMotif.ortholog_id == Ortholog.id)
-            .filter(Ortholog.gene_id == gid)
-            .scalar()
-        ) or 0
-        scored = (
-            s.query(func.count(DivergentMotif.id))
-            .join(Ortholog, DivergentMotif.ortholog_id == Ortholog.id)
-            .filter(Ortholog.gene_id == gid, DivergentMotif.esm1v_score.isnot(None))
-            .scalar()
-        ) or 0
-        if total > 0 and scored == total:
-            fully_scored.add(gid)
+all_genes    = {r[0] for r in rows}
+fully_scored = {r[0] for r in rows if r[1] > 0 and r[1] == r[2]}
 
 gene_ids = sorted(all_genes - fully_scored)
 sys.stderr.write(
