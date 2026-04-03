@@ -35,7 +35,7 @@ log.info """
 ╠══════════════════════════════════════════════════════════╣
 ║  Phenotype    : ${params.phenotype}
 ║  From step    : ${params.from_step}
-║  Until step   : ${params['until'] ?: 'step15'}
+║  Until step   : ${params.until ?: 'step15'}
 ║  DB URL       : ${params.db_url?.take(40)}...
 ║  Storage      : ${params.storage_root}
 ║  Profile      : ${workflow.profile}
@@ -58,7 +58,7 @@ workflow {
 
     def fromStep  = params.from_step ?: 'step1'
     def fromIdx   = STEP_ORDER.indexOf(fromStep)
-    def untilStep = params['until'] ?: STEP_ORDER[-1]
+    def untilStep = params.until ?: STEP_ORDER[-1]
     def untilIdx  = STEP_ORDER.indexOf(untilStep)
     if (fromIdx < 0) {
         error "Unknown from_step value '${fromStep}'. Valid values: ${STEP_ORDER.join(', ')}"
