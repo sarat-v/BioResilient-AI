@@ -324,7 +324,7 @@ def _apply_fdr_correction(
 
 
 def run_step6_all_collect(args):
-    """Collect all HyPhy results (MEME + FEL+BUSTED + RELAX) from merged output."""
+    """Collect all HyPhy results (BUSTED-PH + FEL + BUSTED + RELAX) from merged output."""
     from pipeline.layer2_evolution.selection import (
         load_selection_scores, load_fel_busted_scores, load_relax_scores, build_gene_og_map,
     )
@@ -365,7 +365,7 @@ def run_step6_all_collect(args):
                 "relax_pvalue": r.get("relax_pvalue"),
             }
 
-    log.info("All-HyPhy collect: %d MEME, %d FEL+BUSTED, %d RELAX results",
+    log.info("All-HyPhy collect: %d BUSTED-PH, %d FEL+BUSTED, %d RELAX results",
              len(meme_batch), len(fb_batch), len(relax_batch))
 
     # BH-FDR correction across all OGs before loading to DB
@@ -373,7 +373,7 @@ def run_step6_all_collect(args):
 
     if meme_batch:
         load_selection_scores(meme_batch, gene_by_og)
-        log.info("Loaded %d MEME results to DB", len(meme_batch))
+        log.info("Loaded %d BUSTED-PH/proxy results to DB", len(meme_batch))
     if fb_batch:
         load_fel_busted_scores(fb_batch, gene_by_og)
         log.info("Loaded %d FEL+BUSTED results to DB", len(fb_batch))
@@ -383,13 +383,12 @@ def run_step6_all_collect(args):
 
 
 def run_step6_batch(args):
-    """Batch HyPhy — per-gene IQ-TREE2 tree + parallel MEME/FEL/BUSTED.
+    """Batch HyPhy — codon alignment + BUSTED-PH / FEL / BUSTED / RELAX.
 
-    Gold-standard workflow per CAPHEINE/BABAPPA:
-      1. Build codon alignment + QC
-      2. Infer per-gene ML tree (IQ-TREE2 GTR+G)
-      3. Run MEME + FEL + BUSTED in parallel (ThreadPoolExecutor)
-    Falls back to protein divergence proxy if codon alignment unavailable.
+    Per-OG workflow:
+      1. Build codon alignment + QC (requires ≥4 unique species, ≥60% CDS coverage)
+      2. Run BUSTED-PH + FEL + BUSTED + RELAX in parallel (ThreadPoolExecutor)
+    Falls back to protein-based aBSREL proxy if codon alignment unavailable.
     """
     import gc
     import json

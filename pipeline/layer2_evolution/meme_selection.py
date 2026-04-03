@@ -1194,9 +1194,6 @@ def run_busted_ph(
     # Label test-phenotype branches with {Test} so BUSTED can restrict to them.
     # Reference and outgroup branches are unlabeled (treated as background).
     test_set, _ref, _out = _get_relax_branch_sets()
-    species_in_aln = [label.split("|")[0] for label in codon_aln if label.split("|")[0] not in
-                      {s for s, _ in [(lbl.split("|")[0], 1) for lbl in list(codon_aln.keys())[1:]]}]
-    # Use all species names that appear in the alignment
     all_aln_species = list({label.split("|")[0] for label in codon_aln})
     test_branches = [sp for sp in all_aln_species if sp in test_set]
 

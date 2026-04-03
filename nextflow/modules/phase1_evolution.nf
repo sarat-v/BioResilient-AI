@@ -107,12 +107,14 @@ cur.execute('''
 ''')
 db_og_ids = sorted({row[0] for row in cur.fetchall()})
 
-# OGs that already have a valid evolution_score (dnds_pvalue or busted_ph_pvalue set)
+# OGs that already have a genuine codon-based score (not aBSREL proxy).
+# Proxy results are excluded so re-runs can upgrade them to BUSTED-PH.
 cur.execute('''
     SELECT DISTINCT g.orthofinder_og
     FROM evolution_score es
     JOIN gene g ON g.id = es.gene_id
     WHERE es.dnds_pvalue IS NOT NULL
+      AND es.selection_model NOT IN (\'proxy\')
       AND g.orthofinder_og IS NOT NULL
 ''')
 already_scored_ogs = {row[0] for row in cur.fetchall()}
