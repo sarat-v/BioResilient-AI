@@ -161,14 +161,8 @@ process align_and_divergence {
         --db-url '${params.db_url}' \
         --storage-root '${params.storage_root}' \
         --output-dir '.'
-    # If skip-if-done exited early, copy the pkl via Fusion's POSIX filesystem.
-    # Symlinks don't survive Fusion cross-process staging (the link file itself
-    # gets uploaded to S3, not the target). A real cp is required.
-    if [ ! -f aligned_orthogroups.pkl ]; then
-        FUSION_PKL=\$(echo '${params.storage_root}' | sed 's|s3://|/|')/cache/aligned_orthogroups.pkl
-        cp "\$FUSION_PKL" aligned_orthogroups.pkl \
-            || { echo "ERROR: cannot copy \$FUSION_PKL via Fusion" >&2; exit 1; }
-    fi
+    # aligned_orthogroups.pkl is written by run_step.py in both the run and
+    # skip paths (via STEP_OUTPUT_PROVIDERS). No shell fallback needed.
     DATABASE_URL='${params.db_url}' BIORESILIENT_STORAGE_ROOT='${params.storage_root}' \
         python -m pipeline.step_reporter --step step4 || true
     """

@@ -20,21 +20,16 @@ process build_species_tree {
 
     script:
     """
-    # Fusion maps s3://bucket/ → /bucket/ — use the POSIX path, no aws CLI needed.
-    # Use cp, not ln -sf: symlinks don't survive Fusion cross-process staging.
-    FUSION_TREE=\$(echo '${params.storage_root}' | sed 's|s3://|/|')/phylo/species.treefile
-    if [ -f "\$FUSION_TREE" ]; then
-        echo "step5: treefile already in S3 — skipping IQ-TREE2 rebuild."
-        cp "\$FUSION_TREE" species.treefile
-    else
-        python -m scripts.nf_wrappers.run_step \
-            --step step5 \
-            --input-pkl '${aligned_pkl}' \
-            --db-url '${params.db_url}' \
-            --storage-root '${params.storage_root}'
-        cp "\$FUSION_TREE" species.treefile \
-            || { echo "ERROR: species.treefile not found after step5" >&2; exit 1; }
-    fi
+    # run_step.py handles both paths via STEP_OUTPUT_PROVIDERS + STEP_DONE_CHECKS:
+    # - skip:  done-check detects treefile in storage, copies it here, exits 0
+    # - run:   step5_phylogenetic_tree builds the tree then copies it here
+    # species.treefile is always present in the work dir after this call.
+    python -m scripts.nf_wrappers.run_step \
+        --step step5 \
+        --skip-if-done \
+        --input-pkl '${aligned_pkl}' \
+        --db-url '${params.db_url}' \
+        --storage-root '${params.storage_root}'
     DATABASE_URL='${params.db_url}' BIORESILIENT_STORAGE_ROOT='${params.storage_root}' \
         python -m pipeline.step_reporter --step step5 || true
     """

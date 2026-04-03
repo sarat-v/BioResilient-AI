@@ -42,6 +42,18 @@ def _load_aligned(path: str) -> dict:
         return pickle.load(f)
 
 
+def _storage_posix() -> str:
+    """POSIX path for the pipeline storage root.
+
+    Nextflow Fusion mounts S3 at /<bucket>/ inside every container, so
+    s3://bioresilient-data/phylo/... is readable as /bioresilient-data/phylo/...
+    This helper converts the storage root env var to that POSIX form so
+    plain Python file I/O works without any AWS CLI dependency.
+    """
+    root = os.environ.get("BIORESILIENT_STORAGE_ROOT", ".")
+    return root.replace("s3://", "/").replace("gs://", "/")
+
+
 def run_step1(args):
     from pipeline.orchestrator import step1_validate_environment
     step1_validate_environment()
@@ -113,11 +125,18 @@ def run_step4d(args):
 
 
 def run_step5(args):
+    import shutil
     from pipeline.orchestrator import step5_phylogenetic_tree
     data = _load_aligned(args.input_pkl)
     aligned = data.get("aligned", data)
     treefile = step5_phylogenetic_tree(aligned)
     log.info("Tree written to %s", treefile)
+    # Copy treefile into the NF work dir so Nextflow can stage it to downstream processes.
+    dst = Path("species.treefile")
+    if not dst.exists():
+        src = Path(_storage_posix()) / "phylo" / "species.treefile"
+        shutil.copy2(str(src), str(dst))
+        log.info("Copied species.treefile to work dir")
 
 
 def run_step6_single_og(args):
@@ -904,10 +923,8 @@ STEP_DONE_CHECKS: dict[str, callable] = {
     # step4: ≥ 1,000,000 divergent motifs in DB (current run has 1.9M)
     "step4": lambda: _db_count("SELECT COUNT(*) FROM divergent_motif", 1_000_000),
 
-    # step5: species treefile written to DB phylo table or S3.
-    # Check: ≥ 2 rows in gene with phylo_conservation_score (populated in step3d after step5)
-    # Simpler: check that species.treefile exists in S3 via a sentinel in DB
-    "step5": lambda: _db_count("SELECT COUNT(*) FROM species", 15),  # step5 builds tree; species already loaded
+    # step5: species tree built — check that treefile exists in storage (via Fusion POSIX path)
+    "step5": lambda: (Path(_storage_posix()) / "phylo" / "species.treefile").exists(),
 
     # step3d: ≥ 500 genes with phylo_conservation_score set (step3d runs after step5)
     "step3d": lambda: _db_count(
@@ -935,14 +952,53 @@ STEP_DONE_CHECKS: dict[str, callable] = {
 }
 
 
-def check_done_and_exit(step: str) -> None:
-    """If step already has sufficient data in RDS, log and sys.exit(0)."""
+def _provide_step4_outputs(args) -> None:
+    """Copy aligned_orthogroups.pkl from storage into the NF work dir on step4 skip."""
+    import shutil
+    src = Path(_storage_posix()) / "cache" / "aligned_orthogroups.pkl"
+    dst = Path(args.output_dir or ".") / "aligned_orthogroups.pkl"
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    if not dst.exists():
+        log.info("step4 skip: providing aligned_orthogroups.pkl from %s", src)
+        shutil.copy2(str(src), str(dst))
+        log.info("Copied %.1f MB", dst.stat().st_size / 1e6)
+
+
+def _provide_step5_outputs(args) -> None:
+    """Copy species.treefile from storage into the NF work dir on step5 skip."""
+    import shutil
+    src = Path(_storage_posix()) / "phylo" / "species.treefile"
+    dst = Path("species.treefile")
+    if not dst.exists():
+        log.info("step5 skip: providing species.treefile from %s", src)
+        shutil.copy2(str(src), str(dst))
+
+
+# Registry of output-file providers called when a step is skipped.
+# When --skip-if-done fires, the step function never runs, so Nextflow
+# would not find declared output files. Each entry here copies the
+# already-computed file from storage into the process work dir.
+# To support a new step: add an entry here — no shell fallback needed in .nf files.
+STEP_OUTPUT_PROVIDERS: dict[str, callable] = {
+    "step4": _provide_step4_outputs,
+    "step5": _provide_step5_outputs,
+}
+
+
+def check_done_and_exit(step: str, args=None) -> None:
+    """If step already has sufficient data in RDS, provide NF outputs then exit 0."""
     check_fn = STEP_DONE_CHECKS.get(step)
     if check_fn is None:
         return  # no check registered → always run
     try:
         if check_fn():
             log.info("SKIP: step %s already complete — sufficient data found in DB.", step)
+            provider = STEP_OUTPUT_PROVIDERS.get(step)
+            if provider and args is not None:
+                try:
+                    provider(args)
+                except Exception as exc:
+                    log.warning("Output provider for %s failed (%s) — outputs may be missing.", step, exc)
             sys.exit(0)
         else:
             log.info("PROCEED: step %s data insufficient or absent — running step.", step)
@@ -1026,7 +1082,7 @@ def main():
     _setup_env(args)
 
     if args.skip_if_done:
-        check_done_and_exit(args.step)
+        check_done_and_exit(args.step, args)
 
     log.info("Running step: %s", args.step)
     STEP_MAP[args.step](args)
