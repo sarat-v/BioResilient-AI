@@ -42,16 +42,47 @@ def _load_aligned(path: str) -> dict:
         return pickle.load(f)
 
 
-def _storage_posix() -> str:
-    """POSIX path for the pipeline storage root.
+def _s3_download(storage_root: str, relative_path: str, dst: Path) -> None:
+    """Download *relative_path* from storage_root into *dst*.
 
-    Nextflow Fusion mounts S3 at /<bucket>/ inside every container, so
-    s3://bioresilient-data/phylo/... is readable as /bioresilient-data/phylo/...
-    This helper converts the storage root env var to that POSIX form so
-    plain Python file I/O works without any AWS CLI dependency.
+    Uses boto3 for S3 (no aws-cli required; boto3 is always present).
+    Falls back to a plain file copy for local storage roots.
+    NOTE: Fusion only mounts *declared* Nextflow inputs as POSIX paths,
+    so arbitrary s3:// URIs cannot be accessed via the filesystem —
+    boto3 is the correct cross-container approach.
     """
-    root = os.environ.get("BIORESILIENT_STORAGE_ROOT", ".")
-    return root.replace("s3://", "/").replace("gs://", "/")
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    if storage_root.startswith("s3://"):
+        import boto3
+        bucket = storage_root[len("s3://"):]          # e.g. "bioresilient-data"
+        log.info("Downloading s3://%s/%s → %s", bucket, relative_path, dst)
+        boto3.client("s3").download_file(bucket, relative_path, str(dst))
+    elif storage_root.startswith("gs://"):
+        from google.cloud import storage as gcs
+        bucket_name, prefix = storage_root[len("gs://"):].split("/", 1) if "/" in storage_root[len("gs://"):] else (storage_root[len("gs://"):], "")
+        blob_name = f"{prefix}/{relative_path}".lstrip("/")
+        log.info("Downloading gs://%s/%s → %s", bucket_name, blob_name, dst)
+        gcs.Client().bucket(bucket_name).blob(blob_name).download_to_filename(str(dst))
+    else:
+        import shutil
+        src = Path(storage_root) / relative_path
+        log.info("Copying %s → %s", src, dst)
+        shutil.copy2(str(src), str(dst))
+
+
+def _s3_exists(storage_root: str, relative_path: str) -> bool:
+    """Return True if *relative_path* exists under *storage_root*."""
+    if storage_root.startswith("s3://"):
+        import boto3
+        from botocore.exceptions import ClientError
+        bucket = storage_root[len("s3://"):]
+        try:
+            boto3.client("s3").head_object(Bucket=bucket, Key=relative_path)
+            return True
+        except ClientError:
+            return False
+    else:
+        return (Path(storage_root) / relative_path).exists()
 
 
 def run_step1(args):
@@ -125,18 +156,17 @@ def run_step4d(args):
 
 
 def run_step5(args):
-    import shutil
     from pipeline.orchestrator import step5_phylogenetic_tree
     data = _load_aligned(args.input_pkl)
     aligned = data.get("aligned", data)
     treefile = step5_phylogenetic_tree(aligned)
     log.info("Tree written to %s", treefile)
-    # Copy treefile into the NF work dir so Nextflow can stage it to downstream processes.
+    # Download treefile into the NF work dir so Nextflow can stage it downstream.
     dst = Path("species.treefile")
     if not dst.exists():
-        src = Path(_storage_posix()) / "phylo" / "species.treefile"
-        shutil.copy2(str(src), str(dst))
-        log.info("Copied species.treefile to work dir")
+        storage = os.environ.get("BIORESILIENT_STORAGE_ROOT", ".")
+        _s3_download(storage, "phylo/species.treefile", dst)
+        log.info("species.treefile ready in work dir (%.1f KB)", dst.stat().st_size / 1e3)
 
 
 def run_step6_single_og(args):
@@ -923,8 +953,10 @@ STEP_DONE_CHECKS: dict[str, callable] = {
     # step4: ≥ 1,000,000 divergent motifs in DB (current run has 1.9M)
     "step4": lambda: _db_count("SELECT COUNT(*) FROM divergent_motif", 1_000_000),
 
-    # step5: species tree built — check that treefile exists in storage (via Fusion POSIX path)
-    "step5": lambda: (Path(_storage_posix()) / "phylo" / "species.treefile").exists(),
+    # step5: species tree built — check that treefile exists in storage via boto3
+    "step5": lambda: _s3_exists(
+        os.environ.get("BIORESILIENT_STORAGE_ROOT", "."), "phylo/species.treefile"
+    ),
 
     # step3d: ≥ 500 genes with phylo_conservation_score set (step3d runs after step5)
     "step3d": lambda: _db_count(
@@ -953,25 +985,22 @@ STEP_DONE_CHECKS: dict[str, callable] = {
 
 
 def _provide_step4_outputs(args) -> None:
-    """Copy aligned_orthogroups.pkl from storage into the NF work dir on step4 skip."""
-    import shutil
-    src = Path(_storage_posix()) / "cache" / "aligned_orthogroups.pkl"
+    """Download aligned_orthogroups.pkl from S3 into the NF work dir when step4 is skipped."""
     dst = Path(args.output_dir or ".") / "aligned_orthogroups.pkl"
-    dst.parent.mkdir(parents=True, exist_ok=True)
     if not dst.exists():
-        log.info("step4 skip: providing aligned_orthogroups.pkl from %s", src)
-        shutil.copy2(str(src), str(dst))
-        log.info("Copied %.1f MB", dst.stat().st_size / 1e6)
+        storage = os.environ.get("BIORESILIENT_STORAGE_ROOT", ".")
+        log.info("step4 skip: downloading aligned_orthogroups.pkl from %s/cache/", storage)
+        _s3_download(storage, "cache/aligned_orthogroups.pkl", dst)
+        log.info("aligned_orthogroups.pkl ready (%.1f MB)", dst.stat().st_size / 1e6)
 
 
 def _provide_step5_outputs(args) -> None:
-    """Copy species.treefile from storage into the NF work dir on step5 skip."""
-    import shutil
-    src = Path(_storage_posix()) / "phylo" / "species.treefile"
+    """Download species.treefile from S3 into the NF work dir when step5 is skipped."""
     dst = Path("species.treefile")
     if not dst.exists():
-        log.info("step5 skip: providing species.treefile from %s", src)
-        shutil.copy2(str(src), str(dst))
+        storage = os.environ.get("BIORESILIENT_STORAGE_ROOT", ".")
+        log.info("step5 skip: downloading species.treefile from %s/phylo/", storage)
+        _s3_download(storage, "phylo/species.treefile", dst)
 
 
 # Registry of output-file providers called when a step is skipped.
