@@ -318,72 +318,31 @@ process esm1v_report {
     """
 }
 
-// Step 4d scatter: emit N gene-batch files for parallel direction classification.
-// Each file contains gene_ids (one per line) for a subset of genes.
-// Runs on a small instance — just DB queries + file writes.
-process variant_direction_scatter {
+// Step 4d: classify motif directions (gain/loss/functional_shift/neutral).
+// Runs as a single task using a bulk SQL UPDATE — avoids overwhelming a small
+// RDS instance (db.t4g.micro, 1GB RAM) with 25 concurrent heavy connections.
+// The full-table SQL CASE UPDATE on 1.69M rows completes in ~60-120s.
+process variant_direction {
     label 'base'
     cpus 2
-    memory '4 GB'
-    time '30m'
+    memory '8 GB'
+    time '2h'
+    maxRetries 3
+    errorStrategy { task.attempt <= 3 ? 'retry' : 'finish' }
 
     input:
     val domains_done
     val esm_done
 
     output:
-    path 'direction_batch_*.txt', emit: batches
-
-    script:
-    """
-    python -m scripts.nf_wrappers.run_step \
-        --step step4d_scatter \
-        --db-url '${params.db_url}' \
-        --storage-root '${params.storage_root}'
-    """
-}
-
-// Step 4d chunk: classify motif directions for a single gene batch.
-// Multiple of these run in parallel across the spot fleet.
-process variant_direction_chunk {
-    label 'base'
-    cpus 2
-    memory '8 GB'   // gnomAD TSV (~150MB decompressed) + motif rows for N genes
-    time '1h'
-    maxRetries 2
-    errorStrategy { task.attempt <= 2 ? 'retry' : 'finish' }
-
-    input:
-    path gene_id_file
-
-    output:
-    val true, emit: chunk_done
-
-    script:
-    """
-    python -m scripts.nf_wrappers.run_step \
-        --step step4d_chunk \
-        --gene-id-file '${gene_id_file}' \
-        --db-url '${params.db_url}' \
-        --storage-root '${params.storage_root}'
-    """
-}
-
-// Step 4d collect: wait for all chunks, then emit done signal + report.
-process variant_direction_collect {
-    label 'base'
-    cpus 2
-    memory '4 GB'
-    time '30m'
-
-    input:
-    val all_chunks_done
-
-    output:
     val true, emit: directions_done
 
     script:
     """
+    python -m scripts.nf_wrappers.run_step \
+        --step step4d \
+        --db-url '${params.db_url}' \
+        --storage-root '${params.storage_root}'
     DATABASE_URL='${params.db_url}' BIORESILIENT_STORAGE_ROOT='${params.storage_root}' \
         python -m pipeline.step_reporter --step step4d || true
     """
@@ -455,13 +414,13 @@ workflow PHASE1_SEQUENCE {
         esm_done_ch = Channel.value(true)
     }
 
-    // ── Step 4d: variant direction — scatter/gather for parallelism ─────
-    // Scatter emits N gene-batch files → chunks run in parallel → collect gathers.
+    // ── Step 4d: variant direction — single bulk SQL UPDATE ─────────────
+    // Runs as one task using an optimised SQL CASE UPDATE on all 1.69M motifs.
+    // Scatter/gather was abandoned: 25 concurrent heavy DB connections OOM'd
+    // the db.t4g.micro (1GB RAM). Single task completes in ~60-120s.
     if (untilIdx >= SEQ_STEPS.indexOf('step4d')) {
-        variant_direction_scatter(domains_done_ch, esm_done_ch)
-        variant_direction_chunk(variant_direction_scatter.out.batches.flatten())
-        variant_direction_collect(variant_direction_chunk.out.chunk_done.collect())
-        directions_done_ch = variant_direction_collect.out.directions_done
+        variant_direction(domains_done_ch, esm_done_ch)
+        directions_done_ch = variant_direction.out.directions_done
     } else {
         directions_done_ch = Channel.value(true)
     }
