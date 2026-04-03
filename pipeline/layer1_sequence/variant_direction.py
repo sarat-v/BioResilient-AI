@@ -463,17 +463,23 @@ def annotate_variant_directions(gene_ids: Optional[list[str]] = None) -> int:
     """
     # ------------------------------------------------------------------
     # 1. Determine which gene symbols we need LOEUF for.
+    #    Use a direct psycopg2 query on the gene table only — avoids a
+    #    slow 3-way ORM join across divergent_motif (1.69M rows) that
+    #    hits statement_timeout when 25 chunks query concurrently.
     # ------------------------------------------------------------------
-    with get_session() as session:
-        q = (
-            session.query(Gene.gene_symbol)
-            .join(Ortholog, Ortholog.gene_id == Gene.id)
-            .join(DivergentMotif, DivergentMotif.ortholog_id == Ortholog.id)
-            .distinct()
-        )
-        if gene_ids:
-            q = q.filter(Gene.id.in_(gene_ids))
-        gene_symbols_needed: set[str] = {row[0] for row in q if row[0]}
+    conn_sym = psycopg2.connect(get_db_url())
+    try:
+        with conn_sym.cursor() as cur:
+            if gene_ids:
+                cur.execute(
+                    "SELECT DISTINCT gene_symbol FROM gene WHERE id = ANY(%s) AND gene_symbol IS NOT NULL",
+                    (gene_ids,),
+                )
+            else:
+                cur.execute("SELECT DISTINCT gene_symbol FROM gene WHERE gene_symbol IS NOT NULL")
+            gene_symbols_needed: set[str] = {row[0] for row in cur.fetchall()}
+    finally:
+        conn_sym.close()
 
     log.info("Step 4d: fetching LOEUF for %d gene symbols...", len(gene_symbols_needed))
     loeuf_map: dict[str, Optional[float]] = _fetch_loeuf_bulk(gene_symbols_needed)
