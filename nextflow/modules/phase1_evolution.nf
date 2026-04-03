@@ -20,13 +20,19 @@ process build_species_tree {
 
     script:
     """
-    python -m scripts.nf_wrappers.run_step \
-        --step step5 \
-        --input-pkl '${aligned_pkl}' \
-        --db-url '${params.db_url}' \
-        --storage-root '${params.storage_root}'
-    STORAGE=\$(python -c "from pipeline.config import get_local_storage_root; print(get_local_storage_root())")
-    cp \$STORAGE/phylo/species.treefile species.treefile
+    # If treefile already exists in S3/storage, copy it and skip rebuilding
+    STORAGE=\$(python -c "from pipeline.config import get_local_storage_root; print(get_local_storage_root())" 2>/dev/null || echo ".")
+    if [ -f "\$STORAGE/phylo/species.treefile" ]; then
+        echo "step5: treefile already exists — skipping IQ-TREE2 rebuild."
+        cp "\$STORAGE/phylo/species.treefile" species.treefile
+    else
+        python -m scripts.nf_wrappers.run_step \
+            --step step5 \
+            --input-pkl '${aligned_pkl}' \
+            --db-url '${params.db_url}' \
+            --storage-root '${params.storage_root}'
+        cp "\$STORAGE/phylo/species.treefile" species.treefile
+    fi
     DATABASE_URL='${params.db_url}' BIORESILIENT_STORAGE_ROOT='${params.storage_root}' \
         python -m pipeline.step_reporter --step step5 || true
     """
@@ -49,6 +55,7 @@ process phylo_conservation {
     """
     python -m scripts.nf_wrappers.run_step \
         --step step3d \
+        --skip-if-done \
         --db-url '${params.db_url}' \
         --storage-root '${params.storage_root}'
     DATABASE_URL='${params.db_url}' BIORESILIENT_STORAGE_ROOT='${params.storage_root}' \
@@ -90,6 +97,8 @@ sys.stderr.write(f'pkl: {len(aligned)} aligned OGs, {len(motifs)} in motifs_by_o
 import psycopg2
 conn = psycopg2.connect(db_url)
 cur  = conn.cursor()
+
+# OGs that have divergent motifs
 cur.execute('''
     SELECT DISTINCT o.orthofinder_og
     FROM divergent_motif dm
@@ -97,16 +106,29 @@ cur.execute('''
     WHERE o.orthofinder_og IS NOT NULL
 ''')
 db_og_ids = sorted({row[0] for row in cur.fetchall()})
+
+# OGs that already have a valid evolution_score (dnds_pvalue or busted_ph_pvalue set)
+cur.execute('''
+    SELECT DISTINCT g.orthofinder_og
+    FROM evolution_score es
+    JOIN gene g ON g.id = es.gene_id
+    WHERE es.dnds_pvalue IS NOT NULL
+      AND g.orthofinder_og IS NOT NULL
+''')
+already_scored_ogs = {row[0] for row in cur.fetchall()}
 conn.close()
 
 sys.stderr.write(f'DB has {len(db_og_ids)} OGs with divergent motifs\\n')
-og_list = [og for og in db_og_ids if og in aligned]
-sys.stderr.write(f'OGs in both DB and aligned pkl: {len(og_list)}\\n')
+sys.stderr.write(f'DB has {len(already_scored_ogs)} OGs already scored (skip these)\\n')
+
+og_list = [og for og in db_og_ids if og in aligned and og not in already_scored_ogs]
+sys.stderr.write(f'OGs remaining to process: {len(og_list)}\\n')
 
 if not og_list:
-    sys.stderr.write('WARNING: No OGs found. Falling back to pkl motifs_by_og\\n')
-    og_list = sorted(og for og in motifs if og in aligned)
-    sys.stderr.write(f'Fallback OGs from pkl: {len(og_list)}\\n')
+    sys.stderr.write('All OGs already scored — writing empty sentinel batch.\\n')
+    with open('og_batch_0000.txt', 'w') as f:
+        f.write('')
+    sys.exit(0)
 
 # Pre-filter: skip OGs with < 4 unique species (HyPhy minimum)
 filtered = []
@@ -121,8 +143,14 @@ for og in og_list:
         filtered.append(og)
     else:
         skipped += 1
-sys.stderr.write(f'Pre-filter: {len(filtered)} OGs with >=4 species, {skipped} skipped\\n')
+sys.stderr.write(f'Pre-filter: {len(filtered)} OGs with >=4 species, {skipped} skipped (<4 sp)\\n')
 og_list = filtered
+
+if not og_list:
+    sys.stderr.write('No OGs pass pre-filter — writing empty sentinel batch.\\n')
+    with open('og_batch_0000.txt', 'w') as f:
+        f.write('')
+    sys.exit(0)
 
 n_batches = math.ceil(len(og_list) / batch_size)
 for i in range(n_batches):
@@ -348,6 +376,7 @@ process convergence_scoring {
     """
     python -m scripts.nf_wrappers.run_step \
         --step step7 \
+        --skip-if-done \
         --db-url '${params.db_url}' \
         --storage-root '${params.storage_root}'
     DATABASE_URL='${params.db_url}' BIORESILIENT_STORAGE_ROOT='${params.storage_root}' \
@@ -371,6 +400,7 @@ process convergent_aa {
     """
     python -m scripts.nf_wrappers.run_step \
         --step step7b \
+        --skip-if-done \
         --db-url '${params.db_url}' \
         --storage-root '${params.storage_root}'
     DATABASE_URL='${params.db_url}' BIORESILIENT_STORAGE_ROOT='${params.storage_root}' \

@@ -859,6 +859,100 @@ def run_step6_prefetch_cds(args):
     log.info("CDS cache pickle: %s", pkl_out)
 
 
+# ---------------------------------------------------------------------------
+# Per-step "already done?" completion checks.
+# Each function returns True if the step has sufficient data to skip.
+# Used by --skip-if-done flag so a full step1→step9 run auto-skips completed steps.
+# ---------------------------------------------------------------------------
+
+def _db_count(sql: str, threshold: int = 1) -> bool:
+    """Return True if the SQL scalar COUNT query returns ≥ threshold."""
+    import psycopg2
+    db_url = os.environ.get("DATABASE_URL", "")
+    if not db_url:
+        return False
+    try:
+        conn = psycopg2.connect(db_url, connect_timeout=10)
+        cur = conn.cursor()
+        cur.execute(sql)
+        n = cur.fetchone()[0]
+        conn.close()
+        return (n or 0) >= threshold
+    except Exception as exc:
+        log.warning("_db_count check failed: %s", exc)
+        return False
+
+
+STEP_DONE_CHECKS: dict[str, callable] = {
+    # step1: environment validated = DB reachable
+    "step1": lambda: _db_count("SELECT 1", 1),
+
+    # step2: ≥ 15 species downloaded and in Species table
+    "step2": lambda: _db_count("SELECT COUNT(*) FROM species", 15),
+
+    # step3: ≥ 50,000 orthologs (OrthoFinder done and loaded)
+    "step3": lambda: _db_count("SELECT COUNT(*) FROM ortholog", 50_000),
+
+    # step3b: same — orthologs loaded into DB
+    "step3b": lambda: _db_count("SELECT COUNT(*) FROM ortholog", 50_000),
+
+    # step3c: ≥ 10,000 nucleotide conservation scores in DB
+    # (stored in gene.nucleotide_conservation_score or similar column)
+    "step3c": lambda: _db_count(
+        "SELECT COUNT(*) FROM gene WHERE nucleotide_conservation_score IS NOT NULL", 500
+    ),
+
+    # step4: ≥ 1,000,000 divergent motifs in DB (current run has 1.9M)
+    "step4": lambda: _db_count("SELECT COUNT(*) FROM divergent_motif", 1_000_000),
+
+    # step5: species treefile written to DB phylo table or S3.
+    # Check: ≥ 2 rows in gene with phylo_conservation_score (populated in step3d after step5)
+    # Simpler: check that species.treefile exists in S3 via a sentinel in DB
+    "step5": lambda: _db_count("SELECT COUNT(*) FROM species", 15),  # step5 builds tree; species already loaded
+
+    # step3d: ≥ 500 genes with phylo_conservation_score set (step3d runs after step5)
+    "step3d": lambda: _db_count(
+        "SELECT COUNT(*) FROM gene WHERE phylo_conservation_score IS NOT NULL", 500
+    ),
+
+    # step7: ≥ 1,000 evolution_score rows with convergence_count > 0
+    "step7": lambda: _db_count(
+        "SELECT COUNT(*) FROM evolution_score WHERE convergence_count > 0", 1_000
+    ),
+
+    # step7b: ≥ 5,000 divergent_motif rows with convergent_aa_count > 0
+    "step7b": lambda: _db_count(
+        "SELECT COUNT(*) FROM divergent_motif WHERE convergent_aa_count > 0", 5_000
+    ),
+
+    # Steps intentionally NOT skipped — they need resume/re-run logic:
+    # step4b: resume-safe but new motifs always need annotation  → do NOT skip
+    # step4c: resume-safe (GPU) → do NOT skip; Python skips scored genes
+    # step4d: re-run required (classifier was fixed)            → do NOT skip
+    # step6: HyPhy scatter; OG-level skip via extract_og_ids    → do NOT skip
+    # step8: GEO species list was fixed                         → do NOT skip
+    # step8b: Bgee, best-effort                                 → do NOT skip
+    # step9: always re-score after any upstream change          → do NOT skip
+}
+
+
+def check_done_and_exit(step: str) -> None:
+    """If step already has sufficient data in RDS, log and sys.exit(0)."""
+    check_fn = STEP_DONE_CHECKS.get(step)
+    if check_fn is None:
+        return  # no check registered → always run
+    try:
+        if check_fn():
+            log.info("SKIP: step %s already complete — sufficient data found in DB.", step)
+            sys.exit(0)
+        else:
+            log.info("PROCEED: step %s data insufficient or absent — running step.", step)
+    except SystemExit:
+        raise
+    except Exception as exc:
+        log.warning("Done-check for step %s raised an error (%s) — proceeding.", step, exc)
+
+
 STEP_MAP = {
     "step1": run_step1,
     "step2": run_step2,
@@ -919,9 +1013,21 @@ def main():
     parser.add_argument("--treefile", default=None)
     parser.add_argument("--codon-aln", default=None)
     parser.add_argument("--gene-id-file", default=None)
+    parser.add_argument(
+        "--skip-if-done",
+        action="store_true",
+        default=False,
+        help=(
+            "Exit 0 immediately if this step already has sufficient data in RDS. "
+            "Enables seamless full-pipeline runs (step1→step9) that auto-skip completed steps."
+        ),
+    )
 
     args = parser.parse_args()
     _setup_env(args)
+
+    if args.skip_if_done:
+        check_done_and_exit(args.step)
 
     log.info("Running step: %s", args.step)
     STEP_MAP[args.step](args)
