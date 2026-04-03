@@ -523,7 +523,7 @@ def annotate_motif_consequences(
             with conn.cursor() as cur:
                 cur.execute(
                     "CREATE TEMP TABLE _am_scores "
-                    "(motif_id UUID, score DOUBLE PRECISION) ON COMMIT DROP"
+                    "(motif_id VARCHAR, score DOUBLE PRECISION) ON COMMIT DROP"
                 )
                 buf = io.StringIO()
                 for motif_id, score in scored_pairs:
