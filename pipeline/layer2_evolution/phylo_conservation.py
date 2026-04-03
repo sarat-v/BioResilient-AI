@@ -288,16 +288,33 @@ def _fit_neutral_model(treefile: Path, concat_aln: Path) -> Optional[Path]:
 
 
 def _parse_phylop_output(stdout: str) -> Optional[float]:
-    """Parse phyloP --wig-scores output and return the mean conservation score."""
+    """Parse phyloP --wig-scores output and return the mean conservation score.
+
+    phyloP emits WIG format which contains header lines like:
+      fixedStep chrom=gene1 start=1 step=1
+    Taking line.split()[-1] on a score-only line is correct, but on a header
+    line it yields tokens like "step=1" (ValueError, skipped) or large integers
+    from start= coordinates.  We guard against misparsed header tokens by
+    clamping to the physically meaningful phyloP range [-30, 30]; anything
+    outside that range is a coordinate or header artefact, not a real score.
+    """
+    _PHYLOP_MIN, _PHYLOP_MAX = -30.0, 30.0
     scores = []
     for line in stdout.strip().splitlines():
         line = line.strip()
         if not line or line.startswith("#"):
             continue
+        # Skip WIG header lines (fixedStep / variableStep / track)
+        if line.startswith(("fixedStep", "variableStep", "track")):
+            continue
+        # WIG variableStep lines: "position score" — take the last token
         try:
-            scores.append(float(line.split()[-1]))
+            val = float(line.split()[-1])
         except ValueError:
             continue
+        if _PHYLOP_MIN <= val <= _PHYLOP_MAX:
+            scores.append(val)
+        # else: silently discard — it's a misparsed coordinate or header artefact
     if not scores:
         return None
     return round(sum(scores) / len(scores), 4)
