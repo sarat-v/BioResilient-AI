@@ -684,14 +684,33 @@ def step8_expression(species_list: list[dict], dry_run: bool = False) -> None:
 
 
 def step8b_bgee(dry_run: bool = False) -> None:
-    """Supplement expression data with Bgee curated cross-species calls."""
+    """Supplement expression data with Bgee curated cross-species calls.
+
+    Runs for ALL genes on the first pass (step9 hasn't assigned tiers yet).
+    On re-runs after step9 has run, the tier-filtered default is sufficient.
+    """
     log.info("Step 8b: Bgee cross-species expression supplement...")
     if dry_run:
         return
 
+    from db.models import CandidateScore
+    from db.session import get_session
     from pipeline.layer1_sequence.bgee import run_bgee_pipeline
-    n = run_bgee_pipeline()
-    log.info("  Bgee: %d expression rows added.", n)
+
+    # Check whether step9 has run — if no CandidateScore rows exist, run for all.
+    try:
+        with get_session() as session:
+            tier1_count = (
+                session.query(CandidateScore)
+                .filter(CandidateScore.tier.in_(["Tier1", "Tier2"]))
+                .count()
+            )
+        first_pass = tier1_count == 0
+    except Exception:
+        first_pass = True
+
+    n = run_bgee_pipeline(all_genes=first_pass)
+    log.info("  Bgee: %d expression rows added (all_genes=%s).", n, first_pass)
 
 
 def step9_composite_score(dry_run: bool = False) -> None:

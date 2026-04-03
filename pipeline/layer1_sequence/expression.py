@@ -21,8 +21,28 @@ from pipeline.config import get_ncbi_api_key, get_ncbi_email, get_local_storage_
 
 log = logging.getLogger(__name__)
 
-# Species known to have useful GEO datasets in Phase 1
-GEO_PRIORITY_SPECIES = {"ground_squirrel", "naked_mole_rat", "axolotl", "spiny_mouse", "mouse_lemur"}
+# Species from our 18-species registry that are cancer-resistant and have
+# geo_search_terms defined in config/species_registry.json.
+# Ground squirrel / axolotl / spiny_mouse are placeholders from an earlier
+# version of the species list and are not in our current registry — removed.
+GEO_PRIORITY_SPECIES = {
+    # Rodent cancer-resistant clade (all have geo_search_terms in registry)
+    "naked_mole_rat",
+    "blind_mole_rat",
+    "damaraland_mole_rat",
+    "beaver",
+    # Cetaceans — sparse GEO data, but worth trying
+    "bowhead_whale",
+    "sperm_whale",
+    # Proboscideans
+    "african_elephant",
+    "asian_elephant",
+    # Long-lived outliers
+    "greenland_shark",
+    "ocean_quahog_clam",
+    # Other
+    "little_brown_bat",
+}
 
 
 def search_geo(species_id: str, search_terms: list[str]) -> list[str]:

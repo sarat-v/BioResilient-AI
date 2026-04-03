@@ -363,12 +363,23 @@ def _motif_overlaps_domain(motif_start: int, motif_end: int, domain: dict) -> bo
 # Main annotation entry point
 # --------------------------------------------------------------------------- #
 
-def annotate_motif_domains(gene_ids: Optional[list[str]] = None) -> int:
+def annotate_motif_domains(
+    gene_ids: Optional[list[str]] = None,
+    force_rerun: bool = False,
+) -> int:
     """Annotate DivergentMotif rows with domain information.
 
     1. Load genes that have divergent motifs (skip the rest).
-    2. Fetch domain positions using the configured _STRATEGY.
-    3. Apply overlaps and write to DB in a single session commit.
+    2. Skip genes whose motifs have already been domain-annotated (resume-safe).
+    3. Fetch domain positions using the configured _STRATEGY (UniProt batch).
+    4. Hybrid fallback: genes that got 0 domains from UniProt are re-queried
+       via InterPro which aggregates Pfam, SMART, SUPERFAMILY, ProSite etc.
+       and typically raises domain coverage from ~15% to ~25%.
+    5. Apply overlaps and write to DB in batched commits.
+
+    Args:
+        gene_ids: Optional list of gene IDs to limit processing.
+        force_rerun: If True, re-annotate even genes already processed.
 
     Returns number of motifs annotated as in_functional_domain=True.
     """
@@ -386,6 +397,28 @@ def annotate_motif_domains(gene_ids: Optional[list[str]] = None) -> int:
             .all()
         }
         genes = [g for g in all_genes if g.id in genes_with_motifs]
+
+        # Resume: skip genes whose motifs already have in_functional_domain set.
+        # in_functional_domain is None when unannotated, True/False after annotation.
+        if not force_rerun:
+            already_annotated = {
+                row[0] for row in
+                session.query(Ortholog.gene_id)
+                .join(DivergentMotif, DivergentMotif.ortholog_id == Ortholog.id)
+                .filter(DivergentMotif.in_functional_domain.isnot(None))
+                .distinct()
+                .all()
+            }
+            genes_before = len(genes)
+            genes = [g for g in genes if g.id not in already_annotated]
+            if already_annotated:
+                log.info(
+                    "Resume: skipping %d already-annotated genes; %d remaining.",
+                    genes_before - len(genes), len(genes),
+                )
+        if not genes:
+            log.info("All genes already domain-annotated. Use force_rerun=True to redo.")
+            return 0
 
     log.info("Annotating domains for %d genes with motifs (strategy=%s)...",
              len(genes), _STRATEGY)
@@ -460,13 +493,39 @@ def annotate_motif_domains(gene_ids: Optional[list[str]] = None) -> int:
         # InterPro: domain_map is already keyed by gene_id
         domain_map = fetch_domains_interpro(fetch_args)
 
+    # ------------------------------------------------------------------ #
+    # Hybrid fallback: InterPro for genes that got 0 domains from UniProt.
+    # InterPro aggregates Pfam, SMART, SUPERFAMILY, ProSite and typically
+    # covers ~70% of protein sequence vs ~40% for UniProt alone.
+    # ------------------------------------------------------------------ #
+    zero_domain_genes = [
+        (gene.id, _get_accession(gene))
+        for gene in genes
+        if not domain_map.get(gene.id)
+    ]
+    if zero_domain_genes:
+        log.info(
+            "InterPro hybrid: %d genes got 0 domains from UniProt — querying InterPro...",
+            len(zero_domain_genes),
+        )
+        valid_fallback = [(gid, acc) for gid, acc in zero_domain_genes if acc]
+        if valid_fallback:
+            interpro_results = fetch_domains_interpro(valid_fallback)
+            recovered = sum(1 for doms in interpro_results.values() if doms)
+            log.info("  InterPro hybrid: %d / %d genes recovered domains.", recovered, len(valid_fallback))
+            for gid, doms in interpro_results.items():
+                if doms:
+                    domain_map[gid] = doms
+
     log.info("All domain annotations fetched. Applying to motifs and writing to DB...")
 
     # ------------------------------------------------------------------ #
-    # Apply overlaps in a single DB session
+    # Apply overlaps — commit every 500 genes to avoid large transactions
     # ------------------------------------------------------------------ #
+    COMMIT_BATCH = 500
     functional_count = 0
     with get_session() as session:
+        batch_count = 0
         for gene in genes:
             domains = domain_map.get(gene.id, [])
             if not domains:
@@ -496,12 +555,20 @@ def annotate_motif_domains(gene_ids: Optional[list[str]] = None) -> int:
                 else:
                     motif.in_functional_domain = False
 
+            batch_count += 1
+            if batch_count % COMMIT_BATCH == 0:
+                session.commit()
+                log.info("  Domain annotation: committed %d / %d genes.", batch_count, len(genes))
+
         session.commit()
 
     log.info("Domain annotation complete: %d motifs in functional domains.", functional_count)
     return functional_count
 
 
-def run_pfam_pipeline(gene_ids: Optional[list[str]] = None) -> int:
+def run_pfam_pipeline(
+    gene_ids: Optional[list[str]] = None,
+    force_rerun: bool = False,
+) -> int:
     """Entry point called from orchestrator step4b."""
-    return annotate_motif_domains(gene_ids)
+    return annotate_motif_domains(gene_ids, force_rerun=force_rerun)

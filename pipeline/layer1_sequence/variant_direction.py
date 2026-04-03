@@ -312,8 +312,24 @@ def classify_motif_direction(
         consequence_score: AlphaMissense score in [0,1] (high = pathogenic in human)
         loeuf: gnomAD LOEUF value (low = LoF intolerant in human population)
 
-    When loeuf is None (no gnomAD data), constraint is treated as unknown and the
-    label defaults to 'neutral' rather than assuming either tolerant or intolerant.
+    Classification matrix:
+    ┌─────────────────────────────────────────────────────────────────────────────┐
+    │ ESM destab (LLR < -2) + AM high (> 0.6) + LOEUF tolerant (> 0.5)          │
+    │   → loss_of_function  (gene can tolerate LoF; likely protective LoF)       │
+    │ ESM destab + AM high + LOEUF intolerant (≤ 0.5)                            │
+    │   → functional_shift  (LoF-intolerant gene changed anyway — adaptive)      │
+    │ ESM destab + AM high + LOEUF unknown (None)                                │
+    │   → functional_shift  (direction unknown but clearly functional change)    │
+    │ AM high only (ESM neutral/absent)                                           │
+    │   → gain_of_function  (AM says pathogenic but not structurally destab)     │
+    │ All other                                                                   │
+    │   → neutral                                                                 │
+    └─────────────────────────────────────────────────────────────────────────────┘
+
+    Correction vs previous version: when loeuf is None, we previously returned
+    'neutral' even with strong ESM + AM signals. This caused the 90% neutral rate
+    in step4d because ~40% of genes lack gnomAD LOEUF entries. We now return
+    'functional_shift' — we know the variant is functional, direction uncertain.
 
     Note: These scores are derived from human-centric ML models. A variant
     flagged as 'functional_shift' may actually represent successful adaptation
@@ -324,8 +340,11 @@ def classify_motif_direction(
 
     if esm_destab and am_high:
         if loeuf is None:
-            # Unknown constraint: cannot confidently assign LoF vs functional_shift
-            return "neutral"
+            # We have strong signals from both ESM-1v and AlphaMissense — something
+            # is clearly different functionally. LOEUF unknown means we can't determine
+            # the human tolerance direction, so we call it functional_shift rather than
+            # silencing the signal by calling it neutral.
+            return "functional_shift"
         if loeuf > _LOEUF_INTOLERANT_THRESHOLD:
             return "loss_of_function"
         else:

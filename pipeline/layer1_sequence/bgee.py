@@ -199,6 +199,7 @@ def _query_bgee_for_gene(
 def run_bgee_pipeline(
     gene_ids: Optional[list[str]] = None,
     trait_id: str = "",
+    all_genes: bool = False,
 ) -> int:
     """Query Bgee for cross-species expression data for candidate genes.
 
@@ -206,8 +207,12 @@ def run_bgee_pipeline(
     in a single session commit.
 
     Args:
-        gene_ids: Optional list of gene IDs to process (default: Tier1+Tier2).
+        gene_ids: Optional explicit list of gene IDs to process.
         trait_id: Trait preset id for tissue relevance mapping.
+        all_genes: If True, run for every gene in the DB regardless of tier.
+                   Use this for the first pipeline run before tiers are assigned
+                   (step8 runs before step9, so no Tier1/Tier2 exist yet).
+                   Default is False (original Tier1+Tier2 only behaviour).
 
     Returns:
         Number of ExpressionResult rows written.
@@ -215,7 +220,15 @@ def run_bgee_pipeline(
     trait_tissues = TRAIT_TISSUES.get(trait_id, TRAIT_TISSUES["default"])
 
     with get_session() as session:
-        if gene_ids is None:
+        if gene_ids is not None:
+            # Explicit list provided — use it directly
+            pass
+        elif all_genes:
+            # Run for every gene in the DB (pre-tier / first pass)
+            gene_ids = [g.id for g in session.query(Gene).all()]
+            log.info("Bgee: running for all %d genes (all_genes=True).", len(gene_ids))
+        else:
+            # Original behaviour: Tier1+Tier2 only
             rows = (
                 session.query(CandidateScore.gene_id)
                 .filter(
@@ -227,7 +240,7 @@ def run_bgee_pipeline(
             gene_ids = [r[0] for r in rows]
 
         if not gene_ids:
-            log.info("  Bgee: no Tier1/Tier2 genes found — skipping.")
+            log.info("  Bgee: no genes found — skipping. Pass all_genes=True to run for all.")
             return 0
 
         genes = session.query(Gene).filter(Gene.id.in_(gene_ids)).all()

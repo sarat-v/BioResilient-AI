@@ -214,14 +214,20 @@ def compute_esm1v_llr(
     )
 
 
-def annotate_esm1v_scores(gene_ids: Optional[list[str]] = None) -> int:
+def annotate_esm1v_scores(
+    gene_ids: Optional[list[str]] = None,
+    force_rerun: bool = False,
+) -> int:
     """Annotate DivergentMotif rows with ESM-1v variant effect scores.
 
     Optimised GPU path:
       - One forward pass per unique human protein sequence (not per motif).
       - For each protein, all motifs across all non-human orthologs are scored
         from the single cached log-probability tensor.
-      - Results are written back to DB in a single commit per gene.
+      - Results are written back to DB in a single bulk UPDATE per batch.
+
+    Resume-safe: genes where ALL motifs already have esm1v_score set are
+    skipped automatically. Use force_rerun=True to override.
 
     Returns number of motifs scored.
     """
@@ -237,6 +243,34 @@ def annotate_esm1v_scores(gene_ids: Optional[list[str]] = None) -> int:
     with get_session() as session:
         if gene_ids is None:
             gene_ids = [g.id for g in session.query(Gene).all()]
+
+        # Resume: find genes where every motif already has an esm1v_score.
+        # We skip those entirely — if even one motif is unscored the gene is included.
+        if not force_rerun:
+            from sqlalchemy import func as _func
+            already_done: set[str] = set()
+            for gid in gene_ids:
+                total_motifs = (
+                    session.query(_func.count(DivergentMotif.id))
+                    .join(Ortholog, DivergentMotif.ortholog_id == Ortholog.id)
+                    .filter(Ortholog.gene_id == gid)
+                    .scalar()
+                ) or 0
+                scored_motifs = (
+                    session.query(_func.count(DivergentMotif.id))
+                    .join(Ortholog, DivergentMotif.ortholog_id == Ortholog.id)
+                    .filter(Ortholog.gene_id == gid, DivergentMotif.esm1v_score.isnot(None))
+                    .scalar()
+                ) or 0
+                if total_motifs > 0 and scored_motifs == total_motifs:
+                    already_done.add(gid)
+
+            if already_done:
+                gene_ids = [gid for gid in gene_ids if gid not in already_done]
+                log.info(
+                    "Resume: skipping %d fully-scored genes; %d genes remaining.",
+                    len(already_done), len(gene_ids),
+                )
 
         # Pre-fetch everything we need while session is open
         gene_data: list[tuple[str, str, list]] = []
@@ -340,6 +374,9 @@ def annotate_esm1v_scores(gene_ids: Optional[list[str]] = None) -> int:
     return scored
 
 
-def run_esm1v_pipeline(gene_ids: Optional[list[str]] = None) -> int:
+def run_esm1v_pipeline(
+    gene_ids: Optional[list[str]] = None,
+    force_rerun: bool = False,
+) -> int:
     """Entry point called from orchestrator step4c."""
-    return annotate_esm1v_scores(gene_ids)
+    return annotate_esm1v_scores(gene_ids, force_rerun=force_rerun)
