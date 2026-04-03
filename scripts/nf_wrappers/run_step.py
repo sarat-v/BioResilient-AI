@@ -177,6 +177,53 @@ def run_step4d(args):
     step4d_variant_direction()
 
 
+def run_step4d_scatter(args):
+    """Emit N gene-batch files for parallel variant direction classification.
+
+    Queries all gene_ids that have divergent motifs and splits them into
+    batches of ~500 genes per file → typically 25–30 batch files for our
+    12k-gene dataset.  Each file is named direction_batch_NNN.txt.
+    """
+    from db.models import Gene, Ortholog, DivergentMotif
+    from db.session import get_session
+
+    batch_size = 500  # genes per chunk; each chunk ~1–5 min on spot
+
+    with get_session() as session:
+        gene_ids = [
+            row[0] for row in (
+                session.query(Gene.id)
+                .join(Ortholog, Ortholog.gene_id == Gene.id)
+                .join(DivergentMotif, DivergentMotif.ortholog_id == Ortholog.id)
+                .distinct()
+            )
+        ]
+
+    log.info("step4d_scatter: %d genes → batches of %d", len(gene_ids), batch_size)
+
+    for idx in range(0, len(gene_ids), batch_size):
+        batch = gene_ids[idx : idx + batch_size]
+        fname = f"direction_batch_{idx // batch_size:04d}.txt"
+        with open(fname, "w") as fh:
+            fh.write("\n".join(batch))
+        log.info("  Wrote %s (%d genes)", fname, len(batch))
+
+    log.info("step4d_scatter: %d batch files written.", (len(gene_ids) + batch_size - 1) // batch_size)
+
+
+def run_step4d_chunk(args):
+    """Classify variant directions for the gene subset in args.gene_id_file."""
+    if not args.gene_id_file:
+        raise ValueError("--gene-id-file is required for step4d_chunk")
+
+    gene_ids = [line.strip() for line in open(args.gene_id_file) if line.strip()]
+    log.info("step4d_chunk: %d genes from %s", len(gene_ids), args.gene_id_file)
+
+    from pipeline.layer1_sequence.variant_direction import run_variant_direction_pipeline
+    n = run_variant_direction_pipeline(gene_ids=gene_ids)
+    log.info("step4d_chunk: %d motifs classified.", n)
+
+
 def run_step5(args):
     from pipeline.orchestrator import step5_phylogenetic_tree
     import shutil as _shutil
@@ -1081,6 +1128,8 @@ STEP_MAP = {
     "step4c": run_step4c,
     "step4c_chunk": run_step4c_chunk,
     "step4d": run_step4d,
+    "step4d_scatter": run_step4d_scatter,
+    "step4d_chunk": run_step4d_chunk,
     "step5": run_step5,
     "step6_single_og": run_step6_single_og,
     "step6_prefetch_cds": run_step6_prefetch_cds,
