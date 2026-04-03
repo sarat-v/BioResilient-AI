@@ -24,9 +24,13 @@ RUN pip install \
 
 COPY pipeline/ /app/pipeline/
 COPY db/ /app/db/
-COPY config/ /app/config/
 COPY alembic.ini /app/alembic.ini
 COPY scripts/nf_wrappers/ /app/scripts/nf_wrappers/
 COPY scripts/pipeline_health_check.py /app/scripts/pipeline_health_check.py
+
+# Copy config last so changes to environment.yml (which is gitignored and not
+# tracked by Docker's content-hash cache) always land in a fresh layer.
+# This prevents stale esm_chunk_size / threshold values from being baked in.
+COPY config/ /app/config/
 
 ENV PYTHONPATH=/app
