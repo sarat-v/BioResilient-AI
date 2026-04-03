@@ -385,7 +385,17 @@ def annotate_esm1v_scores(
             if llr is not None:
                 pending_updates.append((motif.id, llr))
             else:
-                # All substitution positions were beyond the ESM window (≥1022).
+                # All substitution positions fall beyond the ESM forward-pass window.
+                # This should only happen when esm_chunk_size < protein_len — if so,
+                # the fix is to raise esm_chunk_size to 1022 in config/environment.yml.
+                max_pos = log_probs.shape[0]
+                beyond = [p for p, _, _ in substitutions if p >= max_pos]
+                if beyond:
+                    log.debug(
+                        "Motif %s: %d/%d substitutions beyond ESM window "
+                        "(max_pos=%d, esm_chunk_size likely too small — set to 1022).",
+                        motif.id, len(beyond), len(substitutions), max_pos,
+                    )
                 pending_updates.append((motif.id, 0.0))
 
         if len(pending_updates) >= BATCH_SIZE:
