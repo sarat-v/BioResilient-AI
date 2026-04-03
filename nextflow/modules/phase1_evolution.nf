@@ -21,17 +21,18 @@ process build_species_tree {
     script:
     """
     # Fusion maps s3://bucket/ → /bucket/ — use the POSIX path, no aws CLI needed.
+    # Use cp, not ln -sf: symlinks don't survive Fusion cross-process staging.
     FUSION_TREE=\$(echo '${params.storage_root}' | sed 's|s3://|/|')/phylo/species.treefile
     if [ -f "\$FUSION_TREE" ]; then
         echo "step5: treefile already in S3 — skipping IQ-TREE2 rebuild."
-        ln -sf "\$FUSION_TREE" species.treefile
+        cp "\$FUSION_TREE" species.treefile
     else
         python -m scripts.nf_wrappers.run_step \
             --step step5 \
             --input-pkl '${aligned_pkl}' \
             --db-url '${params.db_url}' \
             --storage-root '${params.storage_root}'
-        ln -sf "\$FUSION_TREE" species.treefile \
+        cp "\$FUSION_TREE" species.treefile \
             || { echo "ERROR: species.treefile not found after step5" >&2; exit 1; }
     fi
     DATABASE_URL='${params.db_url}' BIORESILIENT_STORAGE_ROOT='${params.storage_root}' \
