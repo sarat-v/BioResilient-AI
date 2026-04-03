@@ -70,6 +70,28 @@ def _s3_download(storage_root: str, relative_path: str, dst: Path) -> None:
         shutil.copy2(str(src), str(dst))
 
 
+def _s3_upload(storage_root: str, relative_path: str, src: Path) -> None:
+    """Upload *src* to *relative_path* under *storage_root*.
+
+    Mirrors _s3_download — uses boto3 for S3, plain copy for local.
+    """
+    if storage_root.startswith("s3://"):
+        import boto3
+        bucket = storage_root[len("s3://"):]
+        log.info("Uploading %s → s3://%s/%s", src, bucket, relative_path)
+        boto3.client("s3").upload_file(str(src), bucket, relative_path)
+    elif storage_root.startswith("gs://"):
+        from google.cloud import storage as gcs
+        bucket_name, prefix = storage_root[len("gs://"):].split("/", 1) if "/" in storage_root[len("gs://"):] else (storage_root[len("gs://"):], "")
+        blob_name = f"{prefix}/{relative_path}".lstrip("/")
+        gcs.Client().bucket(bucket_name).blob(blob_name).upload_from_filename(str(src))
+    else:
+        import shutil
+        dst_path = Path(storage_root) / relative_path
+        dst_path.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(str(src), str(dst_path))
+
+
 def _s3_exists(storage_root: str, relative_path: str) -> bool:
     """Return True if *relative_path* exists under *storage_root*."""
     if storage_root.startswith("s3://"):
@@ -157,16 +179,25 @@ def run_step4d(args):
 
 def run_step5(args):
     from pipeline.orchestrator import step5_phylogenetic_tree
+    import shutil as _shutil
     data = _load_aligned(args.input_pkl)
     aligned = data.get("aligned", data)
     treefile = step5_phylogenetic_tree(aligned)
     log.info("Tree written to %s", treefile)
-    # Download treefile into the NF work dir so Nextflow can stage it downstream.
+    # Copy treefile into the NF work dir so Nextflow can stage it downstream.
+    # treefile is a local path (e.g. /tmp/bioresilient/phylo/species.treefile)
+    # — cannot _s3_download it; it was never uploaded by step5_phylogenetic_tree.
     dst = Path("species.treefile")
     if not dst.exists():
-        storage = os.environ.get("BIORESILIENT_STORAGE_ROOT", ".")
-        _s3_download(storage, "phylo/species.treefile", dst)
-        log.info("species.treefile ready in work dir (%.1f KB)", dst.stat().st_size / 1e3)
+        _shutil.copy2(str(treefile), str(dst))
+    log.info("species.treefile ready in work dir (%.1f KB)", dst.stat().st_size / 1e3)
+    # Upload to S3 cache/ so future runs find it via the done-check.
+    storage = os.environ.get("BIORESILIENT_STORAGE_ROOT", ".")
+    try:
+        _s3_upload(storage, "cache/species.treefile", dst)
+        log.info("species.treefile uploaded to %s/cache/", storage)
+    except Exception as exc:
+        log.warning("Failed to upload species.treefile to storage: %s", exc)
 
 
 def run_step6_single_og(args):
@@ -954,8 +985,9 @@ STEP_DONE_CHECKS: dict[str, callable] = {
     "step4": lambda: _db_count("SELECT COUNT(*) FROM divergent_motif", 1_000_000),
 
     # step5: species tree built — check that treefile exists in storage via boto3
+    # Stored at cache/species.treefile (same prefix as aligned_orthogroups.pkl)
     "step5": lambda: _s3_exists(
-        os.environ.get("BIORESILIENT_STORAGE_ROOT", "."), "phylo/species.treefile"
+        os.environ.get("BIORESILIENT_STORAGE_ROOT", "."), "cache/species.treefile"
     ),
 
     # step3d: ≥ 500 genes with phylo_conservation_score set (step3d runs after step5)
@@ -999,8 +1031,8 @@ def _provide_step5_outputs(args) -> None:
     dst = Path("species.treefile")
     if not dst.exists():
         storage = os.environ.get("BIORESILIENT_STORAGE_ROOT", ".")
-        log.info("step5 skip: downloading species.treefile from %s/phylo/", storage)
-        _s3_download(storage, "phylo/species.treefile", dst)
+        log.info("step5 skip: downloading species.treefile from %s/cache/", storage)
+        _s3_download(storage, "cache/species.treefile", dst)
 
 
 # Registry of output-file providers called when a step is skipped.
