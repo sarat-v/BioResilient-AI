@@ -516,6 +516,18 @@ def annotate_motif_consequences(
     # ── Phase 2: COPY → temp table → single bulk UPDATE ─────────────────────
     log.info("Writing %d consequence scores via bulk COPY + UPDATE...", scored)
 
+    # Dispose the SQLAlchemy connection pool before opening a raw psycopg2
+    # connection.  Step 4b runs pfam THEN alphamissense in the same process;
+    # pfam's ORM commits leave pooled connections open.  With two active
+    # connections from the same process touching divergent_motif in different
+    # lock orders, PostgreSQL can deadlock them.  Disposing the pool ensures
+    # only one connection is active during the bulk write.
+    try:
+        from db.session import get_engine as _get_engine
+        _get_engine().dispose()
+    except Exception:
+        pass
+
     db_url = os.environ["DATABASE_URL"]
     conn = psycopg2.connect(db_url)
     try:
