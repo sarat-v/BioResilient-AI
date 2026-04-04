@@ -558,9 +558,11 @@ def run_step6_batch(args):
     out_dir = Path(args.output_dir or ".")
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    # How many OGs to run in parallel: 1 OG uses 4 HyPhy threads, so parallelism = cpu_count // 4
-    n_og_parallel = max(1, (os.cpu_count() or 4) // 4)
-    log.info("OG-level parallelism: %d concurrent OGs (cpu_count=%d)", n_og_parallel, os.cpu_count() or 4)
+    # Use NF_TASK_CPUS (set by Nextflow to task.cpus) to avoid oversubscription.
+    # os.cpu_count() returns HOST cpu count which can be 2x+ the allocated container CPUs.
+    allocated_cpus = int(os.environ.get('NF_TASK_CPUS', os.cpu_count() or 4))
+    n_og_parallel = max(1, allocated_cpus // 4)
+    log.info("OG-level parallelism: %d concurrent OGs (allocated_cpus=%d)", n_og_parallel, allocated_cpus)
 
     def _process_og(og_id: str) -> None:
         og_out = out_dir / og_id

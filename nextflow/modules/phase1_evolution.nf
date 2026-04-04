@@ -209,6 +209,7 @@ process run_meme {
     """
     echo "hyphy_v18_spot_bustedph_batch10"
     export HYPHY_CPUS=1          # 1 CPU per tool: 4 tools × 1 = 4 total (BUSTED-PH+FEL+BUSTED+RELAX)
+    export NF_TASK_CPUS=${task.cpus}  # actual allocated CPUs so Python uses correct OG parallelism
     mkdir -p '${og_batch.baseName}'
     python -m scripts.nf_wrappers.run_step \
         --step step6_batch \
