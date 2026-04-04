@@ -566,6 +566,11 @@ def run_step6_batch(args):
         og_out = out_dir / og_id
         og_out.mkdir(parents=True, exist_ok=True)
 
+        result_file = og_out / "result.json"
+        if result_file.exists() and result_file.stat().st_size > 0:
+            log.info("OG %s: result.json exists, skipping", og_id)
+            return
+
         if og_id not in aligned:
             log.warning("OG %s not in aligned data, skipping", og_id)
             with open(og_out / "result.json", "w") as f:

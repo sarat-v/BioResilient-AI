@@ -995,7 +995,7 @@ def run_fel(
             "--output", str(out_path),
             "--full-model", "No",
         ]
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=600, env=hyphy_env)
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=300, env=hyphy_env)
         if result.returncode != 0:
             log.warning("FEL failed for %s (rc=%d): %s", og_id, result.returncode, result.stderr[:300])
             return None
@@ -1105,9 +1105,9 @@ def run_busted(
             "--alignment", str(aln_path),
             "--tree", str(tree_path),
             "--output", str(out_path),
-            "--srv", "Yes",
+            # --srv Yes omitted: SRV is 2-4x slower with marginal sensitivity gain at pipeline scale
         ]
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=600, env=hyphy_env)
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=300, env=hyphy_env)
         if result.returncode != 0:
             log.warning("BUSTED failed for %s (rc=%d): %s", og_id, result.returncode, result.stderr[:300])
             return None
@@ -1216,10 +1216,10 @@ def run_busted_ph(
             "--tree", str(tree_path),
             "--output", str(out_path),
             "--branches", "Test",
-            "--srv", "Yes",
+            # --srv Yes omitted: SRV is 2-4x slower with marginal sensitivity gain at pipeline scale
         ]
         log.info("Running BUSTED-PH for %s (CPU=%d)", og_id, cpus)
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=600, env=hyphy_env)
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=300, env=hyphy_env)
         if result.returncode != 0:
             log.warning("BUSTED-PH failed for %s (rc=%d): %s",
                         og_id, result.returncode, result.stderr[:300])
@@ -1535,11 +1535,10 @@ def run_relax(
         "--tree", str(tree_path),
         "--output", str(out_path),
         "--test", "Test",
-        # --models Minimal removed: flag only exists in HyPhy >= 2.5.50; older builds exit rc=1
-        # --quiet removed: was swallowing all HyPhy error output, making failures invisible
+        "--reference", "Reference",   # required: without this HyPhy prompts interactively → rc=1
     ]
     try:
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=600, check=False, env=hyphy_env)
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=300, check=False, env=hyphy_env)
         if result.returncode != 0 or not out_path.exists():
             log.warning("RELAX failed for %s (rc=%d): stdout=%s stderr=%s",
                         og_id, result.returncode if hasattr(result, 'returncode') else -1,
