@@ -66,6 +66,7 @@ process phylo_conservation {
 // efficient scatter — one pkl load per task instead of one per OG.
 process extract_og_ids {
     label 'base'
+    cache false
     cpus 1
     memory '16 GB'
     time '20m'
@@ -107,12 +108,12 @@ db_og_ids = sorted({row[0] for row in cur.fetchall()})
 # OGs that already have a genuine codon-based score (not aBSREL proxy).
 # Proxy results are excluded so re-runs can upgrade them to BUSTED-PH.
 cur.execute('''
-    SELECT DISTINCT g.orthofinder_og
+    SELECT DISTINCT o.orthofinder_og
     FROM evolution_score es
-    JOIN gene g ON g.id = es.gene_id
+    JOIN ortholog o ON o.gene_id = es.gene_id
     WHERE es.dnds_pvalue IS NOT NULL
       AND es.selection_model NOT IN (\'proxy\')
-      AND g.orthofinder_og IS NOT NULL
+      AND o.orthofinder_og IS NOT NULL
 ''')
 already_scored_ogs = {row[0] for row in cur.fetchall()}
 conn.close()
@@ -433,7 +434,7 @@ workflow PHASE1_EVOLUTION {
         build_species_tree(aligned_pkl_val)
         treefile_ch  = build_species_tree.out.treefile
     } else {
-        treefile_ch  = Channel.fromPath("s3://${params.s3_bucket}/cache/species.treefile")
+        treefile_ch  = Channel.fromPath("s3://${params.s3_bucket}/cache/species.treefile").first()
     }
 
     if (fromIdx <= EVO_STEPS.indexOf('step3d') && untilIdx >= EVO_STEPS.indexOf('step3d')) {
@@ -446,13 +447,15 @@ workflow PHASE1_EVOLUTION {
     if (fromIdx <= EVO_STEPS.indexOf('step6') && untilIdx >= EVO_STEPS.indexOf('step6')) {
         // Pre-fetch ALL CDS once (single task) — eliminates NCBI bottleneck in scatter
         prefetch_cds(aligned_pkl_val)
-        cds_cache_ch = prefetch_cds.out.cds_cache
+        cds_cache_ch = prefetch_cds.out.cds_cache.first()
 
         extract_og_ids(aligned_pkl_val)
         og_batches_ch = extract_og_ids.out.og_batches.flatten()
 
         // Step 6: MEME+FEL+BUSTED per OG batch (RELAX deferred)
-        run_meme(og_batches_ch, aligned_pkl_val, treefile_ch, cds_cache_ch)
+        // aligned_pkl_val and treefile_ch must be value channels so they broadcast
+        // to all 1200+ og_batch tasks rather than pairing one-to-one.
+        run_meme(og_batches_ch, aligned_pkl_val.first(), treefile_ch, cds_cache_ch)
         collect_all_hyphy_results(run_meme.out.meme_result.collect())
         all_hyphy_done_ch = collect_all_hyphy_results.out.all_hyphy_done
     } else {

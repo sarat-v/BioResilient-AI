@@ -22,9 +22,12 @@ def _get_engine():
             current_url,
             pool_pre_ping=True,
             connect_args={
-                # Prevent reporters / ad-hoc queries from hanging indefinitely.
-                # 5 min is generous for GROUP-BY on 500K+ row tables.
-                "options": "-c statement_timeout=300000"
+                # 15 min — reporter queries do ORDER BY on 1.69M-row tables joined to
+                # ortholog+gene; without a covering index these can take 8-12 min.
+                # The consequence_score index (ix_divergent_motif_consequence_score)
+                # should bring this under 1s once built, but the higher timeout is a
+                # safety net for future large-table reporters.
+                "options": "-c statement_timeout=900000"
             },
         )
         _engine_url = current_url
