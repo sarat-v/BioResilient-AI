@@ -200,10 +200,7 @@ process run_meme {
     maxRetries 3
 
     input:
-    path og_batch
-    path aligned_pkl
-    path treefile
-    path cds_cache
+    tuple path(og_batch), path(cds_cache), path(aligned_pkl), path(treefile)
 
     output:
     path "${og_batch.baseName}", emit: meme_result
@@ -447,15 +444,21 @@ workflow PHASE1_EVOLUTION {
     if (fromIdx <= EVO_STEPS.indexOf('step6') && untilIdx >= EVO_STEPS.indexOf('step6')) {
         // Pre-fetch ALL CDS once (single task) — eliminates NCBI bottleneck in scatter
         prefetch_cds(aligned_pkl_val)
-        cds_cache_ch = prefetch_cds.out.cds_cache.first()
+        // Use each() so the single cds_cache file is broadcast to every run_meme task
+        cds_cache_ch = prefetch_cds.out.cds_cache
 
         extract_og_ids(aligned_pkl_val)
         og_batches_ch = extract_og_ids.out.og_batches.flatten()
 
-        // Step 6: MEME+FEL+BUSTED per OG batch (RELAX deferred)
-        // aligned_pkl_val and treefile_ch must be value channels so they broadcast
-        // to all 1200+ og_batch tasks rather than pairing one-to-one.
-        run_meme(og_batches_ch, aligned_pkl_val.first(), treefile_ch, cds_cache_ch)
+        // Combine: each og_batch paired with the shared inputs via combine()
+        // This correctly broadcasts cds_cache and aligned_pkl to all batches
+        // without breaking Fusion file staging (avoid .first() on process outputs)
+        run_meme_input_ch = og_batches_ch
+            .combine(cds_cache_ch)
+            .combine(aligned_pkl_val)
+            .combine(treefile_ch)
+
+        run_meme(run_meme_input_ch)
         collect_all_hyphy_results(run_meme.out.meme_result.collect())
         all_hyphy_done_ch = collect_all_hyphy_results.out.all_hyphy_done
     } else {
