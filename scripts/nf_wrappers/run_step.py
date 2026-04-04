@@ -516,11 +516,15 @@ def run_step6_batch(args):
       1. Build codon alignment + QC (requires ≥4 unique species, ≥60% CDS coverage)
       2. Run BUSTED-PH + FEL + BUSTED + RELAX in parallel (ThreadPoolExecutor)
     Falls back to protein-based aBSREL proxy if codon alignment unavailable.
+
+    OG-level parallelism: N_OG_PARALLEL = cpu_count // 4 OGs run concurrently,
+    each with their own 4-tool ThreadPoolExecutor. This fills all available CPUs.
     """
     import gc
     import json
+    import os
     import shutil
-    from concurrent.futures import ThreadPoolExecutor
+    from concurrent.futures import ThreadPoolExecutor, as_completed
     from pipeline.layer2_evolution.meme_selection import (
         load_cds_cache_pkl,
         fetch_cds_for_protein,
@@ -554,7 +558,11 @@ def run_step6_batch(args):
     out_dir = Path(args.output_dir or ".")
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    for og_id in og_ids:
+    # How many OGs to run in parallel: 1 OG uses 4 HyPhy threads, so parallelism = cpu_count // 4
+    n_og_parallel = max(1, (os.cpu_count() or 4) // 4)
+    log.info("OG-level parallelism: %d concurrent OGs (cpu_count=%d)", n_og_parallel, os.cpu_count() or 4)
+
+    def _process_og(og_id: str) -> None:
         og_out = out_dir / og_id
         og_out.mkdir(parents=True, exist_ok=True)
 
@@ -562,7 +570,7 @@ def run_step6_batch(args):
             log.warning("OG %s not in aligned data, skipping", og_id)
             with open(og_out / "result.json", "w") as f:
                 json.dump({"og_id": og_id, "status": "not_in_aligned"}, f)
-            continue
+            return
 
         seqs = dict(aligned[og_id])
         species_ids = [label.split("|")[0] for label in seqs]
@@ -601,7 +609,6 @@ def run_step6_batch(args):
 
         if codon_aln:
             codon_species = list(codon_aln.keys())
-
             pruned_tree = prune_tree_to_species(treefile, codon_species)
 
             with ThreadPoolExecutor(max_workers=4) as executor:
@@ -632,7 +639,6 @@ def run_step6_batch(args):
             if raw is not None:
                 result.update(parse_absrel_results(raw))
                 result["selection_model"] = "proxy"
-                # Filter branches to test (target-phenotype) species for scoring specificity
                 from pipeline.layer2_evolution.meme_selection import _get_relax_branch_sets
                 try:
                     test_set, _ref, _out = _get_relax_branch_sets()
@@ -649,6 +655,19 @@ def run_step6_batch(args):
             json.dump(result, f)
 
         gc.collect()
+
+    if n_og_parallel == 1:
+        for og_id in og_ids:
+            _process_og(og_id)
+    else:
+        with ThreadPoolExecutor(max_workers=n_og_parallel) as pool:
+            futures = {pool.submit(_process_og, og_id): og_id for og_id in og_ids}
+            for fut in as_completed(futures):
+                og_id = futures[fut]
+                try:
+                    fut.result()
+                except Exception as exc:
+                    log.error("OG %s failed: %s", og_id, exc)
 
     log.info("HyPhy batch complete: %d OGs processed", len(og_ids))
 
