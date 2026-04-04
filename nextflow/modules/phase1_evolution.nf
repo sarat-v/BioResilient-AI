@@ -194,7 +194,7 @@ process run_paml {
     label 'paml'
     cpus params.paml_cpus
     memory { (params.paml_memory as nextflow.util.MemoryUnit) * task.attempt }
-    time '1h'
+    time '3h'
     tag "${og_batch.baseName}"
     errorStrategy { task.attempt <= 3 ? 'retry' : 'finish' }
     maxRetries 3
@@ -207,7 +207,7 @@ process run_paml {
 
     script:
     """
-    echo "paml_v1_branch_site_batch20"
+    echo "paml_v2_timeout600s_batch20"
     export NF_TASK_CPUS=${task.cpus}  # actual allocated CPUs so Python runs 1 OG per CPU
     mkdir -p '${og_batch.baseName}'
     python -m scripts.nf_wrappers.run_step \

@@ -280,7 +280,7 @@ def run_paml_branch_site(
     _write_paml_ctl(seq_file, tree_file, h0_out, h0_ctl, fix_omega=1, omega=1.0)
 
     paml_bin = "codeml"
-    timeout = int(os.environ.get("PAML_TIMEOUT", "120"))
+    timeout = int(os.environ.get("PAML_TIMEOUT", "600"))
 
     # Run H1 (alternative: positive selection allowed in foreground)
     try:
