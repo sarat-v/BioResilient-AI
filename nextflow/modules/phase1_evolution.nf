@@ -37,8 +37,8 @@ process build_species_tree {
 
 process phylo_conservation {
     label 'align'
-    cpus 8
-    memory '16 GB'
+    cpus 16
+    memory '32 GB'
     time '2h'
 
     input:

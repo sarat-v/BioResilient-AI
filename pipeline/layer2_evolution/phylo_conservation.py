@@ -592,12 +592,18 @@ def run_phylo_conservation(
                 r[0] for r in session.query(NucleotideRegion.gene_id).distinct().all()
             ]
 
-        # Skip genes already scored — safe to resume mid-run
+        # Skip genes already cleanly scored — safe to resume mid-run.
+        # Exclude genes with cds_phylo_score > 30: those are parsing artefacts
+        # (misparsed WIG header coordinates) that need to be rescored.
         already_scored = {
             r[0] for r in session.query(PhyloConservationScore.gene_id)
             .filter(
                 (PhyloConservationScore.cds_phylo_score.isnot(None)) |
                 (PhyloConservationScore.promoter_phylo_score.isnot(None))
+            )
+            .filter(
+                PhyloConservationScore.cds_phylo_score.is_(None) |
+                (PhyloConservationScore.cds_phylo_score <= 30)
             )
             .all()
         }
@@ -669,10 +675,12 @@ def run_phylo_conservation(
 
     # Build work items: pass stable pruned mod path per gene/region directly
     # so workers never call tree_doctor or write temp .mod files.
-    # phyloP is CPU-bound (not I/O-bound). Oversubscribing causes thrashing.
-    # Optimal: ~1-2 workers per core. With 3 phyloP calls per gene, 16 cores
-    # supports ~8 concurrent genes before saturating all cores.
-    default_workers = max(1, (os.cpu_count() or 4) // 2)
+    # phyloP spawns external subprocesses that release the GIL — threads are
+    # fine. Each gene runs 3 phyloP calls (cds/promoter/downstream), so with
+    # N_cpu cores we can saturate all cores with N_cpu/3 * 2 concurrent genes.
+    # Use all available CPUs; oversubscription is acceptable since phyloP
+    # subprocesses are short-lived (~0.1–0.5s each).
+    default_workers = max(1, os.cpu_count() or 8)
     n_workers = int(get_tool_config().get("phylop_workers", default_workers))
 
     def _make_work_item(gid: str) -> tuple:
