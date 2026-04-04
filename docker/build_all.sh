@@ -14,7 +14,7 @@ TAG="${TAG:-latest}"
 PUSH=false
 [[ "${1:-}" == "--push" ]] && PUSH=true
 
-IMAGES=(base orthofinder align phylo hyphy esm clinical)
+IMAGES=(base orthofinder align phylo paml hyphy esm clinical)
 
 GREEN="\033[0;32m"; CYAN="\033[0;36m"; BOLD="\033[1m"; RESET="\033[0m"
 banner() { echo -e "\n${BOLD}${CYAN}━━━  $1  ━━━${RESET}\n"; }

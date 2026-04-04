@@ -451,7 +451,11 @@ def _apply_fdr_correction(
 
 
 def run_step6_all_collect(args):
-    """Collect all HyPhy results (BUSTED-PH + FEL + BUSTED + RELAX) from merged output."""
+    """Collect all PAML / HyPhy results from merged output and write to DB.
+
+    Handles both new PAML results (selection_model="paml_branch_site") and
+    legacy HyPhy results (selection_model="busted_ph") for backward compatibility.
+    """
     from pipeline.layer2_evolution.selection import (
         load_selection_scores, load_fel_busted_scores, load_relax_scores, build_gene_og_map,
     )
@@ -471,19 +475,18 @@ def run_step6_all_collect(args):
         if r.get("status") in ("no_codon_alignment", "meme_failed", "skipped", "not_in_aligned"):
             continue
 
-        # Map busted_ph_pvalue → dnds_pvalue so it scores via existing DB field.
-        # selection_model="busted_ph" lets scoring.py distinguish from MEME results.
-        if "busted_ph_pvalue" in r:
+        # Legacy HyPhy: map busted_ph_pvalue → dnds_pvalue
+        if "busted_ph_pvalue" in r and "dnds_pvalue" not in r:
             r["dnds_pvalue"] = r["busted_ph_pvalue"]
-            r["dnds_ratio"] = 0.0  # not applicable for BUSTED-PH
+            r["dnds_ratio"] = 0.0
 
         meme_batch[og_id] = r
 
         if "fel_sites" in r or "busted_pvalue" in r:
             fb_batch[og_id] = {
                 "og_id": og_id,
-                "fel_sites": r.get("fel_sites", 0),
-                "busted_pvalue": r.get("busted_pvalue", 1.0),
+                "fel_sites": r.get("fel_sites"),
+                "busted_pvalue": r.get("busted_pvalue"),
             }
         if "relax_k" in r or "relax_pvalue" in r:
             relax_batch[og_id] = {
@@ -492,15 +495,17 @@ def run_step6_all_collect(args):
                 "relax_pvalue": r.get("relax_pvalue"),
             }
 
-    log.info("All-HyPhy collect: %d BUSTED-PH, %d FEL+BUSTED, %d RELAX results",
-             len(meme_batch), len(fb_batch), len(relax_batch))
+    paml_count = sum(1 for r in meme_batch.values() if r.get("selection_model") == "paml_branch_site")
+    proxy_count = sum(1 for r in meme_batch.values() if r.get("selection_model") == "proxy")
+    log.info("Step6 collect: %d total (%d PAML, %d proxy, %d FEL+BUSTED, %d RELAX)",
+             len(meme_batch), paml_count, proxy_count, len(fb_batch), len(relax_batch))
 
     # BH-FDR correction across all OGs before loading to DB
     _apply_fdr_correction(meme_batch, fb_batch)
 
     if meme_batch:
         load_selection_scores(meme_batch, gene_by_og)
-        log.info("Loaded %d BUSTED-PH/proxy results to DB", len(meme_batch))
+        log.info("Loaded %d selection results to DB", len(meme_batch))
     if fb_batch:
         load_fel_busted_scores(fb_batch, gene_by_og)
         log.info("Loaded %d FEL+BUSTED results to DB", len(fb_batch))
@@ -510,40 +515,38 @@ def run_step6_all_collect(args):
 
 
 def run_step6_batch(args):
-    """Batch HyPhy — codon alignment + BUSTED-PH / FEL / BUSTED / RELAX.
+    """Batch PAML — codon alignment + branch-site model A positive selection test.
 
     Per-OG workflow:
       1. Build codon alignment + QC (requires ≥4 unique species, ≥60% CDS coverage)
-      2. Run BUSTED-PH + FEL + BUSTED + RELAX in parallel (ThreadPoolExecutor)
+      2. Run PAML codeml branch-site model A (H0 vs H1 LRT, ~5-30 s/OG)
     Falls back to protein-based aBSREL proxy if codon alignment unavailable.
 
-    OG-level parallelism: N_OG_PARALLEL = cpu_count // 4 OGs run concurrently,
-    each with their own 4-tool ThreadPoolExecutor. This fills all available CPUs.
+    OG-level parallelism: N_OG_PARALLEL = allocated_cpus  (1 CPU per PAML run).
+    With 4 CPUs, 4 OGs run simultaneously — each doing H0 then H1 sequentially.
     """
     import gc
     import json
     import os
-    import shutil
     from concurrent.futures import ThreadPoolExecutor, as_completed
     from pipeline.layer2_evolution.meme_selection import (
         load_cds_cache_pkl,
         fetch_cds_for_protein,
         protein_to_codon_alignment,
-        run_busted_ph, parse_busted_ph_results,
-        run_fel, parse_fel_results,
-        run_busted, parse_busted_results,
-        run_relax, parse_relax_results,
+    )
+    from pipeline.layer2_evolution.paml_selection import (
+        run_paml_branch_site,
+        parse_paml_results,
     )
     from pipeline.layer2_evolution.selection import write_hyphy_input, run_absrel, parse_absrel_results
     from pipeline.layer2_evolution.phylo_tree import prune_tree_to_species
-    from pipeline.config import get_local_storage_root
 
     og_id_file = getattr(args, 'og_id_file', None)
     if not og_id_file:
         raise ValueError("--og-id-file required for step6_batch")
     with open(og_id_file) as f:
         og_ids = [line.strip() for line in f if line.strip()]
-    log.info("HyPhy batch: %d OGs from %s", len(og_ids), og_id_file)
+    log.info("PAML batch: %d OGs from %s", len(og_ids), og_id_file)
 
     cds_cache_file = getattr(args, 'cds_cache', None)
     if cds_cache_file:
@@ -558,11 +561,12 @@ def run_step6_batch(args):
     out_dir = Path(args.output_dir or ".")
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    # Use NF_TASK_CPUS (set by Nextflow to task.cpus) to avoid oversubscription.
-    # os.cpu_count() returns HOST cpu count which can be 2x+ the allocated container CPUs.
+    # PAML is single-threaded per run, so run one OG per CPU.
+    # NF_TASK_CPUS is set by Nextflow to task.cpus (avoids os.cpu_count() host inflation).
     allocated_cpus = int(os.environ.get('NF_TASK_CPUS', os.cpu_count() or 4))
-    n_og_parallel = max(1, allocated_cpus // 4)
-    log.info("OG-level parallelism: %d concurrent OGs (allocated_cpus=%d)", n_og_parallel, allocated_cpus)
+    n_og_parallel = max(1, allocated_cpus)
+    log.info("PAML OG-level parallelism: %d concurrent OGs (allocated_cpus=%d)",
+             n_og_parallel, allocated_cpus)
 
     def _process_og(og_id: str) -> None:
         og_out = out_dir / og_id
@@ -601,7 +605,7 @@ def run_step6_batch(args):
         result = {"og_id": og_id, "cds_coverage": round(cds_coverage, 3)}
         if codon_aln:
             seen_sp = set()
-            deduped_aln = {}
+            deduped_aln: dict[str, str] = {}
             for label, seq in codon_aln.items():
                 sp = label.split("|")[0]
                 if sp not in seen_sp:
@@ -611,34 +615,17 @@ def run_step6_batch(args):
             codon_species = list(codon_aln.keys())
 
             if len(codon_species) < 4:
-                log.info("OG %s: only %d species after dedup, too few for HyPhy", og_id, len(codon_species))
+                log.info("OG %s: only %d species after dedup, too few for PAML", og_id, len(codon_species))
                 codon_aln = None
 
         if codon_aln:
             codon_species = list(codon_aln.keys())
             pruned_tree = prune_tree_to_species(treefile, codon_species)
 
-            with ThreadPoolExecutor(max_workers=4) as executor:
-                fut_busted_ph = executor.submit(run_busted_ph, codon_aln, pruned_tree, og_id)
-                fut_fel = executor.submit(run_fel, codon_aln, pruned_tree, og_id)
-                fut_busted = executor.submit(run_busted, codon_aln, pruned_tree, og_id)
-                fut_relax = executor.submit(run_relax, codon_aln, pruned_tree, og_id)
-
-                busted_ph_json = fut_busted_ph.result()
-                fel_json = fut_fel.result()
-                busted_json = fut_busted.result()
-                relax_json = fut_relax.result()
-
-            busted_ph_parsed = parse_busted_ph_results(busted_ph_json) if busted_ph_json else {"busted_ph_pvalue": 1.0}
-            result["busted_ph_pvalue"] = busted_ph_parsed.get("busted_ph_pvalue", 1.0)
-            result["selection_model"] = "busted_ph" if busted_ph_json is not None else "no_busted_ph"
-
-            result["fel_sites"] = parse_fel_results(fel_json).get("fel_sites", 0) if fel_json else 0
-            result["busted_pvalue"] = parse_busted_results(busted_json).get("busted_pvalue", 1.0) if busted_json else 1.0
-
-            relax_parsed = parse_relax_results(relax_json) if relax_json else {}
-            result["relax_k"] = relax_parsed.get("relax_k")
-            result["relax_pvalue"] = relax_parsed.get("relax_pvalue", 1.0)
+            paml_work = og_out / "paml_work"
+            paml_raw = run_paml_branch_site(codon_aln, pruned_tree, og_id, paml_work)
+            paml_parsed = parse_paml_results(paml_raw)
+            result.update(paml_parsed)
         else:
             pruned_tree = prune_tree_to_species(treefile, species_ids)
             aln_path, tree_path = write_hyphy_input(og_id, seqs, pruned_tree)
@@ -646,15 +633,6 @@ def run_step6_batch(args):
             if raw is not None:
                 result.update(parse_absrel_results(raw))
                 result["selection_model"] = "proxy"
-                from pipeline.layer2_evolution.meme_selection import _get_relax_branch_sets
-                try:
-                    test_set, _ref, _out = _get_relax_branch_sets()
-                    if test_set and result.get("branches_under_selection"):
-                        result["branches_under_selection"] = [
-                            b for b in result["branches_under_selection"] if b in test_set
-                        ]
-                except Exception:
-                    pass
             else:
                 result["status"] = "no_codon_alignment"
 
@@ -676,7 +654,7 @@ def run_step6_batch(args):
                 except Exception as exc:
                     log.error("OG %s failed: %s", og_id, exc)
 
-    log.info("HyPhy batch complete: %d OGs processed", len(og_ids))
+    log.info("PAML batch complete: %d OGs processed", len(og_ids))
 
 
 def run_step6b_batch(args):

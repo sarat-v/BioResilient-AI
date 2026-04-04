@@ -62,7 +62,7 @@ process phylo_conservation {
 
 // extract_og_ids always queries the DB for authoritative OG list (the pkl's
 // motifs_by_og can be stale). The pkl is still needed for aligned sequences.
-// Writes og_batch_NNN.txt files with params.hyphy_batch_size OGs each for
+// Writes og_batch_NNN.txt files with params.paml_batch_size OGs each for
 // efficient scatter — one pkl load per task instead of one per OG.
 process extract_og_ids {
     label 'base'
@@ -83,7 +83,7 @@ process extract_og_ids {
 import pickle, sys, math
 
 db_url    = '${params.db_url}'
-batch_size = int('${params.hyphy_batch_size}')
+batch_size = int('${params.paml_batch_size}')
 
 with open('${aligned_pkl}', 'rb') as f:
     data = pickle.load(f)
@@ -105,14 +105,14 @@ cur.execute('''
 ''')
 db_og_ids = sorted({row[0] for row in cur.fetchall()})
 
-# OGs that already have a genuine codon-based score (not aBSREL proxy).
-# Proxy results are excluded so re-runs can upgrade them to BUSTED-PH.
+# OGs with a genuine codon-based score (paml_branch_site or busted_ph).
+# Proxy results are excluded so re-runs can upgrade them to PAML.
 cur.execute('''
     SELECT DISTINCT o.orthofinder_og
     FROM evolution_score es
     JOIN ortholog o ON o.gene_id = es.gene_id
     WHERE es.dnds_pvalue IS NOT NULL
-      AND es.selection_model NOT IN (\'proxy\')
+      AND es.selection_model IN (\'paml_branch_site\', \'busted_ph\')
       AND o.orthofinder_og IS NOT NULL
 ''')
 already_scored_ogs = {row[0] for row in cur.fetchall()}
@@ -130,7 +130,7 @@ if not og_list:
         f.write('')
     sys.exit(0)
 
-# Pre-filter: skip OGs with < 4 unique species (HyPhy minimum)
+# Pre-filter: skip OGs with < 4 unique species (PAML minimum for reliable LRT)
 filtered = []
 skipped = 0
 for og in og_list:
@@ -190,11 +190,11 @@ process prefetch_cds {
     """
 }
 
-process run_meme {
-    label 'hyphy'
-    cpus params.hyphy_cpus
-    memory { (params.hyphy_memory as nextflow.util.MemoryUnit) * task.attempt }
-    time '3h'
+process run_paml {
+    label 'paml'
+    cpus params.paml_cpus
+    memory { (params.paml_memory as nextflow.util.MemoryUnit) * task.attempt }
+    time '1h'
     tag "${og_batch.baseName}"
     errorStrategy { task.attempt <= 3 ? 'retry' : 'finish' }
     maxRetries 3
@@ -203,13 +203,12 @@ process run_meme {
     tuple path(og_batch), path(cds_cache), path(aligned_pkl), path(treefile)
 
     output:
-    path "${og_batch.baseName}", emit: meme_result
+    path "${og_batch.baseName}", emit: paml_result
 
     script:
     """
-    echo "hyphy_v18_spot_bustedph_batch10"
-    export HYPHY_CPUS=1          # 1 CPU per tool: 4 tools × 1 = 4 total (BUSTED-PH+FEL+BUSTED+RELAX)
-    export NF_TASK_CPUS=${task.cpus}  # actual allocated CPUs so Python uses correct OG parallelism
+    echo "paml_v1_branch_site_batch20"
+    export NF_TASK_CPUS=${task.cpus}  # actual allocated CPUs so Python runs 1 OG per CPU
     mkdir -p '${og_batch.baseName}'
     python -m scripts.nf_wrappers.run_step \
         --step step6_batch \
@@ -224,7 +223,7 @@ process run_meme {
     """
 }
 
-process collect_all_hyphy_results {
+process collect_all_paml_results {
     label 'base'
     cpus 2
     memory '8 GB'
@@ -233,11 +232,11 @@ process collect_all_hyphy_results {
     path 'results/*'
 
     output:
-    val true, emit: all_hyphy_done
+    val true, emit: all_paml_done
 
     script:
     """
-    echo "collect_v7_merged_all_hyphy"
+    echo "collect_v8_paml_branch_site"
     python -m scripts.nf_wrappers.run_step \
         --step step6_all_collect \
         --input-dir results/ \
@@ -245,17 +244,13 @@ process collect_all_hyphy_results {
         --storage-root '${params.storage_root}'
     DATABASE_URL='${params.db_url}' BIORESILIENT_STORAGE_ROOT='${params.storage_root}' \
         python -m pipeline.step_reporter --step step6 || true
-    DATABASE_URL='${params.db_url}' BIORESILIENT_STORAGE_ROOT='${params.storage_root}' \
-        python -m pipeline.step_reporter --step step6b || true
-    DATABASE_URL='${params.db_url}' BIORESILIENT_STORAGE_ROOT='${params.storage_root}' \
-        python -m pipeline.step_reporter --step step6c || true
     """
 }
 
 process run_fel_busted {
-    label 'hyphy'
-    cpus params.hyphy_cpus
-    memory { (params.hyphy_memory as nextflow.util.MemoryUnit) * task.attempt }
+    label 'paml'
+    cpus params.paml_cpus
+    memory { (params.paml_memory as nextflow.util.MemoryUnit) * task.attempt }
     time '12h'
     tag "${meme_out.baseName}"
     errorStrategy { task.attempt <= 3 ? 'retry' : 'finish' }
@@ -282,9 +277,9 @@ process run_fel_busted {
 }
 
 process run_relax {
-    label 'hyphy'
-    cpus params.hyphy_cpus
-    memory { (params.hyphy_memory as nextflow.util.MemoryUnit) * task.attempt }
+    label 'paml'
+    cpus params.paml_cpus
+    memory { (params.paml_memory as nextflow.util.MemoryUnit) * task.attempt }
     time '12h'
     tag "${meme_out.baseName}"
     errorStrategy { task.attempt <= 3 ? 'retry' : 'finish' }
@@ -445,29 +440,27 @@ workflow PHASE1_EVOLUTION {
     if (fromIdx <= EVO_STEPS.indexOf('step6') && untilIdx >= EVO_STEPS.indexOf('step6')) {
         // Pre-fetch ALL CDS once (single task) — eliminates NCBI bottleneck in scatter
         prefetch_cds(aligned_pkl_val)
-        // Use each() so the single cds_cache file is broadcast to every run_meme task
         cds_cache_ch = prefetch_cds.out.cds_cache
 
         extract_og_ids(aligned_pkl_val)
         og_batches_ch = extract_og_ids.out.og_batches.flatten()
 
-        // Combine: each og_batch paired with the shared inputs via combine()
-        // This correctly broadcasts cds_cache and aligned_pkl to all batches
-        // without breaking Fusion file staging (avoid .first() on process outputs)
-        run_meme_input_ch = og_batches_ch
+        // Combine: each og_batch paired with shared inputs via combine()
+        // Broadcasts cds_cache and aligned_pkl to all batches without breaking Fusion staging.
+        run_paml_input_ch = og_batches_ch
             .combine(cds_cache_ch)
             .combine(aligned_pkl_val)
             .combine(treefile_ch)
 
-        run_meme(run_meme_input_ch)
-        collect_all_hyphy_results(run_meme.out.meme_result.collect())
-        all_hyphy_done_ch = collect_all_hyphy_results.out.all_hyphy_done
+        run_paml(run_paml_input_ch)
+        collect_all_paml_results(run_paml.out.paml_result.collect())
+        all_paml_done_ch = collect_all_paml_results.out.all_paml_done
     } else {
-        all_hyphy_done_ch = Channel.value(true)
+        all_paml_done_ch = Channel.value(true)
     }
 
     if (fromIdx <= EVO_STEPS.indexOf('step7') && untilIdx >= EVO_STEPS.indexOf('step7')) {
-        convergence_scoring(all_hyphy_done_ch)
+        convergence_scoring(all_paml_done_ch)
         convergence_done_ch = convergence_scoring.out.convergence_done
     } else {
         convergence_done_ch = Channel.value(true)

@@ -110,29 +110,36 @@ def selection_score(
     branches_under_selection: Optional[list[str]] = None,
     selection_model: Optional[str] = None,
 ) -> float:
-    """Score in [0, 1] combining BUSTED-PH, FEL, BUSTED, and RELAX signals.
+    """Score in [0, 1] combining selection evidence.
 
-    Weights (BUSTED-PH replaces MEME as the primary phenotype-specific signal):
-        FEL       35%  — pervasive positive selection (site-level, all lineages)
-        BUSTED    30%  — gene-wide episodic selection (any lineage)
-        BUSTED-PH 25%  — phenotype-specific episodic selection (foreground only)
+    PAML branch-site model A (selection_model="paml_branch_site"):
+        70% p-value component  — LRT p-value (H0 vs H1, chi-squared df=2)
+        30% omega component    — foreground dN/dS in positive selection class
+        This is the primary pathway going forward.
+
+    HyPhy suite (selection_model="busted_ph", legacy):
+        FEL       35%  — pervasive positive selection (site-level)
+        BUSTED    30%  — gene-wide episodic selection
+        BUSTED-PH 25%  — phenotype-specific episodic selection (foreground)
         RELAX     10%  — selection intensity shift in test vs reference branches
 
-    BUSTED-PH p-value is stored in dnds_pvalue when selection_model="busted_ph".
-    Legacy MEME results (selection_model="meme") are scored with MEME weight for
-    backward compatibility, but weighted at 25% (same slot as BUSTED-PH).
-
-    RELAX component rewards significant branch-specific acceleration (k > 1):
-        relax_score = min(-log10(p) / 10, 1.0) × min((k - 1) / 2.0, 1.0)
+    Legacy MEME results (selection_model="meme") use backward-compatible scoring.
     """
+    # --- PAML branch-site model A (primary pathway) ---
+    if selection_model == "paml_branch_site":
+        if dnds_pvalue is None or dnds_pvalue >= 1.0:
+            return 0.0
+        p_score = round(min(-math.log10(max(dnds_pvalue, 1e-10)) / 10.0, 1.0), 4)
+        omega_score = round(min((dnds_ratio or 0.0) / 5.0, 1.0), 4)
+        return round(0.70 * p_score + 0.30 * omega_score, 4)
+
     # --- BUSTED-PH / MEME component (phenotype-specific, stored in dnds_pvalue) ---
-    # New runs: selection_model="busted_ph", dnds_pvalue = BUSTED-PH foreground p-value
-    # Legacy:   selection_model="meme",      dnds_pvalue = MEME pseudo p-value
+    # New HyPhy runs: selection_model="busted_ph", dnds_pvalue = BUSTED-PH p-value
+    # Legacy:         selection_model="meme",      dnds_pvalue = MEME pseudo p-value
     pheno_score = 0.0
     if dnds_pvalue is not None and 0 < dnds_pvalue <= 1:
         pheno_score = round(min(-math.log10(dnds_pvalue) / 10.0, 1.0), 4)
     elif selection_model == "meme" and dnds_ratio is not None and dnds_pvalue is not None:
-        # Legacy MEME: blend ratio + p-value
         dnds_norm = min(dnds_ratio / 5.0, 1.0)
         if dnds_pvalue <= 0:
             pval_weight = 1.0
@@ -141,7 +148,6 @@ def selection_score(
         else:
             pval_weight = min(-math.log10(dnds_pvalue) / 10.0, 1.0)
         pheno_score = round(0.5 * dnds_norm + 0.5 * pval_weight, 4)
-        # Legacy MEME specificity multiplier
         if pheno_score > 0 and branches_under_selection:
             test_set = _get_test_species()
             if test_set:
