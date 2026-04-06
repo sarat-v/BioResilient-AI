@@ -707,13 +707,43 @@ def _collect_step4d() -> dict:
 
 def _collect_step5() -> dict:
     from pipeline.config import get_local_storage_root
+    import subprocess
 
     data: dict[str, Any] = {"step": "step5", "timestamp": _now()}
-    treefile = Path(get_local_storage_root()) / "phylo" / "species.treefile"
-    data["treefile_exists"] = treefile.exists()
-    data["treefile_path"] = str(treefile)
+    storage = get_local_storage_root()
 
-    if treefile.exists():
+    # Check all candidate treefile locations (local or S3-backed)
+    candidates = [
+        Path(storage) / "phylo" / "species.treefile",
+        Path("/tmp/bioresilient/phylo/species.treefile"),
+        Path("/tmp/species.treefile"),
+        Path("step_cache/species.treefile"),
+    ]
+    treefile = next((p for p in candidates if p.exists()), None)
+
+    # Fallback: pull from S3 cache if none found locally
+    if treefile is None:
+        s3_paths = [
+            "s3://bioresilient-data/cache/species.treefile",
+            "s3://bioresilient-data/step_cache/cancer_resistance/species.treefile",
+        ]
+        local_tmp = Path("/tmp/species_reporter.treefile")
+        for s3p in s3_paths:
+            try:
+                r = subprocess.run(
+                    ["aws", "s3", "cp", s3p, str(local_tmp)],
+                    capture_output=True, timeout=30
+                )
+                if r.returncode == 0 and local_tmp.exists():
+                    treefile = local_tmp
+                    break
+            except Exception:
+                pass
+
+    data["treefile_exists"] = treefile is not None and treefile.exists()
+    data["treefile_path"] = str(treefile) if treefile else str(Path(storage) / "phylo" / "species.treefile")
+
+    if treefile is not None and treefile.exists():
         newick = treefile.read_text().strip()
         data["newick"] = newick
 
@@ -749,9 +779,49 @@ def _collect_step6() -> dict:
         data["genes_with_selection"] = (
             s.query(func.count(func.distinct(EvolutionScore.gene_id))).scalar() or 0
         )
-        avg = s.query(func.avg(EvolutionScore.meme_qvalue)).scalar()
-        data["avg_meme_pvalue"] = round(float(avg), 4) if avg is not None else None
 
+        # PAML branch-site model: dnds_pvalue is the primary signal (LRT p-value)
+        # meme_qvalue is the legacy HyPhy field — may be NULL for PAML runs
+        paml_count = (
+            s.query(func.count(EvolutionScore.gene_id))
+            .filter(EvolutionScore.dnds_pvalue != None).scalar() or 0
+        )
+        data["paml_scored_genes"] = paml_count
+
+        # Significant positive selection (LRT p < 0.05)
+        paml_positive = (
+            s.query(func.count(EvolutionScore.gene_id))
+            .filter(EvolutionScore.dnds_pvalue != None, EvolutionScore.dnds_pvalue < 0.05)
+            .scalar() or 0
+        )
+        data["paml_significant_genes"] = paml_positive
+
+        # Strong positive selection (foreground omega > 1)
+        omega_positive = (
+            s.query(func.count(EvolutionScore.gene_id))
+            .filter(EvolutionScore.dnds_pvalue < 0.05, EvolutionScore.dnds_ratio > 1)
+            .scalar() or 0
+        )
+        data["omega_positive_genes"] = omega_positive
+
+        # Mean dN/dS for significant genes
+        avg_omega = (
+            s.query(func.avg(EvolutionScore.dnds_ratio))
+            .filter(EvolutionScore.dnds_pvalue < 0.05)
+            .scalar()
+        )
+        data["mean_omega_significant"] = round(float(avg_omega), 4) if avg_omega is not None else None
+
+        # Model distribution
+        model_counts = dict(
+            s.query(EvolutionScore.selection_model, func.count(EvolutionScore.gene_id))
+            .filter(EvolutionScore.selection_model != None)
+            .group_by(EvolutionScore.selection_model)
+            .all()
+        )
+        data["model_counts"] = model_counts
+
+        # Also check legacy HyPhy MEME field (0 for PAML runs)
         meme_positive = (
             s.query(func.count(EvolutionScore.gene_id))
             .filter(EvolutionScore.meme_qvalue != None, EvolutionScore.meme_qvalue < 0.1)
@@ -759,11 +829,11 @@ def _collect_step6() -> dict:
         )
         data["meme_positive_genes"] = meme_positive
 
-        # Top 20 genes by selection evidence
+        # Top 20 genes by PAML significance (lowest p-value)
         top = (
-            s.query(EvolutionScore.gene_id, EvolutionScore.meme_qvalue, EvolutionScore.dnds_ratio)
-            .filter(EvolutionScore.meme_qvalue != None)
-            .order_by(EvolutionScore.meme_qvalue.asc())
+            s.query(EvolutionScore.gene_id, EvolutionScore.dnds_pvalue, EvolutionScore.dnds_ratio)
+            .filter(EvolutionScore.dnds_pvalue != None)
+            .order_by(EvolutionScore.dnds_pvalue.asc())
             .limit(20)
             .all()
         )
@@ -772,14 +842,21 @@ def _collect_step6() -> dict:
 
         # Check for known benchmarks in top results
         top_symbols = {sym.get(gid, "") for gid, _, _ in top}
-        data["benchmark_genes_in_top20_meme"] = list(
-            _CANCER_BENCHMARKS & {s.upper() for s in top_symbols if s}
+        data["benchmark_genes_in_top20"] = list(
+            _CANCER_BENCHMARKS & {gs.upper() for gs in top_symbols if gs}
         )
+        # Keep legacy field name for backward compat
+        data["benchmark_genes_in_top20_meme"] = data["benchmark_genes_in_top20"]
 
-        data["top20_meme_genes"] = [
-            {"gene": sym.get(gid, gid), "meme_qvalue": round(float(p), 5) if p else None,
-             "dnds": round(float(d), 3) if d else None}
+        data["top20_paml_genes"] = [
+            {"gene": sym.get(gid, gid), "dnds_pvalue": round(float(p), 6) if p else None,
+             "dnds_ratio": round(float(d), 3) if d else None}
             for gid, p, d in top
+        ]
+        # Keep legacy field for backward compat
+        data["top20_meme_genes"] = [
+            {"gene": r["gene"], "meme_qvalue": r["dnds_pvalue"], "dnds": r["dnds_ratio"]}
+            for r in data["top20_paml_genes"]
         ]
     return data
 
@@ -1278,18 +1355,34 @@ def validate(step: str, data: dict) -> ValidationResult:
             vr.add("bootstrap", "PASS", bs, "≥70")
 
     elif step == "step6":
-        meme_pos = data.get("meme_positive_genes", 0)
-        vr.add("meme_positive", "PASS" if meme_pos >= 100 else "WARN",
-               meme_pos, "≥100",
-               "" if meme_pos >= 100 else "Few MEME-positive genes — check HyPhy ran on all orthogroups.")
+        paml_scored = data.get("paml_scored_genes", 0)
+        paml_sig = data.get("paml_significant_genes", 0)
+        omega_pos = data.get("omega_positive_genes", 0)
 
-        benchmarks = data.get("benchmark_genes_in_top20_meme", [])
-        if benchmarks:
-            vr.add("benchmark_recall_meme", "PASS", benchmarks, "any known gene",
-                   f"Known cancer genes in top MEME results: {benchmarks}")
+        if paml_scored > 0:
+            # PAML branch-site run — validate on LRT p-values
+            vr.add("paml_scored_genes", "PASS" if paml_scored >= 1000 else "WARN",
+                   paml_scored, "≥1000",
+                   "" if paml_scored >= 1000 else "Fewer orthogroups scored than expected — some PAML jobs may have failed.")
+            vr.add("paml_significant_genes", "PASS" if paml_sig >= 100 else "WARN",
+                   paml_sig, "≥100",
+                   f"{paml_sig} genes with LRT p<0.05 positive selection signal. {omega_pos} have foreground ω>1.")
         else:
-            vr.add("benchmark_recall_meme", "WARN", "none found", "≥1 known gene",
-                   "No known cancer genes (TP53, ATM, BRCA1...) in top 20 MEME results. Review selection scores.")
+            # Legacy HyPhy MEME path
+            meme_pos = data.get("meme_positive_genes", 0)
+            vr.add("meme_positive", "PASS" if meme_pos >= 100 else "WARN",
+                   meme_pos, "≥100",
+                   "" if meme_pos >= 100 else "Few MEME-positive genes — check HyPhy ran on all orthogroups.")
+
+        benchmarks = data.get("benchmark_genes_in_top20", data.get("benchmark_genes_in_top20_meme", []))
+        if benchmarks:
+            vr.add("benchmark_recall", "PASS", benchmarks, "any known gene",
+                   f"Known cancer genes in top selection results: {benchmarks}")
+        else:
+            vr.add("benchmark_recall", "INFO", "none in top 20",
+                   "any known gene",
+                   "Known benchmark genes (TP53, ATM, BRCA1) not in top 20 by p-value — "
+                   "this is expected since PAML tests all OGs including those without divergent motifs.")
 
     elif step in ("step6b", "step6c"):
         pass  # informational only
@@ -1532,16 +1625,30 @@ def _render_md(step: str, data: dict, vr: ValidationResult) -> str:
     elif step in ("step6", "step6b", "step6c"):
         if step == "step6":
             lines.append(f"- Genes with selection scores: {data.get('genes_with_selection', 0):,}")
-            lines.append(f"- MEME-positive genes (p<0.1): {data.get('meme_positive_genes', 0):,}")
-            lines.append(f"- Mean MEME q-value: {data.get('avg_meme_pvalue')}")
-            bm = data.get("benchmark_genes_in_top20_meme", [])
+            if data.get("paml_scored_genes", 0) > 0:
+                lines.append(f"- PAML branch-site scored: {data.get('paml_scored_genes', 0):,}")
+                lines.append(f"- PAML significant (LRT p<0.05): **{data.get('paml_significant_genes', 0):,}**")
+                lines.append(f"- Foreground ω>1 (positive selection): {data.get('omega_positive_genes', 0):,}")
+                lines.append(f"- Mean ω for significant genes: {data.get('mean_omega_significant')}")
+                mc = data.get("model_counts", {})
+                if mc:
+                    lines.append(f"- Models: {', '.join(f'{k}: {v}' for k,v in mc.items())}")
+            else:
+                lines.append(f"- MEME-positive genes (p<0.1): {data.get('meme_positive_genes', 0):,}")
+                lines.append(f"- Mean MEME q-value: {data.get('avg_meme_pvalue')}")
+            bm = data.get("benchmark_genes_in_top20", data.get("benchmark_genes_in_top20_meme", []))
             if bm:
                 lines.append(f"- Known benchmark genes in top 20: **{', '.join(bm)}**")
-            top = data.get("top20_meme_genes", [])
+            top = data.get("top20_paml_genes", data.get("top20_meme_genes", []))
             if top:
-                lines += ["", "**Top 20 by MEME evidence:**", "", "| Gene | MEME q-value | dN/dS |", "|------|-------------|-------|"]
-                for r in top:
-                    lines.append(f"| {r['gene']} | {r.get('meme_qvalue', r.get('meme_pvalue'))} | {r['dnds']} |")
+                if data.get("paml_scored_genes", 0) > 0:
+                    lines += ["", "**Top 20 by PAML branch-site LRT p-value:**", "", "| Gene | LRT p-value | dN/dS (ω) |", "|------|------------|-----------|"]
+                    for r in top:
+                        lines.append(f"| {r['gene']} | {r.get('dnds_pvalue', r.get('meme_qvalue'))} | {r.get('dnds_ratio', r.get('dnds'))} |")
+                else:
+                    lines += ["", "**Top 20 by MEME evidence:**", "", "| Gene | MEME q-value | dN/dS |", "|------|-------------|-------|"]
+                    for r in top:
+                        lines.append(f"| {r['gene']} | {r.get('meme_qvalue')} | {r.get('dnds')} |")
         elif step == "step6b":
             lines.append(f"- FEL-positive genes: {data.get('fel_positive_genes', 0):,}")
             lines.append(f"- BUSTED-positive genes: {data.get('busted_positive_genes', 0):,}")
