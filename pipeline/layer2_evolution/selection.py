@@ -205,10 +205,12 @@ def load_selection_scores(
                 ev = EvolutionScore(gene_id=gene_id)
                 session.add(ev)
 
-            ev.dnds_ratio = result["dnds_ratio"]
-            ev.dnds_pvalue = result["dnds_pvalue"]
-            ev.selection_model = result["selection_model"]
-            ev.branches_under_selection = result["branches_under_selection"]
+            ev.dnds_ratio = result.get("dnds_ratio")
+            ev.dnds_pvalue = result.get("dnds_pvalue")
+            ev.selection_model = result.get("selection_model")
+            # PAML branch-site results don't emit branches_under_selection;
+            # HyPhy BUSTED results do. Use .get() so both formats work.
+            ev.branches_under_selection = result.get("branches_under_selection")
             saved += 1
 
     log.info("Saved evolution scores for %d genes.", saved)
