@@ -57,8 +57,10 @@ def search_geo(species_id: str, search_terms: list[str]) -> list[str]:
         api_key = get_ncbi_api_key()
         email = get_ncbi_email()
 
-        query = " OR ".join(f'"{t}"' for t in search_terms)
-        query += ' AND "expression profiling by array"[DataSet Type] OR "expression profiling by high throughput sequencing"[DataSet Type]'
+        # Wrap each group in parens to prevent OR operator precedence leaking
+        species_clause = "(" + " OR ".join(f'"{t}"' for t in search_terms) + ")"
+        dataset_clause = '("expression profiling by array"[DataSet Type] OR "expression profiling by high throughput sequencing"[DataSet Type])'
+        query = f"{species_clause} AND {dataset_clause}"
 
         params = {
             "db": "gds",
