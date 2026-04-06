@@ -361,7 +361,7 @@ process convergence_scoring {
     label 'base'
     cpus 4
     memory '8 GB'
-    time '2h'
+    time '3h'
 
     input:
     val meme_done

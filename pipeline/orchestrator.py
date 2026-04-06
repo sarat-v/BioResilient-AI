@@ -649,11 +649,59 @@ def step7_convergence(dry_run: bool = False) -> None:
         enrich_phylop_scores,
         run_convergence_pipeline,
     )
+    from db.models import EvolutionScore, PhyloConservationScore
+    from db.session import get_session
 
     run_convergence_pipeline()
-    chrom_map = build_chrom_map()
-    if chrom_map:
-        enrich_phylop_scores(chrom_map)
+
+    # Seed evolution_score.phylop_score from step 3d output (phylo_conservation_score)
+    # before calling the slower UCSC API. This avoids re-querying the ~11K genes that
+    # step 3d already resolved, reducing the sequential UCSC loop from ~12K iterations
+    # to only the ~1-2K genes with no existing conservation data.
+    with get_session() as session:
+        pcs_rows = session.query(
+            PhyloConservationScore.gene_id,
+            PhyloConservationScore.cds_phylo_score,
+        ).filter(PhyloConservationScore.cds_phylo_score.isnot(None)).all()
+
+    if pcs_rows:
+        log.info(
+            "Seeding phylop_score from step 3d data for %d genes before UCSC enrichment...",
+            len(pcs_rows),
+        )
+        with get_session() as session:
+            ev_map = {ev.gene_id: ev for ev in session.query(EvolutionScore).all()}
+            seeded = 0
+            for gene_id, cds_score in pcs_rows:
+                ev = ev_map.get(gene_id)
+                if ev is None:
+                    ev = EvolutionScore(gene_id=gene_id)
+                    session.add(ev)
+                    ev_map[gene_id] = ev
+                # Only seed if not already set by run_convergence_pipeline
+                if ev.phylop_score is None:
+                    ev.phylop_score = cds_score
+                    seeded += 1
+            session.commit()
+        log.info("Seeded phylop_score for %d genes from step 3d.", seeded)
+
+    # Only UCSC-query genes that still have no phylop_score after the seed above
+    with get_session() as session:
+        missing_ids = [
+            ev.gene_id
+            for ev in session.query(EvolutionScore).all()
+            if ev.phylop_score is None
+        ]
+
+    if missing_ids:
+        log.info(
+            "Building NCBI chrom map for %d genes missing phylop_score...", len(missing_ids)
+        )
+        chrom_map = build_chrom_map(gene_ids=missing_ids)
+        if chrom_map:
+            enrich_phylop_scores(chrom_map)
+    else:
+        log.info("All genes have phylop_score from step 3d — skipping UCSC enrichment.")
 
 
 def step7b_convergent_aa(dry_run: bool = False) -> None:
