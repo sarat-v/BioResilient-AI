@@ -10,6 +10,7 @@ For species with available GEO datasets (ground squirrel, naked mole rat, axolot
 
 import logging
 import tempfile
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Optional
 
@@ -330,23 +331,60 @@ def save_expression_scores(scores_by_species: dict[str, dict[str, float]]) -> No
 def run_expression_pipeline(species_list: list[dict]) -> dict[str, dict[str, float]]:
     """Run the full expression pipeline for all priority species.
 
+    GEO searches are parallelised across species so the NCBI round-trips happen
+    simultaneously.  GEO downloads and DESeq2 run sequentially per dataset
+    because rpy2/R is not thread-safe and GEOparse downloads large files.
+    The gene-symbol lookup is hoisted outside the loop so we query the DB once
+    instead of once per dataset.
+
     Returns {species_id: {gene_symbol: expression_score}}
     """
     root = Path(get_local_storage_root())
     geo_dir = root / "geo_data"
     geo_dir.mkdir(parents=True, exist_ok=True)
 
+    # Load gene metadata once — reused across all species and datasets.
+    with get_session() as session:
+        genes = session.query(Gene).all()
+        gene_symbols: set[str] = {g.gene_symbol for g in genes}
+        gene_symbol_to_id: dict[str, str] = {g.gene_symbol: g.id for g in genes}
+
+    priority_entries = [
+        entry for entry in species_list
+        if entry["id"] not in ("human",)
+        and entry["id"] in GEO_PRIORITY_SPECIES
+        and entry.get("geo_search_terms")
+    ]
+
+    if not priority_entries:
+        return {}
+
+    # Phase A: parallel GEO search — all species simultaneously (pure HTTP, safe)
+    accessions_by_species: dict[str, list[str]] = {}
+    log.info("GEO search: querying %d species in parallel...", len(priority_entries))
+    with ThreadPoolExecutor(max_workers=min(len(priority_entries), 8)) as pool:
+        search_futures = {
+            pool.submit(search_geo, entry["id"], entry["geo_search_terms"]): entry["id"]
+            for entry in priority_entries
+        }
+        for future in as_completed(search_futures):
+            sid = search_futures[future]
+            try:
+                accessions_by_species[sid] = future.result()
+            except Exception as exc:
+                log.warning("GEO search failed for %s: %s", sid, exc)
+                accessions_by_species[sid] = []
+
+    # Phase B: sequential download + DESeq2 (rpy2/R not thread-safe)
     scores_by_species: dict[str, dict[str, float]] = {}
 
-    for entry in species_list:
+    for entry in priority_entries:
         sid = entry["id"]
-        if sid == "human" or sid not in GEO_PRIORITY_SPECIES:
-            continue
-        if not entry.get("geo_search_terms"):
+        accessions = accessions_by_species.get(sid, [])
+        if not accessions:
             continue
 
-        log.info("Processing GEO expression for %s...", sid)
-        accessions = search_geo(sid, entry["geo_search_terms"])
+        log.info("Processing GEO expression for %s (%d dataset(s))...", sid, len(accessions[:2]))
 
         for gse_acc in accessions[:2]:   # Limit to 2 datasets per species in Phase 1
             geo_path, gse = download_geo_dataset(gse_acc, geo_dir)
@@ -357,7 +395,6 @@ def run_expression_pipeline(species_list: list[dict]) -> dict[str, dict[str, flo
             if matrix is None or matrix.empty:
                 continue
 
-            # Infer condition labels from GSM titles (heuristic)
             condition_map = _infer_conditions(gse)
             if not condition_map or len(set(condition_map.values())) < 2:
                 log.info("  %s/%s: could not infer treatment/control groups", sid, gse_acc)
@@ -367,15 +404,11 @@ def run_expression_pipeline(species_list: list[dict]) -> dict[str, dict[str, flo
             if results is None:
                 continue
 
-            with get_session() as session:
-                genes = session.query(Gene).all()
-                gene_symbols = {g.gene_symbol for g in genes}
-                gene_symbol_to_id = {g.gene_symbol: g.id for g in genes}
-
             species_scores = compute_expression_score(results, gene_symbols)
             scores_by_species[sid] = species_scores
             n_ev = save_expression_evidence(results, gse_acc, sid, gene_symbol_to_id)
-            log.info("  %s/%s: scored %d genes, saved %d evidence rows", sid, gse_acc, len(species_scores), n_ev)
+            log.info("  %s/%s: scored %d genes, saved %d evidence rows",
+                     sid, gse_acc, len(species_scores), n_ev)
 
     return scores_by_species
 

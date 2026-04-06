@@ -38,8 +38,8 @@ REQUEST_TIMEOUT = 20
 
 
 def _bgee_workers() -> int:
-    """Return number of parallel Bgee API workers from config (default 15)."""
-    return int(get_tool_config().get("bgee_workers", 15))
+    """Return number of parallel Bgee API workers from config (default 30)."""
+    return int(get_tool_config().get("bgee_workers", 30))
 
 # Tissues relevant for each trait (mapped to Uberon or Bgee tissue names)
 TRAIT_TISSUES: dict[str, list[str]] = {
@@ -51,16 +51,15 @@ TRAIT_TISSUES: dict[str, list[str]] = {
 }
 
 _bgee_taxid_cache: Optional[dict[int, str]] = None
+_bgee_supported_taxids_cache: Optional[set[int]] = None
 
 
 def _get_bgee_taxids() -> dict[int, str]:
     """Return {taxid: species_id} for all species in the DB that have a taxid.
 
     Derived from the Species table so the list stays current when species are
-    added or removed from the registry.  Bgee silently returns no result for
-    species it doesn't cover, so we can safely try all registered species and
-    let the API filter naturally.  Human (taxid 9606) is always included as the
-    anchor for gene-symbol resolution even if it is a baseline/control species.
+    added or removed from the registry.  Human (taxid 9606) is always included
+    as the anchor for gene-symbol resolution even if it is a baseline/control.
     """
     global _bgee_taxid_cache
     if _bgee_taxid_cache is not None:
@@ -75,6 +74,55 @@ def _get_bgee_taxids() -> dict[int, str]:
         _bgee_taxid_cache = {}
 
     return _bgee_taxid_cache
+
+
+def _get_bgee_supported_taxids() -> set[int]:
+    """Return the set of species taxon IDs that Bgee actually has data for.
+
+    Makes a single lightweight GET /api/species request and caches the result
+    for the lifetime of the process.  This allows us to skip the per-species
+    gene-search calls for the majority of our exotic panel species that Bgee
+    does not cover (e.g. naked mole rat, greenland shark, little skate), cutting
+    API call volume by ~80% and reducing per-gene latency from ~17 calls to ~3.
+
+    Falls back to an empty set (= try all species) on any API error.
+    """
+    global _bgee_supported_taxids_cache
+    if _bgee_supported_taxids_cache is not None:
+        return _bgee_supported_taxids_cache
+
+    try:
+        r = requests.get(
+            f"{BGEE_API}/species",
+            params={"display_type": "json"},
+            timeout=REQUEST_TIMEOUT,
+        )
+        if r.status_code != 200:
+            log.warning("Bgee /api/species returned %d — will try all taxids.", r.status_code)
+            _bgee_supported_taxids_cache = set()
+            return _bgee_supported_taxids_cache
+        data = r.json()
+        # Bgee API wraps responses as data.data.xxx; handle both formats gracefully
+        inner = data.get("data") or data
+        if isinstance(inner, dict):
+            species_list = inner.get("species", [])
+        elif isinstance(inner, list):
+            species_list = inner
+        else:
+            species_list = []
+        supported: set[int] = set()
+        for sp in species_list:
+            taxid = sp.get("id") or sp.get("speciesId") or sp.get("taxonId")
+            if taxid is not None:
+                supported.add(int(taxid))
+        _bgee_supported_taxids_cache = supported
+        log.info("Bgee supports %d species (pre-filtered from %d registered).",
+                 len(supported), len(_get_bgee_taxids()))
+    except Exception as exc:
+        log.warning("Could not fetch Bgee species list (%s) — will try all taxids.", exc)
+        _bgee_supported_taxids_cache = set()
+
+    return _bgee_supported_taxids_cache
 
 
 def _bgee_gene_search(gene_symbol: str, species_taxid: int = 9606) -> Optional[str]:
@@ -134,10 +182,13 @@ def _query_bgee_for_gene(
     gene: Gene,
     trait_tissues: list[str],
 ) -> tuple[str, list[dict]]:
-    """Query Bgee for all supported species for one gene.
+    """Query Bgee for all Bgee-supported species for one gene.
+
+    Uses the pre-fetched supported taxid set to skip species Bgee does not
+    cover (typically ~80% of our exotic panel), cutting per-gene API calls
+    from ~17 down to ~3 (human + 2-3 model organisms).
 
     Returns (gene_id, [ExpressionResult-kwargs, ...]) — does NOT write to DB.
-    Each dict is passed directly to ExpressionResult(**kwargs).
     """
     if not gene.gene_symbol:
         return gene.id, []
@@ -147,13 +198,18 @@ def _query_bgee_for_gene(
         log.debug("  Bgee: no result for %s", gene.gene_symbol)
         return gene.id, []
 
-    time.sleep(0.1)  # small per-gene courtesy pause
-
     expression_rows: list[dict] = []
     present_species: list[str] = []
 
+    # Pre-filtered taxid set: skip species Bgee has no data for.
+    # Falls back to all registered taxids if the /api/species call failed.
+    supported_taxids = _get_bgee_supported_taxids()
+
     for taxid, species_id in _get_bgee_taxids().items():
         if taxid == 9606:
+            continue
+        # Skip species not in Bgee (saves ~2 API calls per unsupported species)
+        if supported_taxids and taxid not in supported_taxids:
             continue
 
         bgee_species_id = _bgee_gene_search(gene.gene_symbol, species_taxid=taxid)
@@ -161,7 +217,7 @@ def _query_bgee_for_gene(
             continue
 
         calls = _bgee_expression_calls(bgee_species_id, taxid)
-        time.sleep(0.05)
+        time.sleep(0.05)  # per-species courtesy pause (runs inside thread)
 
         for call in calls:
             tissue = ""

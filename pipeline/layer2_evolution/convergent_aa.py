@@ -11,7 +11,9 @@ identify functionally equivalent (but not identical) convergent substitutions.
 """
 
 import logging
+import multiprocessing
 from collections import Counter, defaultdict
+from concurrent.futures import ProcessPoolExecutor
 from pathlib import Path
 from typing import Optional
 
@@ -170,66 +172,35 @@ def _infer_ancestral_aa_cached(pruned_tree, species_aa: dict[str, str]) -> dict[
     return parent_aa_map
 
 
-def annotate_convergent_aa(gene_ids: Optional[list[str]] = None) -> int:
-    """Annotate all DivergentMotif rows with convergent_aa_count.
+def _compute_gene_batch(
+    gene_batch: dict[str, list[tuple]],
+    tree_newick: Optional[str],
+    species_lineage_map: dict[str, str],
+) -> dict[str, int]:
+    """Compute convergent_aa_count for a batch of genes.
 
-    Optimised path: raw SQL load, numpy-free in-memory computation using
-    pre-computed Miyata groups and Counter-based convergence detection,
-    then batched bulk UPDATE via unnest.
+    Designed to run in a separate process via ProcessPoolExecutor — all
+    inputs and the output are plain Python types (fully picklable).
+    Each worker maintains its own pruned-tree cache so ete3 objects never
+    cross process boundaries.
+
+    Args:
+        gene_batch:          {gene_id: [(motif_id, start_pos, human_seq, animal_seq, species_id), ...]}
+        tree_newick:         Newick string of the species tree (or None).
+        species_lineage_map: {species_id: lineage_group}
+
+    Returns:
+        {motif_id: convergent_aa_count}
     """
-    from sqlalchemy import text
-
-    with get_session() as session:
-        if gene_ids is None:
-            gene_ids = [g.id for g in session.query(Gene).all()]
-
-        species_lineage_map: dict[str, str] = {
-            s.id: (s.lineage_group or "Other")
-            for s in session.query(Species).all()
-        }
-
-        log.info("Loading motif rows for %d genes via raw SQL...", len(gene_ids))
-        result = session.execute(
-            text("""
-                SELECT dm.id, dm.start_pos, dm.human_seq, dm.animal_seq,
-                       o.gene_id, o.species_id
-                FROM divergent_motif dm
-                JOIN ortholog o ON o.id = dm.ortholog_id
-                WHERE o.gene_id = ANY(:gene_ids)
-            """),
-            {"gene_ids": gene_ids},
-        )
-        rows = result.fetchall()
-
-    log.info("Loaded %d motif rows. Grouping by gene...", len(rows))
-
-    # Group by gene_id — store lightweight tuples, not ORM objects
-    # Each entry: (motif_id, start_pos, human_seq, animal_seq, species_id)
-    gene_motifs: dict[str, list[tuple]] = defaultdict(list)
-    for motif_id, start_pos, human_seq, animal_seq, gene_id, species_id in rows:
-        gene_motifs[gene_id].append((str(motif_id), start_pos, human_seq, animal_seq, species_id))
-
-    del rows
-
-    log.info("Computing convergent AA counts for %d genes...", len(gene_motifs))
-
-    skip_lineages = {"Primates", "Other"}
-    motif_counts: dict[str, int] = {}
-    genes_done = 0
-
-    tree_newick = _load_species_tree_newick()
-    if tree_newick:
-        log.info("Loaded species tree for ancestral state reconstruction.")
-    else:
-        log.warning("No species tree found — falling back to Miyata-only convergence (no ASR).")
-
-    # Cache pruned ete3 trees keyed by frozenset of species to avoid
-    # re-parsing + re-pruning the same tree thousands of times.
+    # Per-worker pruned-tree cache — built on demand, stays in this process.
     _pruned_tree_cache: dict[frozenset, object] = {}
 
     def _get_pruned_tree(species_set: frozenset):
         if species_set in _pruned_tree_cache:
             return _pruned_tree_cache[species_set]
+        if not tree_newick:
+            _pruned_tree_cache[species_set] = None
+            return None
         try:
             from ete3 import Tree
             t = Tree(tree_newick)
@@ -244,8 +215,11 @@ def annotate_convergent_aa(gene_ids: Optional[list[str]] = None) -> int:
             _pruned_tree_cache[species_set] = None
             return None
 
-    for gene_id, motifs in gene_motifs.items():
-        # Phase 1: build position -> {species: alt_aa} and {lineage: miyata_group}
+    skip_lineages = {"Primates", "Other"}
+    motif_counts: dict[str, int] = {}
+
+    for gene_id, motifs in gene_batch.items():
+        # Phase 1: build position → {species: alt_aa} and {lineage: miyata_group}
         position_species_aa: dict[int, dict[str, str]] = defaultdict(dict)
         position_lineage_groups: dict[int, dict[str, int]] = defaultdict(dict)
         position_human_aa: dict[int, str] = {}
@@ -291,8 +265,6 @@ def annotate_convergent_aa(gene_ids: Optional[list[str]] = None) -> int:
                     _get_pruned_tree(species_key), species_aa
                 )
 
-                # Only count species where the substitution is independent
-                # (leaf AA differs from its inferred parent AA)
                 independent_lineages: dict[str, int] = {}
                 for sp_id, alt_aa in position_species_aa[abs_pos].items():
                     anc_aa = parent_aa.get(sp_id)
@@ -322,21 +294,96 @@ def annotate_convergent_aa(gene_ids: Optional[list[str]] = None) -> int:
                     max_conv = conv
             motif_counts[motif_id] = max_conv
 
-        genes_done += 1
-        if genes_done % 2000 == 0:
-            log.info("  genes processed: %d/%d, motifs so far: %d",
-                     genes_done, len(gene_motifs), len(motif_counts))
+    return motif_counts
+
+
+def annotate_convergent_aa(gene_ids: Optional[list[str]] = None) -> int:
+    """Annotate all DivergentMotif rows with convergent_aa_count.
+
+    Optimised path: raw SQL load, numpy-free in-memory computation using
+    pre-computed Miyata groups and Counter-based convergence detection,
+    then batched bulk UPDATE via unnest.
+
+    Parallelised: gene batches are distributed across all available CPUs
+    using ProcessPoolExecutor so the CPU-bound Fitch ASR loop scales linearly
+    with the number of vCPUs on the Batch instance.
+    """
+    from sqlalchemy import text
+
+    with get_session() as session:
+        if gene_ids is None:
+            gene_ids = [g.id for g in session.query(Gene).all()]
+
+        species_lineage_map: dict[str, str] = {
+            s.id: (s.lineage_group or "Other")
+            for s in session.query(Species).all()
+        }
+
+        log.info("Loading motif rows for %d genes via raw SQL...", len(gene_ids))
+        result = session.execute(
+            text("""
+                SELECT dm.id, dm.start_pos, dm.human_seq, dm.animal_seq,
+                       o.gene_id, o.species_id
+                FROM divergent_motif dm
+                JOIN ortholog o ON o.id = dm.ortholog_id
+                WHERE o.gene_id = ANY(:gene_ids)
+            """),
+            {"gene_ids": gene_ids},
+        )
+        rows = result.fetchall()
+
+    log.info("Loaded %d motif rows. Grouping by gene...", len(rows))
+
+    gene_motifs: dict[str, list[tuple]] = defaultdict(list)
+    for motif_id, start_pos, human_seq, animal_seq, gene_id, species_id in rows:
+        gene_motifs[gene_id].append((str(motif_id), start_pos, human_seq, animal_seq, species_id))
+
+    del rows
+
+    log.info("Computing convergent AA counts for %d genes...", len(gene_motifs))
+
+    tree_newick = _load_species_tree_newick()
+    if tree_newick:
+        log.info("Loaded species tree for ancestral state reconstruction.")
+    else:
+        log.warning("No species tree found — falling back to Miyata-only convergence (no ASR).")
+
+    # Split gene work across available CPUs.
+    # ProcessPoolExecutor gives true parallelism (no GIL) for the CPU-bound
+    # Fitch ASR loop. Each worker builds its own pruned-tree cache from the
+    # tree_newick string — ete3 objects stay within each worker process.
+    n_workers = min(multiprocessing.cpu_count(), len(gene_motifs))
+    gene_items = list(gene_motifs.items())
+    chunk_size = max(1, (len(gene_items) + n_workers - 1) // n_workers)
+    chunks = [
+        dict(gene_items[i: i + chunk_size])
+        for i in range(0, len(gene_items), chunk_size)
+    ]
+    log.info(
+        "Dispatching %d gene chunks to %d worker processes (~%d genes/chunk)...",
+        len(chunks), n_workers, chunk_size,
+    )
+
+    motif_counts: dict[str, int] = {}
+    with ProcessPoolExecutor(max_workers=n_workers) as executor:
+        futures = [
+            executor.submit(_compute_gene_batch, chunk, tree_newick, species_lineage_map)
+            for chunk in chunks
+        ]
+        for idx, future in enumerate(futures, 1):
+            result = future.result()
+            motif_counts.update(result)
+            log.info("  Worker %d/%d done (%d motifs so far).", idx, len(chunks), len(motif_counts))
 
     log.info("Computation complete: %d motifs scored. Writing to DB...", len(motif_counts))
 
-    # Bulk write using batched UPDATE with unnest
     truly_convergent = sum(1 for c in motif_counts.values() if c >= 2)
     items = list(motif_counts.items())
     BATCH = 10000
     updated = 0
 
     for i in range(0, len(items), BATCH):
-        chunk = items[i : i + BATCH]
+        chunk = items[i: i + BATCH]
         ids = [mid for mid, _ in chunk]
         counts = [c for _, c in chunk]
         with get_session() as session:
