@@ -60,13 +60,16 @@ process phylo_conservation {
     """
 }
 
-// extract_og_ids always queries the DB for authoritative OG list (the pkl's
-// motifs_by_og can be stale). The pkl is still needed for aligned sequences.
-// Writes og_batch_NNN.txt files with params.paml_batch_size OGs each for
-// efficient scatter — one pkl load per task instead of one per OG.
+// extract_og_ids queries the DB for the authoritative OG list and writes
+// og_batch_NNN.txt files for PAML scatter. storeDir pins the outputs to a
+// FIXED, versioned S3 path so that -resume always receives identical input
+// file paths → deterministic run_paml task hashes → proper cache hits.
+// To force a fresh OG list (e.g. after DB state changes), bump
+// params.paml_og_cache_key (e.g. --paml_og_cache_key v2) or delete the
+// storeDir prefix from S3.
 process extract_og_ids {
     label 'base'
-    cache false
+    storeDir "${params.storage_root}/step_cache/${params.phenotype}/paml_og_batches_b${params.paml_batch_size}_${params.paml_og_cache_key}"
     cpus 1
     memory '16 GB'
     time '20m'
