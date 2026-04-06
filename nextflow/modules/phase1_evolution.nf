@@ -196,6 +196,7 @@ process run_paml {
     memory { (params.paml_memory as nextflow.util.MemoryUnit) * task.attempt }
     time '3h'
     tag "${og_batch.baseName}"
+    maxForks params.paml_max_forks
     errorStrategy { task.attempt <= 3 ? 'retry' : 'finish' }
     maxRetries 3
 
