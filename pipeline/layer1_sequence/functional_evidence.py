@@ -12,13 +12,21 @@ with three well-curated, phenotype-configurable evidence sources:
                               CRISPR Chronos score converted to [0, 1] selective
                               essentiality signal.
 
-Combined score → candidate_score.expression_score.
+Combined score → candidate_score.expression_score (trait_id="").
 This score is used as a 4th rank-product evidence layer in Phase 1 scoring (step 9).
+
+Performance design:
+  - ENSG symbol→ID mapping: Ensembl REST bulk lookup (1000 symbols/request → ~13 calls
+    for 12k genes, vs 12k individual OT search calls). Cached to disk.
+  - GTEx: 20 parallel threads with short per-request delays.
+  - OT association batch: 50 ENSG IDs per GraphQL request.
+  - DepMap: single bulk CSV download (~150 MB), entirely local thereafter.
 
 Per-phenotype configuration: config/functional_evidence_config.json
 Reference for Open Targets: Ochoa et al. (2021) Nature Genetics.
 Reference for DepMap:        Tsherniak et al. (2017) Cell.
 Reference for GTEx:          GTEx Consortium (2020) Science.
+Reference for Ensembl REST:  Yates et al. (2021) Nucleic Acids Research.
 """
 
 import csv
@@ -26,7 +34,9 @@ import json
 import logging
 import math
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
+from threading import Lock
 from typing import Optional
 
 import requests
@@ -43,15 +53,19 @@ log = logging.getLogger(__name__)
 
 OPENTARGETS_GRAPHQL = "https://api.platform.opentargets.org/api/v4/graphql"
 GTEX_API = "https://gtexportal.org/api/v2/expression/geneExpression"
+ENSEMBL_LOOKUP_URL = "https://rest.ensembl.org/lookup/symbol/homo_sapiens"
 DEPMAP_URL = (
     "https://depmap.org/portal/api/download/file"
     "?file_name=CRISPRGeneDependency.csv&release=DepMap+Public+24Q2"
 )
 
-OT_BATCH_SIZE = 50    # genes per GraphQL request to Open Targets
-REQUEST_TIMEOUT = 30  # seconds for individual HTTP requests
-RATE_DELAY_OT = 0.15  # seconds between Open Targets batches
-RATE_DELAY_GTEX = 0.12  # seconds between GTEx requests
+OT_BATCH_SIZE = 50        # genes per GraphQL request to Open Targets
+ENSEMBL_BATCH_SIZE = 1000 # symbols per Ensembl bulk lookup request
+GTEX_WORKERS = 20         # parallel threads for GTEx
+REQUEST_TIMEOUT = 30      # seconds for individual HTTP requests
+RATE_DELAY_OT = 0.15      # seconds between Open Targets batches
+RATE_DELAY_ENSEMBL = 0.3  # seconds between Ensembl bulk requests
+RATE_DELAY_GTEX = 0.1     # delay per GTEx worker (gentle per-thread rate limit)
 
 _REPO_ROOT = Path(__file__).resolve().parents[2]
 _CONFIG_PATH = _REPO_ROOT / "config" / "functional_evidence_config.json"
@@ -89,15 +103,99 @@ def _hgnc_symbol(gene: Gene) -> Optional[str]:
     The DB stores UniProt mnemonic entry names like ``TP53_HUMAN``.
     Stripping the ``_HUMAN`` suffix recovers the HGNC symbol for the vast
     majority of well-characterised human genes (TP53, BRCA1, ATM, etc.).
-    The approximation is acceptable because:
-      - Top-tier candidates are almost always well-known genes with matching names.
-      - Olfactory receptors / pseudogenes that don't match will simply receive no
-        functional score, which does not penalise them — it is conservative.
     """
     sym = gene.gene_symbol or ""
     if sym.endswith("_HUMAN"):
         return sym[: -len("_HUMAN")]
     return sym if sym else None
+
+
+# ---------------------------------------------------------------------------
+# ENSG ID mapping via Ensembl bulk REST API
+# ---------------------------------------------------------------------------
+
+def _ensembl_bulk_lookup(symbols: list[str]) -> dict[str, str]:
+    """Resolve HGNC symbols to Ensembl IDs via the Ensembl REST bulk endpoint.
+
+    POST /lookup/symbol/homo_sapiens accepts up to 1000 symbols at once.
+    Returns {symbol: ensembl_id}. Missing/invalid symbols are absent.
+    """
+    if not symbols:
+        return {}
+
+    result: dict[str, str] = {}
+    try:
+        r = requests.post(
+            ENSEMBL_LOOKUP_URL,
+            headers={"Content-Type": "application/json", "Accept": "application/json"},
+            json={"symbols": symbols},
+            timeout=60,
+        )
+        if r.status_code != 200:
+            log.warning("Ensembl bulk lookup HTTP %d for %d symbols", r.status_code, len(symbols))
+            return {}
+        data = r.json()
+        for sym, info in data.items():
+            if isinstance(info, dict):
+                ensg = info.get("id", "")
+                if ensg.startswith("ENSG"):
+                    result[sym] = ensg
+    except Exception as exc:
+        log.warning("Ensembl bulk lookup failed: %s", exc)
+    return result
+
+
+def _build_ensg_map(genes: list[Gene]) -> dict[str, str]:
+    """Build {hgnc_symbol: ensembl_id} mapping using the Ensembl bulk REST API.
+
+    Uses a persistent disk cache to avoid repeated lookups across pipeline runs.
+    On first call for 12k genes: ~13 HTTP requests (1000 symbols each) → ~5 seconds.
+    On subsequent calls: instant (cache hit).
+    """
+    cache_path = Path(get_local_storage_root()) / "ot_ensg_cache.json"
+    cache: dict[str, str] = {}
+    if cache_path.exists():
+        try:
+            with open(cache_path) as f:
+                cache = json.load(f)
+        except Exception:
+            cache = {}
+
+    # Collect symbols not yet in cache
+    symbols_needed = []
+    for gene in genes:
+        sym = _hgnc_symbol(gene)
+        if sym and sym not in cache:
+            symbols_needed.append(sym)
+
+    if symbols_needed:
+        log.info(
+            "ENSG lookup: %d new symbols via Ensembl bulk API (~%d requests)...",
+            len(symbols_needed),
+            math.ceil(len(symbols_needed) / ENSEMBL_BATCH_SIZE),
+        )
+        n_resolved = 0
+        for i in range(0, len(symbols_needed), ENSEMBL_BATCH_SIZE):
+            batch = symbols_needed[i: i + ENSEMBL_BATCH_SIZE]
+            found = _ensembl_bulk_lookup(batch)
+            n_resolved += len(found)
+            # Cache every symbol (resolved or not) to avoid re-querying unknowns
+            for sym in batch:
+                cache[sym] = found.get(sym, "")
+            time.sleep(RATE_DELAY_ENSEMBL)
+            batch_num = i // ENSEMBL_BATCH_SIZE + 1
+            total_batches = math.ceil(len(symbols_needed) / ENSEMBL_BATCH_SIZE)
+            log.info(
+                "  ENSG: batch %d / %d — %d resolved so far",
+                batch_num, total_batches, n_resolved,
+            )
+
+        cache_path.parent.mkdir(parents=True, exist_ok=True)
+        with open(cache_path, "w") as f:
+            json.dump(cache, f)
+        log.info("ENSG map: %d / %d symbols resolved.", n_resolved, len(symbols_needed))
+
+    return cache
 
 
 # ---------------------------------------------------------------------------
@@ -118,75 +216,6 @@ query FunctionalEvidence($ensemblIds: [String!]!) {
   }
 }
 """
-
-_OT_SYMBOL_QUERY = """
-query SymbolToEnsembl($queryString: String!) {
-  search(queryString: $queryString, entityNames: ["target"], page: {size: 1}) {
-    hits {
-      id
-      ... on Target {
-        approvedSymbol
-      }
-    }
-  }
-}
-"""
-
-
-def _ot_symbol_to_ensg(symbol: str) -> Optional[str]:
-    """Resolve a gene symbol to an ENSEMBL ID via the Open Targets search API."""
-    try:
-        r = requests.post(
-            OPENTARGETS_GRAPHQL,
-            json={"query": _OT_SYMBOL_QUERY, "variables": {"queryString": symbol}},
-            timeout=REQUEST_TIMEOUT,
-        )
-        r.raise_for_status()
-        hits = (r.json().get("data") or {}).get("search", {}).get("hits", [])
-        if hits:
-            hit = hits[0]
-            approved = hit.get("approvedSymbol", "")
-            if approved.upper() == symbol.upper():
-                return hit.get("id")
-    except Exception as exc:
-        log.debug("OT symbol lookup failed for %s: %s", symbol, exc)
-    return None
-
-
-def _build_ensg_map(genes: list[Gene]) -> dict[str, str]:
-    """Build {hgnc_symbol: ensembl_id} mapping via Open Targets search.
-
-    Uses a cache file to avoid repeated API calls across pipeline runs.
-    """
-    cache_path = Path(get_local_storage_root()) / "ot_ensg_cache.json"
-    cache: dict[str, str] = {}
-    if cache_path.exists():
-        try:
-            with open(cache_path) as f:
-                cache = json.load(f)
-        except Exception:
-            cache = {}
-
-    symbols_needed = []
-    for gene in genes:
-        sym = _hgnc_symbol(gene)
-        if sym and sym not in cache:
-            symbols_needed.append(sym)
-
-    if symbols_needed:
-        log.info("OT symbol→ENSG lookup for %d new symbols...", len(symbols_needed))
-        for i, sym in enumerate(symbols_needed):
-            ensg = _ot_symbol_to_ensg(sym)
-            cache[sym] = ensg or ""
-            time.sleep(RATE_DELAY_OT)
-            if (i + 1) % 100 == 0:
-                log.info("  Symbol lookup: %d / %d done", i + 1, len(symbols_needed))
-
-        cache_path.parent.mkdir(parents=True, exist_ok=True)
-        with open(cache_path, "w") as f:
-            json.dump(cache, f)
-
-    return cache
 
 
 def _fetch_ot_batch(ensg_ids: list[str], disease_set: set[str]) -> dict[str, float]:
@@ -213,12 +242,11 @@ def _fetch_ot_batch(ensg_ids: list[str], disease_set: set[str]) -> dict[str, flo
     result: dict[str, float] = {}
     for target in (data.get("data") or {}).get("targets") or []:
         eid = target.get("id", "")
-        scores = []
-        for row in (target.get("associatedDiseases") or {}).get("rows") or []:
-            if row.get("disease", {}).get("id") in disease_set:
-                s = row.get("score")
-                if s is not None:
-                    scores.append(float(s))
+        scores = [
+            float(row["score"])
+            for row in (target.get("associatedDiseases") or {}).get("rows") or []
+            if row.get("disease", {}).get("id") in disease_set and row.get("score") is not None
+        ]
         if scores:
             result[eid] = max(scores)
     return result
@@ -241,7 +269,7 @@ def fetch_open_targets_scores(
         len(genes), len(disease_ids),
     )
 
-    # Build symbol → ENSG map (cached)
+    # Build symbol → ENSG map via Ensembl bulk API (cached)
     ensg_map = _build_ensg_map(genes)
 
     # Map gene DB id → ENSG
@@ -257,15 +285,13 @@ def fetch_open_targets_scores(
         log.info("No ENSG IDs resolved — skipping Open Targets scoring.")
         return {}
 
-    log.info("  %d / %d genes have ENSG IDs resolved.", len(gid_to_ensg), len(genes))
+    log.info("  %d / %d genes have resolved ENSG IDs.", len(gid_to_ensg), len(genes))
 
-    # Invert: ENSG → gene DB id (for result mapping)
     ensg_to_gid: dict[str, str] = {v: k for k, v in gid_to_ensg.items()}
-
     ensg_list = list(ensg_to_gid.keys())
-    all_scores: dict[str, float] = {}
     n_batches = math.ceil(len(ensg_list) / OT_BATCH_SIZE)
 
+    all_scores: dict[str, float] = {}
     for i in range(0, len(ensg_list), OT_BATCH_SIZE):
         batch = ensg_list[i: i + OT_BATCH_SIZE]
         scores = _fetch_ot_batch(batch, disease_set)
@@ -275,7 +301,7 @@ def fetch_open_targets_scores(
                 all_scores[gid] = score
         time.sleep(RATE_DELAY_OT)
         batch_num = i // OT_BATCH_SIZE + 1
-        if batch_num % 5 == 0 or batch_num == n_batches:
+        if batch_num % 10 == 0 or batch_num == n_batches:
             log.info("  OT: %d / %d batches complete", batch_num, n_batches)
 
     log.info("Open Targets: %d / %d genes scored.", len(all_scores), len(genes))
@@ -283,22 +309,19 @@ def fetch_open_targets_scores(
 
 
 # ---------------------------------------------------------------------------
-# GTEx
+# GTEx  (parallelised with ThreadPoolExecutor)
 # ---------------------------------------------------------------------------
 
 def _fetch_gtex_gene(gene_symbol: str, tissue_ids: list[str]) -> Optional[dict[str, float]]:
     """Fetch GTEx v10 median TPM for a gene across the requested tissues.
 
-    Issues one request per gene (returning all tissues) and filters client-side.
-    Falls back to per-tissue requests if the bulk call fails.
-
+    Issues one bulk request (all tissues, filter client-side).
     Returns {tissue_id: median_tpm} or None if no data.
     """
     result: dict[str, float] = {}
     tissue_set = set(tissue_ids)
 
     try:
-        # Single request for all tissues
         r = requests.get(
             GTEX_API,
             params={"geneSymbol": gene_symbol, "datasetId": "gtex_v10"},
@@ -315,7 +338,7 @@ def _fetch_gtex_gene(gene_symbol: str, tissue_ids: list[str]) -> Optional[dict[s
                         except (TypeError, ValueError):
                             pass
     except Exception as exc:
-        log.debug("GTEx bulk fetch failed for %s: %s", gene_symbol, exc)
+        log.debug("GTEx fetch failed for %s: %s", gene_symbol, exc)
 
     return result if result else None
 
@@ -338,28 +361,45 @@ def fetch_gtex_scores(
 ) -> dict[str, float]:
     """Fetch GTEx expression scores for all genes in phenotype-relevant tissues.
 
+    Uses a thread pool (GTEX_WORKERS=20) so 12k genes complete in ~2 minutes
+    instead of ~26 minutes sequentially.
+
     Returns {gene_id (DB primary key): score [0, 1]}.
     """
     if not tissue_ids:
         return {}
 
-    log.info("GTEx: querying %d genes across %d tissues...", len(genes), len(tissue_ids))
-    scores: dict[str, float] = {}
+    # Filter to genes with valid symbols
+    gene_pairs = [(g, _hgnc_symbol(g)) for g in genes]
+    gene_pairs = [(g, sym) for g, sym in gene_pairs if sym]
+    log.info("GTEx: querying %d genes × %d tissues with %d workers...",
+             len(gene_pairs), len(tissue_ids), GTEX_WORKERS)
 
-    for i, gene in enumerate(genes):
-        sym = _hgnc_symbol(gene)
-        if not sym:
-            continue
+    scores: dict[str, float] = {}
+    lock = Lock()
+    done_count = [0]
+
+    def _worker(g: Gene, sym: str) -> None:
         tpm_map = _fetch_gtex_gene(sym, tissue_ids)
+        time.sleep(RATE_DELAY_GTEX)
         if tpm_map:
             score = _gtex_normalize(list(tpm_map.values()))
             if score > 0:
-                scores[gene.id] = score
-        time.sleep(RATE_DELAY_GTEX)
-        if (i + 1) % 200 == 0:
-            log.info("  GTEx: %d / %d genes done...", i + 1, len(genes))
+                with lock:
+                    scores[g.id] = score
+        with lock:
+            done_count[0] += 1
+            if done_count[0] % 500 == 0:
+                log.info("  GTEx: %d / %d genes done...", done_count[0], len(gene_pairs))
 
-    log.info("GTEx: %d / %d genes scored.", len(scores), len(genes))
+    with ThreadPoolExecutor(max_workers=GTEX_WORKERS) as pool:
+        futures = [pool.submit(_worker, g, sym) for g, sym in gene_pairs]
+        for f in as_completed(futures):
+            exc = f.exception()
+            if exc:
+                log.debug("GTEx worker error: %s", exc)
+
+    log.info("GTEx: %d / %d genes scored.", len(scores), len(gene_pairs))
     return scores
 
 
@@ -404,7 +444,6 @@ def _load_depmap_index() -> dict[str, float]:
             header = next(reader, None)
             if not header:
                 return {}
-            # Column format: "SYMBOL (ENTREZ_ID)" → extract symbol
             symbols = [h.split(" (")[0].strip() for h in header[1:]]
             for sym in symbols:
                 gene_scores[sym] = []
@@ -432,7 +471,7 @@ def _depmap_to_score(chronos: float) -> float:
     """Convert mean Chronos score to a [0, 1] functional relevance score.
 
     Genes with strong selective essentiality (chronos << -0.5) score near 1.
-    Broadly non-essential genes (chronos ≈ 0) score near 0.
+    Non-essential genes (chronos ≈ 0) score near 0.
     Uses a sigmoid centred at -0.5: score = σ(-10 × (chronos + 0.5)).
     """
     return round(1.0 / (1.0 + math.exp(10.0 * (chronos + 0.5))), 4)
@@ -506,15 +545,12 @@ def _persist_results(
     ot_scores: dict[str, float],
     gtex_scores: dict[str, float],
     depmap_scores: dict[str, float],
-    phenotype: str,
 ) -> int:
     """Write evidence sub-scores to expression_result and update candidate_score.
 
-    The expression_result table is repurposed:
-      geo_accession → source identifier (e.g. "OT:cancer", "GTEX:Spleen")
-      comparison    → human-readable source description
-      log2fc        → sub-score value [0, 1]
-      padj          → null (not applicable)
+    Writes to trait_id="" (the default used by step 9 scoring) so that the
+    functional evidence score feeds directly into the rank-product in step 9.
+    Phenotype info is preserved in expression_result.comparison and .geo_accession.
 
     Returns number of genes with a non-zero combined score.
     """
@@ -558,10 +594,11 @@ def _persist_results(
         if rows:
             session.add_all(rows)
 
-        # Load existing CandidateScore rows (keyed by gene_id + trait_id)
+        # Write expression_score to CandidateScore rows with trait_id=""
+        # (matches what step 9 run_scoring uses as default trait_id)
         cs_map = {
             r.gene_id: r
-            for r in session.query(CandidateScore).filter_by(trait_id=phenotype).all()
+            for r in session.query(CandidateScore).filter_by(trait_id="").all()
         }
 
         updated = 0
@@ -570,7 +607,7 @@ def _persist_results(
                 continue
             cs = cs_map.get(gid)
             if cs is None:
-                cs = CandidateScore(gene_id=gid, trait_id=phenotype)
+                cs = CandidateScore(gene_id=gid, trait_id="")
                 session.add(cs)
             cs.expression_score = score
             updated += 1
@@ -593,11 +630,11 @@ def run_functional_evidence(phenotype: str = "cancer_resistance") -> dict:
 
     Steps:
       1. Load per-phenotype config (OT disease IDs, GTEx tissues, DepMap flag).
-      2. Fetch Open Targets association scores (batched GraphQL).
-      3. Fetch GTEx tissue expression scores (one request per gene).
+      2. Fetch Open Targets association scores (Ensembl bulk ENSG lookup + batched GraphQL).
+      3. Fetch GTEx tissue expression scores (parallelised with 20 threads).
       4. Optionally fetch DepMap essentiality scores.
       5. Combine into a single expression_score per gene.
-      6. Persist to expression_result table and candidate_score.expression_score.
+      6. Persist to expression_result table and candidate_score.expression_score (trait_id="").
 
     Returns a summary dict with counts for monitoring/reporting.
     """
@@ -652,9 +689,7 @@ def run_functional_evidence(phenotype: str = "cancer_resistance") -> dict:
 
     # Combine and persist ------------------------------------------------
     combined = _combine_scores(gene_ids, ot_scores, gtex_scores, depmap_scores)
-    nonzero = _persist_results(
-        gene_ids, combined, ot_scores, gtex_scores, depmap_scores, phenotype
-    )
+    nonzero = _persist_results(gene_ids, combined, ot_scores, gtex_scores, depmap_scores)
 
     summary = {
         "phenotype": phenotype,
