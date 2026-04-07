@@ -20,7 +20,6 @@ Reference: Breitling et al. (2004) "Rank products" FEBS Letters 573:83-92
 
 import logging
 import math
-import random
 from collections import defaultdict
 from datetime import datetime, timezone
 from typing import Optional
@@ -492,33 +491,33 @@ def _compute_rank_product(ranks_per_layer: list[list[int]], n_genes: int) -> lis
     return rp
 
 
-def _rank_product_pvalues(rp_observed: list[float], ranks_per_layer: list[list[int]],
-                          n_genes: int, n_permutations: int = 1000) -> list[float]:
-    """Estimate rank-product p-values via permutation.
+def _rank_product_pvalues_analytical(rp_observed: list[float], k: int) -> list[float]:
+    """Analytical rank-product p-values using the log-normal approximation.
 
-    For each permutation, shuffle the ranks independently in each layer,
-    compute the RP, and count how often the permuted RP is <= the observed RP.
+    Under the null hypothesis, each rank r_i is Uniform(1, n), so r_i/n → Uniform(0,1).
+    For k independent uniform layers:
+        ln(RP) = Σ ln(r_i/n)  ~  N(-k, k)   (CLT; exact for large n)
+
+    Therefore:
+        p_i = Φ((ln(RP_i) + k) / √k)
+
+    This gives properly calibrated, continuous p-values for any n and k without
+    the 1/n_permutations floor that makes Tier 2 unreachable with n=12k genes.
+
+    Reference: Breitling et al. (2004) FEBS Letters 573:83-92 (log-normal approx);
+               Koziol (2010) for exactness of the approximation.
     """
-    k = len(ranks_per_layer)
-    rng = random.Random(42)
-    counts = [0] * n_genes
-
-    for _ in range(n_permutations):
-        perm_layers = []
-        for layer_ranks in ranks_per_layer:
-            shuffled = list(layer_ranks)
-            rng.shuffle(shuffled)
-            perm_layers.append(shuffled)
-
-        for i in range(n_genes):
-            perm_product = 1.0
-            for layer in perm_layers:
-                perm_product *= layer[i]
-            perm_rp = perm_product / (n_genes ** k)
-            if perm_rp <= rp_observed[i]:
-                counts[i] += 1
-
-    return [c / n_permutations for c in counts]
+    sqrt_k = math.sqrt(k)
+    pvals = []
+    for rp in rp_observed:
+        if rp <= 0:
+            pvals.append(0.0)
+            continue
+        z = (math.log(rp) + k) / sqrt_k
+        # Normal CDF via math.erf — no scipy dependency
+        p = (1.0 + math.erf(z / math.sqrt(2.0))) / 2.0
+        pvals.append(max(0.0, min(1.0, p)))
+    return pvals
 
 
 # ---------------------------------------------------------------------------
@@ -603,7 +602,17 @@ def _run_scoring_rank_product(tid: str) -> None:
 
         for gid in gene_ids:
             ev = ev_map.get(gid)
-            pval = ev.dnds_pvalue if ev and ev.dnds_pvalue is not None else 1.0
+            # Only use PAML branch-site p-values as the selection signal.
+            # Proxy model genes have stale/placeholder p-values from old HyPhy runs;
+            # treat them as no selection signal (pval=1.0) to avoid false positives.
+            if (
+                ev is not None
+                and ev.selection_model == "paml_branch_site"
+                and ev.dnds_pvalue is not None
+            ):
+                pval = ev.dnds_pvalue
+            else:
+                pval = 1.0
             selection_pvals.append(pval)
 
             phylop = ev.phylop_score if ev and ev.phylop_score is not None else 0.0
@@ -641,8 +650,11 @@ def _run_scoring_rank_product(tid: str) -> None:
 
         rp_values = _compute_rank_product(available_layers, n)
 
-        log.info("Computing rank-product p-values (1000 permutations)...")
-        rp_pvals = _rank_product_pvalues(rp_values, available_layers, n, n_permutations=1000)
+        log.info(
+            "Computing analytical rank-product p-values (log-normal, k=%d layers)...",
+            len(available_layers),
+        )
+        rp_pvals = _rank_product_pvalues_analytical(rp_values, k=len(available_layers))
 
         log.info("Applying BH FDR correction...")
         rp_qvals = apply_bh_correction(rp_pvals)

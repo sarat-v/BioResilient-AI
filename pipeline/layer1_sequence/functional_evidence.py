@@ -63,8 +63,11 @@ OPENTARGETS_GRAPHQL = "https://api.platform.opentargets.org/api/v4/graphql"
 GTEX_EXPRESSION_API = "https://gtexportal.org/api/v2/expression/medianGeneExpression"
 GTEX_GENE_REF_API = "https://gtexportal.org/api/v2/reference/gene"
 ENSEMBL_LOOKUP_URL = "https://rest.ensembl.org/lookup/symbol/homo_sapiens"
-# DepMap 24Q4 Public — CRISPRGeneDependency.csv (~400 MB) via Figshare
-DEPMAP_URL = "https://ndownloader.figshare.com/files/51064631"
+# DepMap 24Q4 Public — CRISPRGeneEffect.csv (Chronos scores, ~408 MB) via Figshare.
+# NOTE: CRISPRGeneEffect.csv contains raw Chronos scores (negative = essential, ~0 = non-essential).
+# Do NOT use CRISPRGeneDependency.csv — those are probability scores (0-1) incompatible
+# with the Chronos-calibrated sigmoid in _depmap_to_score().
+DEPMAP_URL = "https://ndownloader.figshare.com/files/51064667"
 DEPMAP_HEADERS = {"User-Agent": "BioResilient research pipeline (Mozilla/5.0 compatible)"}
 
 OT_BATCH_SIZE = 50        # genes per GraphQL request to Open Targets
@@ -506,18 +509,20 @@ def fetch_gtex_scores(
 def _depmap_cache_path() -> Path:
     root = Path(get_local_storage_root()) / "depmap"
     root.mkdir(parents=True, exist_ok=True)
-    return root / "CRISPRGeneDependency_24Q4.csv"
+    return root / "CRISPRGeneEffect_24Q4.csv"
 
 
 def _load_depmap_index() -> dict[str, float]:
-    """Return {gene_symbol: mean_chronos_score} from DepMap 24Q4 CRISPRGeneDependency.
+    """Return {gene_symbol: mean_chronos_score} from DepMap 24Q4 CRISPRGeneEffect.
 
-    Downloads the CSV (~400 MB) on first call and caches locally.
-    Chronos score: ~-1 = essential, ~0 = non-essential.
+    CRISPRGeneEffect.csv stores raw Chronos scores per gene per cell line.
+    Chronos score: ~-1 = strongly essential, ~0 = non-essential, rarely positive.
+    Mean across all cell lines gives the typical essentiality across cancer lines.
+    Downloads (~408 MB) on first call and caches locally.
     """
     path = _depmap_cache_path()
     if not path.exists():
-        log.info("Downloading DepMap 24Q4 CRISPR scores (~400 MB)...")
+        log.info("Downloading DepMap 24Q4 CRISPRGeneEffect (Chronos scores, ~408 MB)...")
         try:
             with requests.get(
                 DEPMAP_URL, headers=DEPMAP_HEADERS, stream=True, timeout=300
@@ -681,7 +686,7 @@ def _persist_results(
             rows.append(ExpressionResult(
                 gene_id=gid,
                 geo_accession="DEPMAP:essentiality",
-                comparison="DepMap 24Q4 CRISPR Chronos selective essentiality",
+                comparison="DepMap 24Q4 CRISPRGeneEffect Chronos selective essentiality",
                 log2fc=round(depmap_scores[gid], 4),
                 padj=None,
                 n_samples=None,
