@@ -1,0 +1,98 @@
+{
+  "_comment": "Per-phenotype configuration for Step 8 functional evidence scoring.",
+  "_sources": {
+    "opentargets": "Open Targets Platform gene-disease association scores [0,1]. EFO/MONDO/HP ontology IDs.",
+    "gtex": "GTEx v10 median TPM in phenotype-relevant tissues. Use tissueSiteDetailId from GTEx portal.",
+    "depmap": "DepMap CRISPR Chronos essentiality scores (cancer/dna_repair phenotypes only)."
+  },
+  "_scoring_weights": "OT=0.5, GTEx=0.3, DepMap=0.2. Missing sources have their weight redistributed.",
+  "_fallback": "Any phenotype not listed falls back to cancer_resistance config.",
+
+  "cancer_resistance": {
+    "_description": "Genes convergently evolved in species with extremely low cancer rates.",
+    "opentargets": {
+      "enabled": true,
+      "disease_ids": ["EFO_0000311", "EFO_0000616", "MONDO_0004992"],
+      "_notes": "cancer (EFO_0000311), neoplasm (EFO_0000616), malignant neoplasm (MONDO_0004992)"
+    },
+    "gtex": {
+      "enabled": true,
+      "tissues": ["Whole_Blood", "Spleen", "Lung", "Kidney_Cortex", "Colon_Transverse"],
+      "_notes": "Immune and epithelial tissues where cancer commonly originates"
+    },
+    "depmap": {
+      "enabled": true,
+      "_notes": "Cancer cell line essentiality is directly relevant for cancer resistance targets"
+    }
+  },
+
+  "longevity": {
+    "_description": "Genes associated with extended lifespan in long-lived species.",
+    "opentargets": {
+      "enabled": true,
+      "disease_ids": ["EFO_0001421", "EFO_0004289", "HP_0011499"],
+      "_notes": "aging (EFO_0001421), aging-associated disease (EFO_0004289), premature aging (HP_0011499)"
+    },
+    "gtex": {
+      "enabled": true,
+      "tissues": ["Liver", "Heart_Left_Ventricle", "Brain_Frontal_Cortex_Ba9", "Adipose_Visceral_Omentum", "Muscle_Skeletal"],
+      "_notes": "Tissues most affected by aging: liver (metabolism), heart, brain, adipose, muscle"
+    },
+    "depmap": {
+      "enabled": false,
+      "_notes": "Cancer cell lines not directly relevant for longevity phenotype"
+    }
+  },
+
+  "viral_immunity": {
+    "_description": "Genes evolved in bat species that host high viral loads without disease.",
+    "opentargets": {
+      "enabled": true,
+      "disease_ids": ["EFO_0005140", "EFO_0007187", "MONDO_0005550"],
+      "_notes": "viral infectious disease (EFO_0005140), COVID-19 (EFO_0007187), infectious disease (MONDO_0005550)"
+    },
+    "gtex": {
+      "enabled": true,
+      "tissues": ["Lung", "Spleen", "Small_Intestine_Terminal_Ileum", "Whole_Blood"],
+      "_notes": "Innate immune tissues and primary infection sites for respiratory/systemic viruses"
+    },
+    "depmap": {
+      "enabled": false
+    }
+  },
+
+  "hypoxia_tolerance": {
+    "_description": "Genes evolved in species that tolerate extreme low-oxygen environments.",
+    "opentargets": {
+      "enabled": true,
+      "disease_ids": ["EFO_0000768", "EFO_0000289", "HP_0002093"],
+      "_notes": "hypoxia (EFO_0000768), respiratory disease (EFO_0000289), respiratory insufficiency (HP_0002093)"
+    },
+    "gtex": {
+      "enabled": true,
+      "tissues": ["Heart_Left_Ventricle", "Heart_Atrial_Appendage", "Muscle_Skeletal", "Brain_Frontal_Cortex_Ba9"],
+      "_notes": "Tissues with highest oxygen demand: cardiac muscle, skeletal muscle, brain"
+    },
+    "depmap": {
+      "enabled": false
+    }
+  },
+
+  "dna_repair": {
+    "_description": "Genes involved in convergent improvements to DNA damage detection and repair.",
+    "opentargets": {
+      "enabled": true,
+      "disease_ids": ["EFO_0000311", "EFO_0000616", "HP_0002664"],
+      "_notes": "cancer (EFO_0000311), neoplasm (EFO_0000616), neoplasm/tumor (HP_0002664)"
+    },
+    "gtex": {
+      "enabled": true,
+      "tissues": ["Whole_Blood", "Spleen", "Thyroid", "Kidney_Cortex"],
+      "_notes": "Rapidly dividing tissues with high DNA replication demand"
+    },
+    "depmap": {
+      "enabled": true,
+      "_notes": "DNA repair genes often show synthetic lethality in cancer cell lines"
+    }
+  }
+}

@@ -3,9 +3,10 @@
 Phase 1 uses a rank-product method instead of arbitrary weighted composites:
 
 Evidence layers (Phase 1):
-  1. Selection:  MEME p-value (lower = stronger positive selection)
-  2. Convergence: PhyloP score (higher = more convergent evolution)
-  3. Convergent AAs: max convergent_aa_count per gene (higher = more convergent)
+  1. Selection:           PAML branch-site LRT p-value (lower = stronger positive selection)
+  2. Convergence:         PhyloP score (higher = more convergent evolution)
+  3. Convergent AAs:      max convergent_aa_count per gene (higher = more convergent)
+  4. Functional evidence: Open Targets + GTEx + DepMap combined score (step 8, optional)
 
 Scoring procedure:
   1. Rank each gene within each evidence layer (best = rank 1)
@@ -552,8 +553,14 @@ def run_scoring(phase: str = "phase1", trait_id: Optional[str] = None) -> None:
 
 
 def _run_scoring_rank_product(tid: str) -> None:
-    """Phase 1 rank-product scoring across evolution evidence layers."""
+    """Phase 1 rank-product scoring across evolution + functional evidence layers.
 
+    Evidence layers (added when data is available):
+      1. Selection     — PAML branch-site LRT p-value (always present)
+      2. Convergence   — PhyloP conservation score
+      3. Convergent AAs — max convergent AA count per gene
+      4. Functional    — Open Targets + GTEx + DepMap combined score (step 8)
+    """
     with get_session() as session:
         genes = session.query(Gene).all()
         gene_ids = [g.id for g in genes]
@@ -576,9 +583,23 @@ def _run_scoring_rank_product(tid: str) -> None:
         )
         conv_aa_map: dict[str, int] = {gid: cnt or 0 for gid, cnt in conv_aa_rows}
 
+        # Read functional evidence scores written by step 8 (preserved across the update).
+        # expression_score is set by pipeline/layer1_sequence/functional_evidence.py;
+        # we read it here so it can feed into the rank product.
+        existing_cs = {
+            r.gene_id: r
+            for r in session.query(CandidateScore).filter_by(trait_id=tid).all()
+        }
+        func_ev_scores: dict[str, float] = {
+            gid: float(cs.expression_score)
+            for gid, cs in existing_cs.items()
+            if cs.expression_score is not None and cs.expression_score > 0
+        }
+
         selection_pvals = []
         convergence_phylop = []
         convergent_aa_counts = []
+        functional_scores = []
 
         for gid in gene_ids:
             ev = ev_map.get(gid)
@@ -591,9 +612,12 @@ def _run_scoring_rank_product(tid: str) -> None:
             aa_count = conv_aa_map.get(gid, 0)
             convergent_aa_counts.append(float(aa_count))
 
+            functional_scores.append(func_ev_scores.get(gid, 0.0))
+
         sel_ranks = _rank_values(selection_pvals, ascending=True)
         conv_ranks = _rank_values(convergence_phylop, ascending=False)
         aa_ranks = _rank_values(convergent_aa_counts, ascending=False)
+        func_ranks = _rank_values(functional_scores, ascending=False)
 
         available_layers = [sel_ranks]
         layer_names = ["selection"]
@@ -608,6 +632,11 @@ def _run_scoring_rank_product(tid: str) -> None:
             available_layers.append(aa_ranks)
             layer_names.append("convergent_aa")
 
+        has_func = any(v > 0 for v in functional_scores)
+        if has_func:
+            available_layers.append(func_ranks)
+            layer_names.append("functional_evidence")
+
         log.info("Using %d evidence layers: %s", len(available_layers), ", ".join(layer_names))
 
         rp_values = _compute_rank_product(available_layers, n)
@@ -618,10 +647,7 @@ def _run_scoring_rank_product(tid: str) -> None:
         log.info("Applying BH FDR correction...")
         rp_qvals = apply_bh_correction(rp_pvals)
 
-        cs_map = {
-            r.gene_id: r
-            for r in session.query(CandidateScore).filter_by(trait_id=tid).all()
-        }
+        cs_map = existing_cs  # reuse already-loaded map
 
         tier_counts = {"Tier1": 0, "Tier2": 0, "Tier3": 0}
         for idx, gid in enumerate(gene_ids):
@@ -660,7 +686,9 @@ def _run_scoring_rank_product(tid: str) -> None:
 
             cs.convergence_score = conv_score_val
             cs.selection_score = sel_score_val
-            cs.expression_score = 0.0
+            # Preserve expression_score written by step 8; do not zero it out.
+            if cs.expression_score is None:
+                cs.expression_score = 0.0
             cs.disease_score = 0.0
             cs.druggability_score = 0.0
             cs.safety_score = 0.5

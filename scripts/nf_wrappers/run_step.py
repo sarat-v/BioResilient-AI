@@ -880,9 +880,8 @@ def run_step7b(args):
 
 
 def run_step8(args):
-    from pipeline.orchestrator import step8_expression
-    species = _load_species(args.phenotype)
-    step8_expression(species)
+    from pipeline.orchestrator import step8_functional_evidence
+    step8_functional_evidence(phenotype=args.phenotype)
 
 
 def run_step8b(args):

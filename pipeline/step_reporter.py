@@ -144,19 +144,25 @@ _EXPLANATIONS: dict[str, str] = {
         "merely 'both regions diverged'."
     ),
     "step8": (
-        "Searches NCBI GEO for RNA-seq datasets per species, downloads count matrices, runs DESeq2 to "
-        "find differentially expressed genes. Expression evidence validates that a protein with an "
-        "adaptive sequence change is also functionally active in the relevant tissue."
+        "Functional evidence scoring from three curated human databases: "
+        "(1) Open Targets Platform — gene-disease association scores across genetics, transcriptomics, "
+        "and proteomics evidence, configurable to any phenotype via EFO/MONDO ontology IDs; "
+        "(2) GTEx v10 — median TPM expression in phenotype-relevant tissues; "
+        "(3) DepMap CRISPR Chronos — selective essentiality in cancer cell lines "
+        "(for cancer_resistance and dna_repair phenotypes only). "
+        "Combined score feeds into the rank-product as a 4th evidence layer. "
+        "Config: config/functional_evidence_config.json"
     ),
     "step8b": (
-        "Supplements GEO data with Bgee pre-curated cross-species expression calls for species with "
-        "limited GEO coverage (painted turtle, ocean quahog clam, Hydra)."
+        "Step 8b is now a no-op pass-through. Functional evidence (Open Targets + GTEx + DepMap) "
+        "is fully consolidated in step 8."
     ),
     "step9": (
-        "Phase 1 composite scoring: convergence×0.40 + selection×0.35 + expression×0.25. "
-        "Tier1 ≥0.70, Tier2 ≥0.40. This is the PRIMARY CHECKPOINT — the first biological preview "
-        "of which genes the evolutionary evidence puts at the top. If known benchmark genes "
-        "(TP53, ATM, ERCC1) are not in Tier1/2, the pipeline needs investigation before Phase 2."
+        "Phase 1 rank-product scoring across 4 evidence layers: "
+        "selection (PAML dN/dS p-value), convergence (PhyloP), convergent AAs, "
+        "and functional evidence (OT + GTEx + DepMap from step 8). "
+        "Tier1 = FDR < 0.05, Tier2 = FDR < 0.20. This is the PRIMARY CHECKPOINT — the first "
+        "biological preview of which genes the evolutionary evidence puts at the top."
     ),
     "step10": "API ready. No computation — FastAPI server can now serve Phase 1 results.",
     "step10b": (
@@ -1019,48 +1025,66 @@ def _collect_step7b() -> dict:
 
 
 def _collect_step8() -> dict:
+    """Collect functional evidence statistics (Open Targets + GTEx + DepMap)."""
     from db.session import get_session
-    from db.models import ExpressionResult, Gene
+    from db.models import ExpressionResult, Gene, CandidateScore
     from sqlalchemy import func
 
     data: dict[str, Any] = {"step": "step8", "timestamp": _now()}
     with get_session() as s:
-        data["expression_rows"] = s.query(func.count(ExpressionResult.id)).scalar() or 0
-        data["species_with_expression"] = (
-            s.query(func.count(func.distinct(ExpressionResult.comparison))).scalar() or 0
-        )
-        # DE genes: log2FC >= 1 and padj < 0.05
-        de = (
-            s.query(func.count(func.distinct(ExpressionResult.gene_id)))
-            .filter(
-                ExpressionResult.log2fc != None,
-                func.abs(ExpressionResult.log2fc) >= 1,
-                ExpressionResult.padj != None,
-                ExpressionResult.padj < 0.05,
-            )
-            .scalar() or 0
-        )
-        data["de_genes"] = de
+        total_rows = s.query(func.count(ExpressionResult.id)).scalar() or 0
+        data["evidence_rows_total"] = total_rows
 
-        # Top 20 DE by abs log2FC
-        top = (
-            s.query(ExpressionResult.gene_id, ExpressionResult.log2fc,
-                    ExpressionResult.padj, ExpressionResult.comparison)
-            .filter(
-                ExpressionResult.log2fc != None,
-                ExpressionResult.padj != None,
-                ExpressionResult.padj < 0.05,
+        # Count rows per source (geo_accession prefix)
+        source_counts: dict[str, int] = {}
+        for src in ("OT:disease_association", "GTEX:tissue_expression", "DEPMAP:essentiality"):
+            n = (
+                s.query(func.count(ExpressionResult.id))
+                .filter(ExpressionResult.geo_accession == src)
+                .scalar() or 0
             )
-            .order_by(func.abs(ExpressionResult.log2fc).desc())
+            source_counts[src.split(":")[0].lower()] = n
+        data["source_counts"] = source_counts
+
+        # Genes with any functional evidence score
+        genes_scored = (
+            s.query(func.count(func.distinct(ExpressionResult.gene_id))).scalar() or 0
+        )
+        data["genes_scored"] = genes_scored
+
+        # Distribution of expression_score in candidate_score
+        expr_scores = (
+            s.query(CandidateScore.expression_score)
+            .filter(CandidateScore.expression_score != None,
+                    CandidateScore.expression_score > 0)
+            .all()
+        )
+        vals = [float(r[0]) for r in expr_scores]
+        if vals:
+            data["expr_score_mean"] = round(sum(vals) / len(vals), 4)
+            data["expr_score_max"] = round(max(vals), 4)
+            data["expr_score_nonzero"] = len(vals)
+        else:
+            data["expr_score_mean"] = 0.0
+            data["expr_score_max"] = 0.0
+            data["expr_score_nonzero"] = 0
+
+        # Top 20 by expression_score
+        top = (
+            s.query(CandidateScore, Gene)
+            .join(Gene, CandidateScore.gene_id == Gene.id)
+            .filter(CandidateScore.expression_score != None,
+                    CandidateScore.expression_score > 0)
+            .order_by(CandidateScore.expression_score.desc())
             .limit(20)
             .all()
         )
-        gene_ids = [r[0] for r in top]
-        sym = dict(s.query(Gene.id, Gene.gene_symbol).filter(Gene.id.in_(gene_ids)).all())
-        data["top20_de_genes"] = [
-            {"gene": sym.get(gid, gid), "log2fc": round(float(l), 3) if l else None,
-             "padj": round(float(p), 5) if p else None, "species": sp}
-            for gid, l, p, sp in top
+        data["top20_by_func_score"] = [
+            {
+                "gene": g.gene_symbol,
+                "func_score": round(float(cs.expression_score or 0), 4),
+            }
+            for cs, g in top
         ]
     return data
 
@@ -1410,10 +1434,23 @@ def validate(step: str, data: dict) -> ValidationResult:
                    motifs_with_conv, ">0 motifs",
                    "" if motifs_with_conv > 0 else "No motifs with convergent amino acids found.")
 
-    elif step in ("step8", "step8b"):
-        de = data.get("de_genes", 0)
-        vr.add("de_genes", "INFO", de, "any >0",
-               "Expression data is supplementary. Low counts expected for invertebrate species.")
+    elif step == "step8":
+        genes_scored = data.get("genes_scored", 0)
+        nonzero = data.get("expr_score_nonzero", 0)
+        src = data.get("source_counts", {})
+        vr.add("genes_scored", "PASS" if genes_scored > 0 else "WARN", genes_scored, ">0 genes",
+               "" if genes_scored > 0 else "No functional evidence scores generated — check network access to Open Targets / GTEx.")
+        vr.add("ot_coverage", "INFO", src.get("ot", 0), "any",
+               "Open Targets rows written (one per gene-disease match).")
+        vr.add("gtex_coverage", "INFO", src.get("gtex", 0), "any",
+               "GTEx tissue expression rows written.")
+        if nonzero > 0:
+            vr.add("func_score_quality", "PASS", data.get("expr_score_mean", 0), ">0 mean",
+                   f"Mean functional evidence score: {data.get('expr_score_mean', 0):.4f}")
+
+    elif step == "step8b":
+        vr.add("step8b_noop", "INFO", "pass-through", "no-op",
+               "Step 8b is now a no-op. Functional evidence is unified in step 8.")
 
     elif step == "step9":
         tier_counts = data.get("tier_counts", {})
@@ -1672,15 +1709,24 @@ def _render_md(step: str, data: dict, vr: ValidationResult) -> str:
             for r in top:
                 lines.append(f"| {r['gene']} | {r['convergence_count']} | {r['phylop']} |")
 
-    elif step in ("step8", "step8b"):
-        lines.append(f"- Expression rows: {data.get('expression_rows', 0):,}")
-        lines.append(f"- Species with expression data: {data.get('species_with_expression', 0)}")
-        lines.append(f"- DE genes (|log2FC| ≥1, padj < 0.05): {data.get('de_genes', 0):,}")
-        top = data.get("top20_de_genes", [])
+    elif step == "step8":
+        src = data.get("source_counts", {})
+        lines.append(f"- Total evidence rows: {data.get('evidence_rows_total', 0):,}")
+        lines.append(f"- Open Targets rows: {src.get('ot', 0):,}")
+        lines.append(f"- GTEx rows: {src.get('gtex', 0):,}")
+        lines.append(f"- DepMap rows: {src.get('depmap', 0):,}")
+        lines.append(f"- Genes with non-zero functional score: {data.get('expr_score_nonzero', 0):,}")
+        lines.append(f"- Mean functional score: {data.get('expr_score_mean', 0):.4f}")
+        lines.append(f"- Max functional score: {data.get('expr_score_max', 0):.4f}")
+        top = data.get("top20_by_func_score", [])
         if top:
-            lines += ["", "**Top 20 DE genes:**", "", "| Gene | log2FC | padj | Species |", "|------|--------|------|---------|"]
+            lines += ["", "**Top 20 genes by functional evidence score:**", "",
+                      "| Gene | Functional Score |", "|------|-----------------|"]
             for r in top:
-                lines.append(f"| {r['gene']} | {r['log2fc']} | {r['padj']} | {r['species']} |")
+                lines.append(f"| {r['gene']} | {r['func_score']:.4f} |")
+
+    elif step == "step8b":
+        lines.append("Step 8b is now a no-op — functional evidence is unified in step 8.")
 
     elif step in ("step9", "step15"):
         tc = data.get("tier_counts", {})

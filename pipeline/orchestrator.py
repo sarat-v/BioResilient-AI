@@ -55,8 +55,8 @@ STEP_LABELS = {
     "step6c":  "RELAX branch-specific rate acceleration",
     "step7":   "Convergence & conservation scoring",
     "step7b":  "True convergent amino acid substitution detection",
-    "step8":   "Expression analysis (GEO/DESeq2)",
-    "step8b":  "Bgee cross-species expression supplement",
+    "step8":   "Functional evidence (Open Targets + GTEx + DepMap)",
+    "step8b":  "Functional evidence supplement (pass-through)",
     "step9":   "Compute composite scores",
     "step10":  "API ready",
     "step10b": "Regulatory divergence (AlphaGenome)",
@@ -720,45 +720,39 @@ def step7b_convergent_aa(dry_run: bool = False) -> None:
     log.info("  Convergent AA: %d motifs with true convergence (≥2 lineages, same substitution).", n)
 
 
-def step8_expression(species_list: list[dict], dry_run: bool = False) -> None:
-    """Fetch GEO datasets and run DESeq2 expression analysis."""
-    log.info("Step 8: Running expression annotation (GEO + DESeq2)...")
+def step8_functional_evidence(phenotype: str = "cancer_resistance", dry_run: bool = False) -> None:
+    """Gather functional evidence (Open Targets + GTEx + DepMap) for all genes.
+
+    Replaces GEO/DESeq2 (old step 8) and Bgee (old step 8b) with three
+    well-curated, phenotype-configurable data sources:
+
+      1. Open Targets Platform  — gene-disease association scores
+      2. GTEx tissue expression — median TPM in phenotype-relevant tissues
+      3. DepMap essentiality    — CRISPR Chronos scores (cancer/dna_repair only)
+
+    Config: config/functional_evidence_config.json
+    Generalised for any phenotype via per-phenotype EFO/MONDO disease IDs,
+    GTEx tissue lists, and optional DepMap enable flag.
+    """
+    log.info("Step 8: Functional evidence (OT + GTEx + DepMap), phenotype=%r...", phenotype)
     if dry_run:
         return
 
-    from pipeline.layer1_sequence.expression import run_expression_pipeline, save_expression_scores
-    scores_by_species = run_expression_pipeline(species_list)
-    save_expression_scores(scores_by_species)
+    from pipeline.layer1_sequence.functional_evidence import run_functional_evidence
+    summary = run_functional_evidence(phenotype=phenotype)
+    log.info("  Functional evidence complete: %s", summary)
+
+
+# Keep old name as alias for backward compatibility with any direct callers.
+def step8_expression(species_list: list[dict], dry_run: bool = False) -> None:
+    """Deprecated: delegates to step8_functional_evidence."""
+    phenotype = "cancer_resistance"
+    step8_functional_evidence(phenotype=phenotype, dry_run=dry_run)
 
 
 def step8b_bgee(dry_run: bool = False) -> None:
-    """Supplement expression data with Bgee curated cross-species calls.
-
-    Runs for ALL genes on the first pass (step9 hasn't assigned tiers yet).
-    On re-runs after step9 has run, the tier-filtered default is sufficient.
-    """
-    log.info("Step 8b: Bgee cross-species expression supplement...")
-    if dry_run:
-        return
-
-    from db.models import CandidateScore
-    from db.session import get_session
-    from pipeline.layer1_sequence.bgee import run_bgee_pipeline
-
-    # Check whether step9 has run — if no CandidateScore rows exist, run for all.
-    try:
-        with get_session() as session:
-            tier1_count = (
-                session.query(CandidateScore)
-                .filter(CandidateScore.tier.in_(["Tier1", "Tier2"]))
-                .count()
-            )
-        first_pass = tier1_count == 0
-    except Exception:
-        first_pass = True
-
-    n = run_bgee_pipeline(all_genes=first_pass)
-    log.info("  Bgee: %d expression rows added (all_genes=%s).", n, first_pass)
+    """Step 8b: No-op pass-through (unified with step 8 functional evidence)."""
+    log.info("Step 8b: Skipping — functional evidence is now unified in step 8.")
 
 
 def step9_composite_score(dry_run: bool = False) -> None:
@@ -997,7 +991,7 @@ STEPS = {
     "step6c":  step6c_relax,
     "step7":   step7_convergence,
     "step7b":  step7b_convergent_aa,
-    "step8":   step8_expression,
+    "step8":   step8_functional_evidence,
     "step8b":  step8b_bgee,
     "step9":   step9_composite_score,
     "step10":  step10_start_api,
@@ -1247,7 +1241,7 @@ def run_pipeline(
                 step7b_convergent_aa(dry_run=dry_run)
 
             elif step_name == "step8":
-                step8_expression(species_list, dry_run=dry_run)
+                step8_functional_evidence(phenotype=phenotype, dry_run=dry_run)
 
             elif step_name == "step8b":
                 step8b_bgee(dry_run=dry_run)

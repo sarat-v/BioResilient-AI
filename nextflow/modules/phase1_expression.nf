@@ -1,13 +1,19 @@
 /*
- * Phase 1 — Expression & Scoring Module
- * Steps: 8, 8b, 9
+ * Phase 1 — Functional Evidence & Scoring Module
+ * Steps: 8, 8b (no-op), 9
+ *
+ * Step 8 replaces GEO/DESeq2 + Bgee with three well-curated human databases:
+ *   - Open Targets Platform  (gene-disease association scores, any phenotype)
+ *   - GTEx v10               (tissue expression in phenotype-relevant tissues)
+ *   - DepMap CRISPR          (selective essentiality, cancer/dna_repair only)
+ * Config: config/functional_evidence_config.json
  */
 
-process expression_analysis {
-    label 'clinical'
-    cpus 4
+process functional_evidence {
+    label 'base'
+    cpus 2
     memory '8 GB'
-    time '2h'
+    time '3h'
 
     input:
     val convergent_aa_done
@@ -21,8 +27,7 @@ process expression_analysis {
         --step step8 \
         --phenotype '${params.phenotype}' \
         --db-url '${params.db_url}' \
-        --storage-root '${params.storage_root}' \
-        --ncbi-api-key '${params.ncbi_api_key ?: ""}'
+        --storage-root '${params.storage_root}'
     DATABASE_URL='${params.db_url}' BIORESILIENT_STORAGE_ROOT='${params.storage_root}' \
         python -m pipeline.step_reporter --step step8 || true
     """
@@ -30,9 +35,9 @@ process expression_analysis {
 
 process bgee_expression {
     label 'base'
-    cpus 2
-    memory '4 GB'
-    time '1h'
+    cpus 1
+    memory '2 GB'
+    time '5m'
 
     input:
     val expression_done
@@ -42,10 +47,12 @@ process bgee_expression {
 
     script:
     """
+    # Step 8b is now a no-op — functional evidence is unified in step 8.
+    echo "Step 8b: pass-through (functional evidence unified in step 8)"
     python -m scripts.nf_wrappers.run_step \
         --step step8b \
         --db-url '${params.db_url}' \
-        --storage-root '${params.storage_root}'
+        --storage-root '${params.storage_root}' || true
     DATABASE_URL='${params.db_url}' BIORESILIENT_STORAGE_ROOT='${params.storage_root}' \
         python -m pipeline.step_reporter --step step8b || true
     """
@@ -127,8 +134,8 @@ workflow PHASE1_EXPRESSION {
     if (untilIdx < 0) untilIdx = EXPR_STEPS.size() - 1
 
     if (fromIdx <= EXPR_STEPS.indexOf('step8') && untilIdx >= EXPR_STEPS.indexOf('step8')) {
-        expression_analysis(convergent_aa_done)
-        expression_done_ch = expression_analysis.out.expression_done
+        functional_evidence(convergent_aa_done)
+        expression_done_ch = functional_evidence.out.expression_done
     } else {
         expression_done_ch = Channel.value(true)
     }
