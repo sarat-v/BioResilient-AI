@@ -108,14 +108,15 @@ cur.execute('''
 ''')
 db_og_ids = sorted({row[0] for row in cur.fetchall()})
 
-# OGs with a genuine codon-based score (paml_branch_site or busted_ph).
-# Proxy results are excluded so re-runs can upgrade them to PAML.
+# OGs with a completed PAML or HyPhy run — skip these to avoid redundant recomputation.
+# Includes paml_no_signal (PAML ran, found no selection) in addition to paml_branch_site
+# (PAML ran, found selection) and busted_ph (legacy HyPhy). Proxy results are intentionally
+# excluded so re-runs can upgrade them to a real PAML result.
 cur.execute('''
     SELECT DISTINCT o.orthofinder_og
     FROM evolution_score es
     JOIN ortholog o ON o.gene_id = es.gene_id
-    WHERE es.dnds_pvalue IS NOT NULL
-      AND es.selection_model IN (\'paml_branch_site\', \'busted_ph\')
+    WHERE es.selection_model IN (\'paml_branch_site\', \'busted_ph\', \'paml_no_signal\')
       AND o.orthofinder_og IS NOT NULL
 ''')
 already_scored_ogs = {row[0] for row in cur.fetchall()}
@@ -240,7 +241,7 @@ process collect_all_paml_results {
 
     script:
     """
-    echo "collect_v8_paml_branch_site"
+    echo "collect_v9_all_genes_per_og"
     python -m scripts.nf_wrappers.run_step \
         --step step6_all_collect \
         --input-dir results/ \

@@ -468,9 +468,18 @@ def run_step6_all_collect(args):
     fb_batch: dict[str, dict] = {}
     relax_batch: dict[str, dict] = {}
 
+    # Model priority: real PAML > no-signal PAML > proxy (fallback)
+    _MODEL_RANK = {"paml_branch_site": 3, "busted_ph": 2, "paml_no_signal": 1, "proxy": 0}
+
     for rfile in all_results:
-        with open(rfile) as f:
-            r = json.load(f)
+        try:
+            with open(rfile) as f:
+                content = f.read().strip()
+            if not content:
+                continue
+            r = json.loads(content)
+        except (json.JSONDecodeError, OSError):
+            continue
         og_id = r.get("og_id") or rfile.parent.name
         if r.get("status") in ("no_codon_alignment", "meme_failed", "skipped", "not_in_aligned"):
             continue
@@ -479,6 +488,14 @@ def run_step6_all_collect(args):
         if "busted_ph_pvalue" in r and "dnds_pvalue" not in r:
             r["dnds_pvalue"] = r["busted_ph_pvalue"]
             r["dnds_ratio"] = 0.0
+
+        # Keep the highest-priority result when duplicates exist for the same OG
+        existing = meme_batch.get(og_id)
+        if existing is not None:
+            existing_rank = _MODEL_RANK.get(existing.get("selection_model", ""), 0)
+            new_rank = _MODEL_RANK.get(r.get("selection_model", ""), 0)
+            if new_rank <= existing_rank:
+                continue  # existing result is better or equal — keep it
 
         meme_batch[og_id] = r
 

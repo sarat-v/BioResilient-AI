@@ -182,13 +182,13 @@ def parse_absrel_results(hyphy_json: dict) -> dict:
 
 def load_selection_scores(
     selection_results: dict[str, dict],
-    gene_by_og: dict[str, str],
+    gene_by_og: dict[str, list[str]],
 ) -> int:
-    """Save EvolutionScore rows from HyPhy results.
+    """Save EvolutionScore rows from PAML/HyPhy results.
 
     Args:
-        selection_results: {og_id: parsed_absrel_result}
-        gene_by_og: {og_id: gene_id}
+        selection_results: {og_id: parsed_result}
+        gene_by_og: {og_id: [gene_id, ...]}  — ALL genes in each OG
 
     Returns:
         Number of rows inserted/updated.
@@ -196,22 +196,23 @@ def load_selection_scores(
     saved = 0
     with get_session() as session:
         for og_id, result in selection_results.items():
-            gene_id = gene_by_og.get(og_id)
-            if not gene_id:
+            gene_ids = gene_by_og.get(og_id, [])
+            if not gene_ids:
                 continue
 
-            ev = session.get(EvolutionScore, gene_id)
-            if ev is None:
-                ev = EvolutionScore(gene_id=gene_id)
-                session.add(ev)
+            for gene_id in gene_ids:
+                ev = session.get(EvolutionScore, gene_id)
+                if ev is None:
+                    ev = EvolutionScore(gene_id=gene_id)
+                    session.add(ev)
 
-            ev.dnds_ratio = result.get("dnds_ratio")
-            ev.dnds_pvalue = result.get("dnds_pvalue")
-            ev.selection_model = result.get("selection_model")
-            # PAML branch-site results don't emit branches_under_selection;
-            # HyPhy BUSTED results do. Use .get() so both formats work.
-            ev.branches_under_selection = result.get("branches_under_selection")
-            saved += 1
+                ev.dnds_ratio = result.get("dnds_ratio")
+                ev.dnds_pvalue = result.get("dnds_pvalue")
+                ev.selection_model = result.get("selection_model")
+                # PAML branch-site results don't emit branches_under_selection;
+                # HyPhy BUSTED results do. Use .get() so both formats work.
+                ev.branches_under_selection = result.get("branches_under_selection")
+                saved += 1
 
     log.info("Saved evolution scores for %d genes.", saved)
     return saved
@@ -235,7 +236,7 @@ def _retry_on_deadlock(fn, max_retries=5):
 
 def load_fel_busted_scores(
     fel_busted_results: dict[str, dict],
-    gene_by_og: dict[str, str],
+    gene_by_og: dict[str, list[str]],
 ) -> int:
     """Update EvolutionScore rows with FEL and BUSTED supplementary results.
 
@@ -246,14 +247,12 @@ def load_fel_busted_scores(
 
     updates = []
     for og_id, result in fel_busted_results.items():
-        gene_id = gene_by_og.get(og_id)
-        if not gene_id:
-            continue
-        updates.append((
-            gene_id,
-            result.get("fel_sites"),
-            result.get("busted_pvalue"),
-        ))
+        for gene_id in gene_by_og.get(og_id, []):
+            updates.append((
+                gene_id,
+                result.get("fel_sites"),
+                result.get("busted_pvalue"),
+            ))
 
     if not updates:
         log.info("No FEL/BUSTED scores to update.")
@@ -287,7 +286,7 @@ def load_fel_busted_scores(
 
 def load_relax_scores(
     relax_results: dict[str, dict],
-    gene_by_og: dict[str, str],
+    gene_by_og: dict[str, list[str]],
 ) -> int:
     """Update EvolutionScore rows with RELAX branch acceleration results.
 
@@ -297,14 +296,12 @@ def load_relax_scores(
 
     updates = []
     for og_id, result in relax_results.items():
-        gene_id = gene_by_og.get(og_id)
-        if not gene_id:
-            continue
-        updates.append((
-            gene_id,
-            result.get("relax_k"),
-            result.get("relax_pvalue"),
-        ))
+        for gene_id in gene_by_og.get(og_id, []):
+            updates.append((
+                gene_id,
+                result.get("relax_k"),
+                result.get("relax_pvalue"),
+            ))
 
     if not updates:
         log.info("No RELAX scores to update.")
@@ -336,13 +333,19 @@ def load_relax_scores(
     return updated
 
 
-def build_gene_og_map() -> dict[str, str]:
-    """Build {og_id: gene_id} from the Ortholog table."""
-    og_map: dict[str, str] = {}
+def build_gene_og_map() -> dict[str, list[str]]:
+    """Build {og_id: [gene_id, ...]} from the Ortholog table.
+
+    An OG can contain multiple human genes (paralogs/split OGs). All gene_ids
+    are returned so that load_selection_scores updates every gene in the OG,
+    not just whichever one happens to be queried first.
+    """
+    og_map: dict[str, list[str]] = {}
     with get_session() as session:
         for o in session.query(Ortholog).filter(Ortholog.orthofinder_og.isnot(None)):
-            if o.orthofinder_og not in og_map:
-                og_map[o.orthofinder_og] = o.gene_id
+            og_map.setdefault(o.orthofinder_og, [])
+            if o.gene_id not in og_map[o.orthofinder_og]:
+                og_map[o.orthofinder_og].append(o.gene_id)
     return og_map
 
 
