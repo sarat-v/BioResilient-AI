@@ -199,6 +199,58 @@ def load_tree(treefile: Path) -> str:
     return treefile.read_text().strip()
 
 
+def load_trusted_tree() -> Optional[Path]:
+    """Return the path to the trusted species tree (data/trusted_species_tree.nwk).
+
+    The trusted tree is a TimeTree-consensus Newick with the correct topology for
+    the 18 pipeline species.  It is used instead of the IQ-TREE reconstructed tree
+    when ``use_fixed_tree: true`` is set in environment.yml.
+
+    Returns
+    -------
+    Path if the file exists, None otherwise.
+    """
+    # Check project data/ directory first, then the configured storage root.
+    candidates = [
+        Path(__file__).resolve().parents[2] / "data" / "trusted_species_tree.nwk",
+        Path(get_local_storage_root()) / "trusted_species_tree.nwk",
+    ]
+    for p in candidates:
+        if p.exists():
+            log.info("Using trusted species tree: %s", p)
+            return p
+    log.warning(
+        "Trusted species tree not found (looked in %s). "
+        "Falling back to IQ-TREE reconstructed tree.",
+        [str(c) for c in candidates],
+    )
+    return None
+
+
+def get_species_treefile() -> Optional[Path]:
+    """Return the species tree to use for downstream steps (Step 6/7).
+
+    Decision logic
+    --------------
+    1. If ``use_fixed_tree: true`` in environment.yml → load_trusted_tree().
+    2. Else → IQ-TREE reconstructed tree at <storage>/phylo/species.treefile.
+    3. If neither exists → return None (caller must handle gracefully).
+    """
+    cfg = get_tool_config()
+    use_fixed = cfg.get("use_fixed_tree", False)
+
+    if use_fixed:
+        trusted = load_trusted_tree()
+        if trusted is not None:
+            return trusted
+
+    iqtree_path = Path(get_local_storage_root()) / "phylo" / "species.treefile"
+    if iqtree_path.exists():
+        return iqtree_path
+
+    return None
+
+
 _PRUNE_CACHE: dict[tuple, str] = {}
 
 

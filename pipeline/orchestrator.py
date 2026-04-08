@@ -648,11 +648,33 @@ def step7_convergence(dry_run: bool = False) -> None:
         build_chrom_map,
         enrich_phylop_scores,
         run_convergence_pipeline,
+        run_convergence_permutation_test,
     )
     from db.models import EvolutionScore, PhyloConservationScore
     from db.session import get_session
+    from pipeline.config import get_tool_config
 
     run_convergence_pipeline()
+
+    # Fix 2: run permutation-based null model to assign significance p-values.
+    # Skip if already populated (idempotent) — check a sample of rows.
+    cfg = get_tool_config()
+    n_iter = int(cfg.get("convergence_permutation_iterations", 200))
+    with get_session() as session:
+        sample = (
+            session.query(EvolutionScore.convergence_pval)
+            .filter(EvolutionScore.convergence_pval.isnot(None))
+            .limit(1)
+            .first()
+        )
+    if sample is None:
+        log.info("Running convergence permutation test (%d iterations)...", n_iter)
+        run_convergence_permutation_test(n_iterations=n_iter)
+    else:
+        log.info(
+            "convergence_pval already populated — skipping permutation test "
+            "(delete rows or set convergence_pval=NULL to re-run)."
+        )
 
     # Seed evolution_score.phylop_score from step 3d output (phylo_conservation_score)
     # before calling the slower UCSC API. This avoids re-querying the ~11K genes that

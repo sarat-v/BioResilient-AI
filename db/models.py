@@ -194,6 +194,16 @@ class EvolutionScore(Base):
     relax_k = Column(Float, nullable=True)              # RELAX k parameter (>1 = acceleration)
     relax_pvalue = Column(Float, nullable=True)         # RELAX p-value for rate shift
 
+    # Fix 3: dedicated convergence weight column (populated in Step 7a)
+    # Previously the convergence weight was incorrectly written to phylop_score when
+    # phylop_score was None (conflating two distinct signals).  phylop_score now holds
+    # only the UCSC PhyloP conservation score; this column holds the phylogenetically-
+    # weighted motif-convergence score from convergence.py.
+    convergence_weight = Column(Float, nullable=True)   # phylogenetically-weighted convergence score
+
+    # Fix 2: permutation-based null-model p-value for convergence (populated in Step 7a)
+    convergence_pval = Column(Float, nullable=True)     # empirical p-value vs. 200-iteration label shuffle
+
     gene = relationship("Gene", back_populates="evolution_score")
 
     def __repr__(self) -> str:

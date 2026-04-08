@@ -36,10 +36,16 @@ _MIYATA: dict[str, int] = {
 
 
 def _load_species_tree_newick() -> Optional[str]:
-    """Load the species tree Newick from step 5 output."""
-    root = Path(get_local_storage_root())
-    treefile = root / "phylo" / "species.treefile"
-    if treefile.exists():
+    """Load the species tree Newick, preferring the trusted TimeTree file.
+
+    Priority order:
+    1. data/trusted_species_tree.nwk  (if use_fixed_tree: true in environment.yml)
+    2. <storage_root>/phylo/species.treefile  (IQ-TREE output from step 5)
+    """
+    from pipeline.layer2_evolution.phylo_tree import get_species_treefile
+
+    treefile = get_species_treefile()
+    if treefile is not None and treefile.exists():
         return treefile.read_text().strip()
     return None
 

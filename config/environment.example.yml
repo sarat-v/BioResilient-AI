@@ -71,6 +71,13 @@ tools:
   iqtree_threads: AUTO            # IQ-TREE auto-detects best thread count
   iqtree_bootstrap: 1000
   hyphy_threads: 4
+  # Fix 1: replace the IQ-TREE reconstructed species tree with the TimeTree-consensus
+  # topology stored in data/trusted_species_tree.nwk.  Set to true for all reruns
+  # after the initial full pipeline run.  Step 7b (convergent AA / ASR) will use
+  # this tree; PAML trees are gene-specific pruned subtrees derived from this file.
+  use_fixed_tree: true
+  # Fix 2: iterations for convergence permutation null model (200 is default).
+  convergence_permutation_iterations: 200
   # API concurrency — capped by external service rate limits, not CPU count.
   # Increase carefully; exceeding limits causes 429 errors and backoff delays.
   uniprot_batch_workers: 4        # Parallel HTTP requests to UniProt batch API

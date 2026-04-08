@@ -129,6 +129,10 @@ def selection_score(
     if selection_model == "paml_branch_site":
         if dnds_pvalue is None or dnds_pvalue >= 1.0:
             return 0.0
+        # Guard: ω ≤ 1 means no positive selection regardless of p-value.
+        # Stored p=0 with ω=1 is a PAML numerical artifact (LRT=0 → p should be 1.0).
+        if dnds_ratio is None or dnds_ratio <= 1.0:
+            return 0.0
         p_score = round(min(-math.log10(max(dnds_pvalue, 1e-10)) / 10.0, 1.0), 4)
         omega_score = round(min((dnds_ratio or 0.0) / 5.0, 1.0), 4)
         return round(0.70 * p_score + 0.30 * omega_score, 4)
@@ -596,7 +600,7 @@ def _run_scoring_rank_product(tid: str) -> None:
         }
 
         selection_pvals = []
-        convergence_phylop = []
+        convergence_signals = []   # Fix 3+2: convergence_weight or 1−convergence_pval
         convergent_aa_counts = []
         functional_scores = []
 
@@ -615,23 +619,33 @@ def _run_scoring_rank_product(tid: str) -> None:
                 pval = 1.0
             selection_pvals.append(pval)
 
-            phylop = ev.phylop_score if ev and ev.phylop_score is not None else 0.0
-            convergence_phylop.append(phylop)
+            # Fix 2+3: use permutation p-value if available; fall back to raw
+            # convergence_weight (Fix 3); only fall back to the old phylop_score
+            # if neither new column is populated (legacy runs before migration 0023).
+            if ev is not None and ev.convergence_pval is not None:
+                # Convert p-value to a "higher = more convergent" signal for ranking
+                conv_signal = 1.0 - ev.convergence_pval
+            elif ev is not None and ev.convergence_weight is not None:
+                conv_signal = ev.convergence_weight
+            else:
+                # Legacy fallback: phylop_score may hold the old convergence weight
+                conv_signal = ev.phylop_score if ev and ev.phylop_score is not None else 0.0
+            convergence_signals.append(conv_signal)
 
             aa_count = conv_aa_map.get(gid, 0)
             convergent_aa_counts.append(float(aa_count))
 
             functional_scores.append(func_ev_scores.get(gid, 0.0))
 
-        sel_ranks = _rank_values(selection_pvals, ascending=True)
-        conv_ranks = _rank_values(convergence_phylop, ascending=False)
-        aa_ranks = _rank_values(convergent_aa_counts, ascending=False)
-        func_ranks = _rank_values(functional_scores, ascending=False)
+        sel_ranks  = _rank_values(selection_pvals,      ascending=True)
+        conv_ranks = _rank_values(convergence_signals,   ascending=False)
+        aa_ranks   = _rank_values(convergent_aa_counts,  ascending=False)
+        func_ranks = _rank_values(functional_scores,     ascending=False)
 
         available_layers = [sel_ranks]
         layer_names = ["selection"]
 
-        has_conv = any(v > 0 for v in convergence_phylop)
+        has_conv = any(v > 0 for v in convergence_signals)
         if has_conv:
             available_layers.append(conv_ranks)
             layer_names.append("convergence")
@@ -661,6 +675,22 @@ def _run_scoring_rank_product(tid: str) -> None:
 
         cs_map = existing_cs  # reuse already-loaded map
 
+        # Pre-compute per-gene "active layer" counts for the minimum-evidence guard.
+        # A gene must have meaningful signal in at least 2 layers to leave Tier3;
+        # this prevents a single strong convergence hit from single-handedly pulling
+        # a gene into Tier1/2 when all other evidence is absent.
+        def _active_layers(idx: int, gid: str) -> int:
+            count = 0
+            if selection_pvals[idx] < 0.1:
+                count += 1
+            if convergence_signals[idx] > 0:
+                count += 1
+            if convergent_aa_counts[idx] > 0:
+                count += 1
+            if functional_scores[idx] > 0:
+                count += 1
+            return count
+
         tier_counts = {"Tier1": 0, "Tier2": 0, "Tier3": 0}
         for idx, gid in enumerate(gene_ids):
             ev = ev_map.get(gid)
@@ -672,13 +702,25 @@ def _run_scoring_rank_product(tid: str) -> None:
                 tier = "Tier2"
             else:
                 tier = "Tier3"
+
+            # Fix 3 — minimum 2-layer evidence guard:
+            # Demote to Tier3 if fewer than 2 independent evidence layers show signal.
+            # This prevents genes that score well on convergence alone (or any single
+            # layer) from appearing in Tier1/2 without corroborating evidence.
+            if tier in ("Tier1", "Tier2") and _active_layers(idx, gid) < 2:
+                log.debug(
+                    "Demoting gene %s from %s to Tier3: only 1 active evidence layer.",
+                    gid[:8], tier,
+                )
+                tier = "Tier3"
+
             tier_counts[tier] += 1
 
             composite = round(1.0 - qval, 4)
 
             conv_score_val = convergence_score(
                 ev.convergence_count if ev else 0,
-                phylo_weight=ev.phylop_score if ev and ev.phylop_score else None,
+                phylo_weight=ev.convergence_weight if ev and ev.convergence_weight else None,
             )
             sel_score_val = selection_score(
                 ev.dnds_ratio if ev else None,
@@ -688,6 +730,7 @@ def _run_scoring_rank_product(tid: str) -> None:
                 relax_k=ev.relax_k if ev else None,
                 relax_pvalue=ev.relax_pvalue if ev else None,
                 branches_under_selection=ev.branches_under_selection if ev else None,
+                selection_model=ev.selection_model if ev else None,
             )
 
             cs = cs_map.get(gid)
@@ -760,6 +803,7 @@ def _run_scoring_weighted(weights: dict, tier_thresholds: dict, tid: str) -> Non
                 relax_k=ev.relax_k if ev else None,
                 relax_pvalue=ev.relax_pvalue if ev else None,
                 branches_under_selection=ev.branches_under_selection if ev else None,
+                selection_model=ev.selection_model if ev else None,
             )
             expr_score_val = expr_map.get(gene.id, 0.0)
             dis_score = disease_score(ann) if weights.get("disease", 0) > 0 else 0.0
