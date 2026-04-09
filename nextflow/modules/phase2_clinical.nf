@@ -30,6 +30,7 @@ process alphagenome_regulatory {
 
     script:
     """
+    export ALPHAGENOME_API_KEY='${params.alphagenome_api_key ?: ""}'
     python -m scripts.nf_wrappers.run_step \
         --step step10b \
         --db-url '${params.db_url}' \
