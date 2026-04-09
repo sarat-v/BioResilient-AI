@@ -17,6 +17,7 @@ Drug-target interpretation (Oxford BDI 2024):
 """
 
 import logging
+import time
 from typing import Optional
 
 import requests
@@ -27,6 +28,10 @@ from db.session import get_session
 log = logging.getLogger(__name__)
 
 GNOMAD_GRAPHQL = "https://gnomad.broadinstitute.org/api"
+
+# gnomAD uses CloudFlare; rapid bursts trigger 429. 0.2 s = ~5 req/s per IP.
+# 60 genes × 2 calls each = 120 requests in ~24 s.
+_RATE_SLEEP = 0.2
 
 # gnomAD v4 thresholds (updated from v2.1.1)
 PLI_INTOLERANT_THRESHOLD = 0.9   # same as v2
@@ -164,16 +169,18 @@ def annotate_genes_gnomad(gene_ids: list[str]) -> int:
         log.info("gnomAD: all %d genes already annotated, skipping.", len(already_done))
         return 0
 
-    # Fetch constraints outside DB session (network calls)
+    # Fetch constraints outside DB session (rate-limited; gnomAD CloudFlare is sensitive)
     fetch_results: dict[str, dict] = {}
-    for gid in todo:
+    for i, gid in enumerate(todo):
         gene = gene_map[gid]
         ensembl_id = _symbol_to_ensembl_id(gene.gene_symbol)
-        if not ensembl_id:
-            continue
-        constraint = fetch_gnomad_constraint(ensembl_id)
-        if constraint:
-            fetch_results[gid] = constraint
+        if ensembl_id:
+            time.sleep(_RATE_SLEEP)  # between symbol-lookup and constraint call
+            constraint = fetch_gnomad_constraint(ensembl_id)
+            if constraint:
+                fetch_results[gid] = constraint
+        if i < len(todo) - 1:
+            time.sleep(_RATE_SLEEP)  # between genes
 
     if not fetch_results:
         return 0

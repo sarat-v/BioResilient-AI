@@ -1,6 +1,7 @@
 """GWAS Catalog REST API — strongest association p-value per gene."""
 
 import logging
+import time
 from typing import Optional
 
 import requests
@@ -11,6 +12,10 @@ from db.session import get_session
 log = logging.getLogger(__name__)
 
 GWAS_API = "https://www.ebi.ac.uk/gwas/rest/api"
+
+# EBI asks for "reasonable use". 0.25 s between calls = ~4 req/s per IP.
+# At 60 genes × 2 calls each that's 120 requests in ~30 s — well within limits.
+_RATE_SLEEP = 0.25
 
 
 def fetch_gwas_pvalue(gene_symbol: str) -> Optional[float]:
@@ -72,12 +77,14 @@ def annotate_genes_gwas(gene_ids: list[str]) -> int:
         log.info("GWAS Catalog: all %d genes already annotated, skipping.", len(already_done))
         return 0
 
-    # Fetch all p-values outside DB session
+    # Fetch all p-values outside DB session (rate-limited to avoid EBI 429)
     fetch_results: dict[str, float] = {}
-    for gid in todo:
+    for i, gid in enumerate(todo):
         pval = fetch_gwas_pvalue(gene_map[gid].gene_symbol)
         if pval is not None:
             fetch_results[gid] = pval
+        if i < len(todo) - 1:
+            time.sleep(_RATE_SLEEP)
 
     if not fetch_results:
         return 0

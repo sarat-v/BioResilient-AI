@@ -11,6 +11,7 @@ skipped conservatively (all hits retained with a warning flag).
 """
 
 import logging
+import time
 from typing import Any, Optional
 
 import requests
@@ -24,6 +25,10 @@ GWAS_API = "https://www.ebi.ac.uk/gwas/rest/api"
 
 # Flanking window around gene body for SNP inclusion (bp)
 _GENE_FLANK_BP = 1_000
+
+# PheWAS makes 3 API calls per gene (gene lookup + associations + coordinates).
+# 0.3 s between genes = ~1 req/s effective throughput per gene (3 calls / 3 s).
+_RATE_SLEEP = 0.3
 
 
 def _fetch_gene_coordinates(gene_symbol: str) -> Optional[tuple[str, int, int]]:
@@ -176,10 +181,13 @@ def fetch_phewas_hits(gene_symbol: str) -> Optional[dict[str, Any]]:
 
 
 def annotate_genes_phewas(gene_ids: list[str]) -> int:
-    """Populate SafetyFlag.phewas_hits for the given genes (with LD filter)."""
+    """Populate SafetyFlag.phewas_hits for the given genes (with LD filter).
+
+    Rate-limited: 0.3 s between genes (3 GWAS API calls per gene × 0.3 s gap).
+    """
     updated = 0
     with get_session() as session:
-        for gid in gene_ids:
+        for i, gid in enumerate(gene_ids):
             gene = session.get(Gene, gid)
             if not gene:
                 continue
@@ -192,5 +200,7 @@ def annotate_genes_phewas(gene_ids: list[str]) -> int:
                 session.add(sf)
             sf.phewas_hits = hits
             updated += 1
+            if i < len(gene_ids) - 1:
+                time.sleep(_RATE_SLEEP)
     log.info("PheWAS: updated %d genes (LD-filtered).", updated)
     return updated
