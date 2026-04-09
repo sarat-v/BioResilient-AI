@@ -20,7 +20,8 @@ RUN pip install \
     boto3>=1.34.0 \
     google-cloud-storage>=2.14.0 \
     GEOparse>=2.0.3 \
-    ete3>=3.1.3
+    ete3>=3.1.3 \
+    alphagenome
 
 COPY pipeline/ /app/pipeline/
 COPY db/ /app/db/
