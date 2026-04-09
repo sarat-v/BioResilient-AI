@@ -817,7 +817,12 @@ def step10b_alphagenome(dry_run: bool = False) -> None:
 
 
 def _get_tier12_gene_ids(trait_id: str = "") -> list[str]:
-    """Return gene IDs for Tier1 and Tier2 candidates (for funnel gating of Phase 2 layers)."""
+    """Return gene IDs for Tier1 and Tier2 candidates (for funnel gating of Phase 2 layers).
+
+    Phase 1 stores CandidateScore rows with trait_id='' (empty string).
+    If no rows match the requested trait_id, fall back to trait_id='' so that
+    Phase 2 steps always see the scored genes regardless of how Phase 1 was run.
+    """
     from db.models import CandidateScore
     from db.session import get_session
     with get_session() as session:
@@ -827,6 +832,19 @@ def _get_tier12_gene_ids(trait_id: str = "") -> list[str]:
         if trait_id:
             q = q.filter(CandidateScore.trait_id == trait_id)
         rows = q.all()
+        if not rows and trait_id:
+            # Phase 1 may have stored scores with empty trait_id — fall back
+            log.info(
+                "_get_tier12_gene_ids: no rows for trait_id=%r, falling back to trait_id=''", trait_id
+            )
+            rows = (
+                session.query(CandidateScore.gene_id)
+                .filter(
+                    CandidateScore.tier.in_(["Tier1", "Tier2"]),
+                    CandidateScore.trait_id == "",
+                )
+                .all()
+            )
     return [r[0] for r in rows]
 
 
