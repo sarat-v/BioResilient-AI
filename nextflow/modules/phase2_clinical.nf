@@ -3,7 +3,17 @@
  * Steps: 10b, 11, 11b, 11c, 11d, 12, 12b, 13, 14, 14b, 15
  *
  * All Phase 2 steps operate on Tier1/Tier2 genes from Phase 1 scoring.
- * Many annotation steps (11, 11b, 11c) are API-bound and can run in parallel.
+ * Many annotation steps (11, 11b, 11c) are API-bound and run in parallel.
+ *
+ * Resource notes:
+ *   - API-bound steps (step11, 11b, 11c, 14): 2 CPUs (ThreadPoolExecutor uses I/O threads,
+ *     not CPU-bound). Paying for idle vCPUs on Batch is wasted cost.
+ *   - step12 (fpocket): 4 CPUs — fpocket itself is single-threaded but we run it per-gene;
+ *     the orchestrator loops N genes sequentially so 4 CPUs is still wasteful, but kept
+ *     to give headroom for P2Rank JVM startup in step12b.
+ *   - step14b (DepMap): 8 GB — parses 150 MB CSV into a Python dict (~2-3 GB peak RAM).
+ *   - time limits: ALL steps have explicit limits to kill runaway containers on Spot
+ *     and avoid holding the queue if a job hangs on a slow API.
  */
 
 process alphagenome_regulatory {
@@ -30,9 +40,9 @@ process alphagenome_regulatory {
 
 process disease_annotation {
     label 'base'
-    cpus 4
+    cpus 2          // API-bound — ThreadPoolExecutor uses I/O threads not CPU
     memory '8 GB'
-    time '2h'
+    time '3h'       // 14 Tier1 + ~50 Tier2 × 3 concurrent API calls; 3h is very safe
 
     input:
     val scored
@@ -54,7 +64,7 @@ process rare_variants {
     label 'base'
     cpus 2
     memory '4 GB'
-    time '1h'
+    time '2h'       // gnomAD GraphQL + GWAS Catalog per gene; can be slow
 
     input:
     val disease_done
@@ -118,10 +128,10 @@ process pathway_convergence {
 }
 
 process druggability {
-    label 'clinical'
+    label 'clinical'    // clinical container has fpocket + P2Rank installed
     cpus 4
     memory '8 GB'
-    time '2h'
+    time '2h'           // AlphaFold downloads + fpocket per gene; generous for S3 cache misses
 
     input:
     val pathways_done
@@ -188,7 +198,7 @@ process safety_screen {
     label 'base'
     cpus 2
     memory '4 GB'
-    time '1h'
+    time '2h'           // PheWAS LD filter makes 2 GWAS API calls per gene; can be slow
 
     input:
     val p2rank_done
@@ -209,8 +219,8 @@ process safety_screen {
 process depmap_gtex {
     label 'base'
     cpus 2
-    memory '4 GB'
-    time '1h'
+    memory '8 GB'   // DepMap CSV is 150 MB; Python dict from 18K genes × 1K cell lines ≈ 2-3 GB RAM peak
+    time '1h'       // Slow download first time; fast from S3 cache on retry
 
     input:
     val safety_done
@@ -266,7 +276,7 @@ workflow PHASE2_CLINICAL {
     if (fromIdx < 0) fromIdx = 0
     if (untilIdx < 0) untilIdx = CLINICAL_STEPS.size() - 1
 
-    // step10b and step11 can run in parallel after scoring
+    // step10b and step11 run in parallel after scoring
     if (fromIdx <= CLINICAL_STEPS.indexOf('step10b') && untilIdx >= CLINICAL_STEPS.indexOf('step10b')) {
         alphagenome_regulatory(scored)
         alphagenome_done_ch = alphagenome_regulatory.out.alphagenome_done
@@ -281,7 +291,7 @@ workflow PHASE2_CLINICAL {
         disease_done_ch = Channel.value(true)
     }
 
-    // step11b and step11c can run in parallel after disease annotation
+    // step11b and step11c run in parallel after disease annotation
     if (fromIdx <= CLINICAL_STEPS.indexOf('step11b') && untilIdx >= CLINICAL_STEPS.indexOf('step11b')) {
         rare_variants(disease_done_ch)
         rare_done_ch = rare_variants.out.rare_done
@@ -319,7 +329,7 @@ workflow PHASE2_CLINICAL {
         p2rank_done_ch = Channel.value(true)
     }
 
-    // step13 and step14 can run in parallel
+    // step13 and step14 run in parallel after step12b
     if (fromIdx <= CLINICAL_STEPS.indexOf('step13') && untilIdx >= CLINICAL_STEPS.indexOf('step13')) {
         gene_therapy(p2rank_done_ch)
         therapy_done_ch = gene_therapy.out.therapy_done

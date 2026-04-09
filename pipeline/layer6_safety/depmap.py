@@ -47,14 +47,64 @@ def _depmap_cache_path() -> Path:
     return root / "CRISPRGeneDependency.csv"
 
 
+_DEPMAP_S3_KEY = "cache/depmap/CRISPRGeneDependency.csv"
+
+
+def _try_s3_download(s3_key: str, local_path: Path) -> bool:
+    """Try to restore *s3_key* from the pipeline S3 bucket to *local_path*.
+
+    Returns True on success, False if the object doesn't exist or on error.
+    Same-region downloads (ap-south-1 → ap-south-1) are effectively free
+    and run at ~100 MB/s, making this much faster than hitting the DepMap
+    portal every retry.
+    """
+    from pipeline.config import get_storage_root
+    storage_root = get_storage_root()
+    if not storage_root.startswith("s3://"):
+        return False
+    bucket = storage_root[len("s3://"):].split("/")[0]
+    try:
+        import boto3
+        boto3.client("s3").download_file(bucket, s3_key, str(local_path))
+        log.info("DepMap: loaded from S3 cache s3://%s/%s", bucket, s3_key)
+        return True
+    except Exception:
+        return False
+
+
+def _try_s3_upload(s3_key: str, local_path: Path) -> None:
+    """Upload *local_path* to the pipeline S3 bucket for future retries."""
+    from pipeline.config import get_storage_root
+    storage_root = get_storage_root()
+    if not storage_root.startswith("s3://"):
+        return
+    bucket = storage_root[len("s3://"):].split("/")[0]
+    try:
+        import boto3
+        boto3.client("s3").upload_file(str(local_path), bucket, s3_key)
+        log.info("DepMap: cached to s3://%s/%s for future retries.", bucket, s3_key)
+    except Exception as exc:
+        log.debug("DepMap S3 cache upload failed (non-fatal): %s", exc)
+
+
 def download_depmap_scores(force: bool = False) -> Path:
-    """Download DepMap CRISPR gene dependency scores if not cached."""
+    """Download DepMap CRISPR gene dependency scores.
+
+    Lookup order (fastest first):
+      1. Local disk (/tmp/bioresilient/depmap/) — present after first run in same container
+      2. S3 bucket (cache/depmap/) — present after any previous successful run
+      3. DepMap portal (~150 MB) — original source; result is uploaded to S3 for caching
+    """
     path = _depmap_cache_path()
     if path.exists() and not force:
-        log.info("DepMap scores already cached at %s", path)
+        log.info("DepMap scores already cached locally at %s", path)
         return path
 
-    log.info("Downloading DepMap CRISPR scores (~150 MB)...")
+    # S3 cache check — avoids 150 MB portal download on Spot retries
+    if not force and _try_s3_download(_DEPMAP_S3_KEY, path):
+        return path
+
+    log.info("Downloading DepMap CRISPR scores from portal (~150 MB)...")
     try:
         with requests.get(DEPMAP_SUMMARY_URL, stream=True, timeout=60) as r:
             r.raise_for_status()
@@ -62,6 +112,8 @@ def download_depmap_scores(force: bool = False) -> Path:
                 for chunk in r.iter_content(chunk_size=1024 * 1024):
                     f.write(chunk)
         log.info("DepMap download complete: %s", path)
+        # Cache to S3 so spot retries skip the portal download
+        _try_s3_upload(_DEPMAP_S3_KEY, path)
     except Exception as exc:
         log.warning("DepMap download failed: %s — skipping essentiality scoring.", exc)
         if path.exists():

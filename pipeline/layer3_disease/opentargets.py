@@ -198,32 +198,73 @@ def fetch_opentargets_score(gene_id: str, gene_symbol: str, ensembl_id: Optional
 
 
 def annotate_genes_opentargets(gene_ids: list[str]) -> int:
-    """Populate DiseaseAnnotation and DrugTarget with extended OT data for the given genes."""
-    updated = 0
+    """Populate DiseaseAnnotation and DrugTarget with extended OT data for the given genes.
+
+    Idempotent: skips genes already annotated (opentargets_score is not null).
+    Batch write: all DB writes happen in a single session at the end (not N sessions).
+    """
+    # Load genes and existing annotation state in one query
     with get_session() as session:
-        # Pre-resolve Ensembl IDs in one pass to avoid repeated symbol lookups
-        ensembl_map: dict[str, str] = {}
-        for gid in gene_ids:
-            gene = session.get(Gene, gid)
-            if not gene:
-                continue
+        gene_map: dict[str, Gene] = {
+            g.id: g for g in session.query(Gene).filter(Gene.id.in_(gene_ids)).all()
+        }
+        already_done = {
+            r.gene_id
+            for r in session.query(DiseaseAnnotation.gene_id)
+            .filter(
+                DiseaseAnnotation.gene_id.in_(gene_ids),
+                DiseaseAnnotation.opentargets_score.isnot(None),
+            )
+            .all()
+        }
+
+    todo = [gid for gid in gene_ids if gid not in already_done and gid in gene_map]
+    if not todo:
+        log.info("OpenTargets: all %d genes already annotated, skipping.", len(already_done))
+        return 0
+
+    log.info("OpenTargets: fetching %d genes (%d already done)...", len(todo), len(already_done))
+
+    # Resolve Ensembl IDs (single pass, separate session to avoid long-lived transaction)
+    ensembl_map: dict[str, str] = {}
+    with get_session() as session:
+        for gid in todo:
             eid = _symbol_to_ensembl(session, gid)
             if eid:
                 ensembl_map[gid] = eid
 
-    for gid in gene_ids:
-        with get_session() as session:
-            gene = session.get(Gene, gid)
-            if not gene:
-                continue
+    # Fetch API results (network I/O, no DB session open)
+    results: dict[str, dict] = {}
+    for gid in todo:
+        gene = gene_map[gid]
+        r = fetch_opentargets_full(gid, gene.gene_symbol, ensembl_id=ensembl_map.get(gid))
+        if r is not None:
+            results[gid] = r
 
-        result = fetch_opentargets_full(gid, gene.gene_symbol, ensembl_id=ensembl_map.get(gid))
-        if result is None:
-            continue
+    if not results:
+        log.info("OpenTargets: no results returned for %d genes.", len(todo))
+        return 0
 
-        with get_session() as session:
-            # DiseaseAnnotation — association score + drug + safety
-            ann = session.get(DiseaseAnnotation, gid)
+    # Bulk write — single session for all genes
+    updated = 0
+    with get_session() as session:
+        ann_map = {
+            r.gene_id: r
+            for r in session.query(DiseaseAnnotation)
+            .filter(DiseaseAnnotation.gene_id.in_(list(results)))
+            .all()
+        }
+        dt_map = {
+            r.gene_id: r
+            for r in session.query(DrugTarget)
+            .filter(DrugTarget.gene_id.in_(list(results)))
+            .all()
+        }
+
+        for gid, result in results.items():
+            gene = gene_map[gid]
+
+            ann = ann_map.get(gid)
             if ann is None:
                 ann = DiseaseAnnotation(gene_id=gid)
                 session.add(ann)
@@ -236,8 +277,7 @@ def annotate_genes_opentargets(gene_ids: list[str]) -> int:
             if result["ot_safety_liability"] is not None:
                 ann.ot_safety_liability = result["ot_safety_liability"]
 
-            # DrugTarget — tractability flags
-            dt = session.get(DrugTarget, gid)
+            dt = dt_map.get(gid)
             if dt is None:
                 dt = DrugTarget(gene_id=gid)
                 session.add(dt)

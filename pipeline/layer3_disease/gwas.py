@@ -50,21 +50,54 @@ def fetch_gwas_pvalue(gene_symbol: str) -> Optional[float]:
 
 
 def annotate_genes_gwas(gene_ids: list[str]) -> int:
-    """Populate DiseaseAnnotation.gwas_pvalue for the given genes."""
+    """Populate DiseaseAnnotation.gwas_pvalue for the given genes.
+
+    Idempotent: skips genes where gwas_pvalue is already populated.
+    Bulk write: all DB writes in one session after all fetches complete.
+    """
+    with get_session() as session:
+        gene_map = {g.id: g for g in session.query(Gene).filter(Gene.id.in_(gene_ids)).all()}
+        already_done = {
+            r.gene_id
+            for r in session.query(DiseaseAnnotation.gene_id)
+            .filter(
+                DiseaseAnnotation.gene_id.in_(gene_ids),
+                DiseaseAnnotation.gwas_pvalue.isnot(None),
+            )
+            .all()
+        }
+
+    todo = [gid for gid in gene_ids if gid not in already_done and gid in gene_map]
+    if not todo:
+        log.info("GWAS Catalog: all %d genes already annotated, skipping.", len(already_done))
+        return 0
+
+    # Fetch all p-values outside DB session
+    fetch_results: dict[str, float] = {}
+    for gid in todo:
+        pval = fetch_gwas_pvalue(gene_map[gid].gene_symbol)
+        if pval is not None:
+            fetch_results[gid] = pval
+
+    if not fetch_results:
+        return 0
+
+    # Bulk write in one session
     updated = 0
     with get_session() as session:
-        for gid in gene_ids:
-            gene = session.get(Gene, gid)
-            if not gene:
-                continue
-            pval = fetch_gwas_pvalue(gene.gene_symbol)
-            if pval is None:
-                continue
-            ann = session.get(DiseaseAnnotation, gid)
+        ann_map = {
+            r.gene_id: r
+            for r in session.query(DiseaseAnnotation)
+            .filter(DiseaseAnnotation.gene_id.in_(list(fetch_results)))
+            .all()
+        }
+        for gid, pval in fetch_results.items():
+            ann = ann_map.get(gid)
             if ann is None:
                 ann = DiseaseAnnotation(gene_id=gid)
                 session.add(ann)
             ann.gwas_pvalue = pval
             updated += 1
+
     log.info("GWAS Catalog: updated %d genes.", updated)
     return updated

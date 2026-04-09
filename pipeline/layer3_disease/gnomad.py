@@ -143,20 +143,53 @@ def fetch_gnomad_pli(ensembl_gene_id: str) -> Optional[float]:
 
 
 def annotate_genes_gnomad(gene_ids: list[str]) -> int:
-    """Populate DiseaseAnnotation.gnomad_pli and .gnomad_loeuf for the given genes."""
+    """Populate DiseaseAnnotation.gnomad_pli and .gnomad_loeuf for the given genes.
+
+    Idempotent: skips genes where gnomad_pli is already populated.
+    """
+    with get_session() as session:
+        gene_map = {g.id: g for g in session.query(Gene).filter(Gene.id.in_(gene_ids)).all()}
+        already_done = {
+            r.gene_id
+            for r in session.query(DiseaseAnnotation.gene_id)
+            .filter(
+                DiseaseAnnotation.gene_id.in_(gene_ids),
+                DiseaseAnnotation.gnomad_pli.isnot(None),
+            )
+            .all()
+        }
+
+    todo = [gid for gid in gene_ids if gid not in already_done and gid in gene_map]
+    if not todo:
+        log.info("gnomAD: all %d genes already annotated, skipping.", len(already_done))
+        return 0
+
+    # Fetch constraints outside DB session (network calls)
+    fetch_results: dict[str, dict] = {}
+    for gid in todo:
+        gene = gene_map[gid]
+        ensembl_id = _symbol_to_ensembl_id(gene.gene_symbol)
+        if not ensembl_id:
+            continue
+        constraint = fetch_gnomad_constraint(ensembl_id)
+        if constraint:
+            fetch_results[gid] = constraint
+
+    if not fetch_results:
+        return 0
+
+    # Bulk write in one session
     updated = 0
     with get_session() as session:
-        for gid in gene_ids:
-            gene = session.get(Gene, gid)
-            if not gene:
-                continue
-            ensembl_id = _symbol_to_ensembl_id(gene.gene_symbol)
-            if not ensembl_id:
-                continue
-            constraint = fetch_gnomad_constraint(ensembl_id)
-            if constraint is None:
-                continue
-            ann = session.get(DiseaseAnnotation, gid)
+        ann_map = {
+            r.gene_id: r
+            for r in session.query(DiseaseAnnotation)
+            .filter(DiseaseAnnotation.gene_id.in_(list(fetch_results)))
+            .all()
+        }
+        for gid, constraint in fetch_results.items():
+            gene = gene_map[gid]
+            ann = ann_map.get(gid)
             if ann is None:
                 ann = DiseaseAnnotation(gene_id=gid)
                 session.add(ann)
@@ -172,5 +205,6 @@ def annotate_genes_gnomad(gene_ids: list[str]) -> int:
                 constraint.get("loeuf"),
                 (constraint.get("loeuf") or 1.0) < LOEUF_INTOLERANT_THRESHOLD,
             )
+
     log.info("gnomAD: updated %d genes (pLI + LOEUF v4).", updated)
     return updated
