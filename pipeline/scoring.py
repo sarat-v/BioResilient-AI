@@ -196,41 +196,105 @@ def expression_score_from_db(gene_id: str, session) -> float:
 
 
 def disease_score(ann: Optional[DiseaseAnnotation]) -> float:
-    """Score in [0, 1] from OpenTargets, GWAS p-value, gnomAD pLI (disease relevance)."""
+    """Score in [0, 1] from OpenTargets, GWAS, gnomAD, known drugs, protective variants.
+
+    Scoring breakdown (max 1.0):
+      0.30  OpenTargets association score — disease relevance breadth
+      0.20  GWAS p-value                 — human genetic evidence
+      0.15  gnomAD pLI or LOEUF          — LoF intolerance (functional importance)
+      0.20  known drug phase             — clinical validation (0=none → 4=approved)
+      0.15  protective variant           — PCSK9-paradigm human validation
+    """
     if ann is None:
         return 0.0
     s = 0.0
+
+    # OpenTargets association breadth
     if ann.opentargets_score is not None:
-        s += min(ann.opentargets_score, 1.0) * 0.4
+        s += min(ann.opentargets_score, 1.0) * 0.30
+
+    # Human genetic evidence (GWAS)
     if ann.gwas_pvalue is not None and ann.gwas_pvalue > 0:
-        s += min(-math.log10(ann.gwas_pvalue) / 15.0, 1.0) * 0.3
-    if ann.gnomad_pli is not None:
-        s += min(ann.gnomad_pli, 1.0) * 0.3
+        s += min(-math.log10(ann.gwas_pvalue) / 15.0, 1.0) * 0.20
+
+    # LoF constraint — prefer LOEUF (v4, continuous) over pLI (binary-ish).
+    # LOEUF < 0.6 = intolerant; invert so low LOEUF → high score.
+    loeuf = getattr(ann, "gnomad_loeuf", None)
+    pli = ann.gnomad_pli
+    if loeuf is not None:
+        # 1 − LOEUF/1.0 maps [0, 1] LOEUF to [1, 0] score; clamp at 0
+        s += max(0.0, min(1.0 - loeuf, 1.0)) * 0.15
+    elif pli is not None:
+        s += min(pli, 1.0) * 0.15
+
+    # Known drug clinical phase (approved drug = strongest validation)
+    known_phase = getattr(ann, "known_drug_phase", None)
+    if known_phase is not None and known_phase > 0:
+        s += min(known_phase / 4.0, 1.0) * 0.20  # phase 4 (approved) = full 0.20
+
+    # Rare protective variant (PCSK9 paradigm) — binary bonus
+    pv_count = ann.protective_variant_count
+    pv_pval = ann.protective_variant_pvalue
+    if pv_count is not None and pv_count >= 1 and pv_pval is not None and pv_pval < 5e-8:
+        s += 0.15
+
     return round(min(s, 1.0), 4)
 
 
 def druggability_score(dt: Optional[DrugTarget]) -> float:
-    """Score in [0, 1] from pockets, ChEMBL, CanSAR tier, and P2Rank ML prediction."""
+    """Score in [0, 1] from pockets, ChEMBL, CanSAR tier, P2Rank, tractability, and convergent proximity.
+
+    Scoring breakdown (max 1.0):
+      0.20  fpocket pocket count   — proxy for surface pocketability
+      0.20  fpocket top pocket score — direct druggability estimate
+      0.10  P2Rank ML score        — independent ML pocket confidence
+      0.15  ChEMBL target / existing drugs — chemical matter exists
+      0.10  CanSAR tier            — curated druggability annotation
+      0.10  OT tractability (SM/AB/PROTAC) — any modality tractable
+      0.15  Convergent-pocket proximal — convergent residue near top pocket
+    """
     if dt is None:
         return 0.0
     s = 0.0
+
+    # Pocket existence and quality
     if dt.pocket_count is not None and dt.pocket_count > 0:
-        s += min(dt.pocket_count / 5.0, 1.0) * 0.25
+        s += min(dt.pocket_count / 5.0, 1.0) * 0.20
     if dt.top_pocket_score is not None:
-        s += min(dt.top_pocket_score, 1.0) * 0.25
-    if dt.chembl_target_id:
-        s += 0.2
-    if dt.existing_drugs and len(dt.existing_drugs) > 0:
-        s += 0.2
-    tier = (dt.druggability_tier or "").upper()
-    if tier == "A":
-        s += 0.2
-    elif tier == "B":
-        s += 0.1
-    # P2Rank ML prediction — supplementary signal (up to 0.1 bonus)
+        s += min(dt.top_pocket_score, 1.0) * 0.20
+
+    # P2Rank ML prediction
     p2rank = getattr(dt, "p2rank_score", None)
     if p2rank is not None and p2rank > 0:
-        s += min(p2rank, 1.0) * 0.1
+        s += min(p2rank, 1.0) * 0.10
+
+    # Chemical matter evidence
+    if dt.chembl_target_id:
+        s += 0.10
+    if dt.existing_drugs and len(dt.existing_drugs) > 0:
+        s += 0.05
+
+    # CanSAR tier
+    tier = (dt.druggability_tier or "").upper()
+    if tier == "A":
+        s += 0.10
+    elif tier == "B":
+        s += 0.05
+
+    # OpenTargets tractability — any modality tractable is a positive signal
+    sm = getattr(dt, "tractability_sm", None)
+    ab = getattr(dt, "tractability_ab", None)
+    protac = getattr(dt, "tractability_protac", None)
+    if sm or ab or protac:
+        s += 0.10
+
+    # Convergent-pocket proximal — the key novel signal:
+    # if the convergent residue sits near the druggable pocket, modulating that
+    # pocket directly perturbs the evolved adaptive position.
+    proximal = getattr(dt, "convergent_pocket_proximal", None)
+    if proximal:
+        s += 0.15
+
     return round(min(s, 1.0), 4)
 
 
@@ -843,6 +907,17 @@ def _run_scoring_weighted(weights: dict, tier_thresholds: dict, tid: str) -> Non
             }
 
             comp = composite_score(sub_scores, weights)
+
+            # Safety is a hard floor, not an additive contribution.
+            # If safety_score falls below the configured threshold the gene is
+            # zeroed out regardless of how strong the evolutionary signal is.
+            # This prevents a gene with a fatal safety liability (e.g. cardiac
+            # ion channel, ubiquitously essential) from reaching Tier1 on the
+            # back of convergence alone.
+            safety_floor = weights.get("safety_floor", 0.0)
+            if safety_floor > 0 and safe_score < safety_floor:
+                comp = 0.0
+
             hg_score = human_genetics_score_from_disease(ann)
             tier = assign_tier(comp, tier_thresholds, human_genetics_score=hg_score)
 

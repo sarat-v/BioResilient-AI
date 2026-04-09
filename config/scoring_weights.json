@@ -10,14 +10,16 @@
     "safety":           0.00,
     "regulatory":       0.00
   },
+  "_comment_phase2": "Safety is NOT additive — it is a multiplicative floor. safety_floor=0.40 means any gene with safety_score < 0.40 is zeroed out regardless of evolutionary signal. The freed 10% weight is redistributed to evolutionary + disease layers.",
   "phase2": {
-    "convergence":      0.22,
-    "selection":        0.18,
-    "disease":          0.20,
-    "druggability":     0.15,
+    "convergence":      0.25,
+    "selection":        0.20,
+    "disease":          0.22,
+    "druggability":     0.18,
     "expression":       0.10,
-    "safety":           0.10,
-    "regulatory":       0.05
+    "safety":           0.00,
+    "regulatory":       0.05,
+    "safety_floor":     0.40
   },
   "tier_thresholds": {
     "tier1": 0.70,

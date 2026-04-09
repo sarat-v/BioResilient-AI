@@ -236,6 +236,12 @@ class DiseaseAnnotation(Base):
     lit_score = Column(Float, nullable=True)            # PubMed citation density in resilience/longevity literature
     lit_pmid_count = Column(Integer, nullable=True)     # Number of relevant PubMed papers
 
+    # Phase 2 upgrades: OpenTargets extended fields (populated in Step 11)
+    gnomad_loeuf = Column(Float, nullable=True)         # gnomAD v4 LOEUF (< 0.6 = LoF intolerant)
+    known_drug_name = Column(String, nullable=True)     # Best-phase known drug targeting this gene
+    known_drug_phase = Column(Integer, nullable=True)   # Max clinical trial phase (4 = approved)
+    ot_safety_liability = Column(String, nullable=True) # Comma-separated safety event labels from OT
+
     gene = relationship("Gene", back_populates="disease_annotation")
 
 
@@ -258,6 +264,12 @@ class DrugTarget(Base):
     # Item 7: P2Rank ML pocket prediction (populated in Step 12b)
     p2rank_score = Column(Float, nullable=True)         # Best P2Rank pocket probability [0–1]
     p2rank_pocket_count = Column(Integer, nullable=True)  # Number of predicted pockets
+
+    # Phase 2 upgrades: tractability modalities + convergent position proximity (Step 12)
+    tractability_sm = Column(Boolean, nullable=True)    # Small molecule tractable (OT / DrugEBIlity)
+    tractability_ab = Column(Boolean, nullable=True)    # Antibody tractable (surface/extracellular)
+    tractability_protac = Column(Boolean, nullable=True)  # PROTAC-tractable (PROTACtable genome)
+    convergent_pocket_proximal = Column(Boolean, nullable=True)  # Any convergent AA within 6Å of top pocket
 
     gene = relationship("Gene", back_populates="drug_target")
 
