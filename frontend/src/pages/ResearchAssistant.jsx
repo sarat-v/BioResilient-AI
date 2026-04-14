@@ -62,16 +62,16 @@ export default function ResearchAssistant() {
     <div className="px-8 py-8 space-y-6">
       <PageHeader
         title="Research Assistant"
-        subtitle="Search genes by symbol, NCBI Gene ID, or UniProt accession; generate plain-English summaries."
+        subtitle="Search genes by symbol, ID, or accession across all candidates. AI generates plain-English scientific narratives of each gene's role in disease resilience."
       />
 
       {traits.length > 0 && (
         <div className="flex items-center gap-2">
-          <span className="text-sm text-text-muted">Trait:</span>
+          <span className="text-sm text-ink-3">Trait:</span>
           <select
             value={traitId}
             onChange={e => setTraitId(e.target.value)}
-            className="px-3 py-2 bg-surface border border-white/8 rounded-lg text-sm text-text-primary focus:outline-none focus:border-accent/50"
+            className="px-3 py-2 bg-surface border border-border rounded-lg text-sm text-ink focus:outline-none focus:border-accent/50"
           >
             <option value="">Default</option>
             {traits.map(t => (
@@ -86,14 +86,14 @@ export default function ResearchAssistant() {
         <div className="card">
           <div className="flex items-center gap-2 mb-3">
             <Dna className="w-4 h-4 text-accent" />
-            <p className="font-semibold text-text-primary">Browse by Biological Process</p>
+            <p className="font-semibold text-ink">Browse by Biological Process</p>
           </div>
-          <p className="text-xs text-text-muted mb-3">Select a GO term or Reactome pathway to filter candidates.</p>
+          <p className="text-xs text-ink-3 mb-3">Select a GO term or Reactome pathway to filter candidates.</p>
           <div className="flex items-center gap-3 flex-wrap">
             <select
               value={pathwayFilter}
               onChange={e => setPathwayFilter(e.target.value)}
-              className="px-3 py-2 bg-base border border-white/8 rounded-lg text-sm text-text-primary focus:outline-none focus:border-accent/50 min-w-[220px]"
+              className="px-3 py-2 bg-base border border-border rounded-lg text-sm text-ink focus:outline-none focus:border-accent/50 min-w-[220px]"
             >
               <option value="">All pathways</option>
               {pathwayOptions.go_terms?.slice(0, 60).map(go => (
@@ -118,13 +118,13 @@ export default function ResearchAssistant() {
       {/* Search */}
       <div className="card max-w-2xl">
         <div className="relative">
-          <Search className="absolute left-3 top-1/2 -translate-y-1/2 w-4 h-4 text-text-muted" />
+          <Search className="absolute left-3 top-1/2 -translate-y-1/2 w-4 h-4 text-ink-3" />
           <input
             value={query}
             onChange={onSearchChange}
             placeholder="Search by gene symbol (e.g. TP53), NCBI ID, or UniProt accession…"
-            className="w-full pl-10 pr-4 py-3 bg-base border border-white/8 rounded-lg text-text-primary
-                       placeholder:text-text-muted focus:outline-none focus:border-accent/50"
+            className="w-full pl-10 pr-4 py-3 bg-base border border-border rounded-lg text-ink
+                       placeholder:text-ink-3 focus:outline-none focus:border-accent/50"
           />
           {searching && (
             <span className="absolute right-3 top-1/2 -translate-y-1/2">
@@ -137,9 +137,9 @@ export default function ResearchAssistant() {
       <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
         {/* Results list */}
         <div className="card">
-          <p className="font-semibold text-text-primary mb-3">Results</p>
+          <p className="font-semibold text-ink mb-3">Results</p>
           {hits.length === 0 && !searching && (
-            <p className="text-sm text-text-muted py-4">
+            <p className="text-sm text-ink-3 py-4">
               {query.trim().length < 2 ? 'Type at least 2 characters to search.' : 'No genes found.'}
             </p>
           )}
@@ -156,12 +156,12 @@ export default function ResearchAssistant() {
                     'w-full text-left px-4 py-2.5 rounded-lg text-sm transition-colors',
                     selected?.gene_id === g.gene_id
                       ? 'bg-accent/15 text-accent border border-accent/30'
-                      : 'hover:bg-white/5 text-text-primary border border-transparent',
+                      : 'hover:bg-canvas text-ink border border-transparent',
                   )}
                 >
                   <span className="font-mono font-medium">{g.gene_symbol}</span>
                   {g.human_protein && (
-                    <span className="ml-2 text-text-muted text-xs">{g.human_protein}</span>
+                    <span className="ml-2 text-ink-3 text-xs">{g.human_protein}</span>
                   )}
                 </button>
               </li>
@@ -180,7 +180,7 @@ export default function ResearchAssistant() {
               <div className="flex items-center justify-between">
                 <div>
                   <p className="font-mono text-lg font-semibold text-accent">{selected.gene_symbol}</p>
-                  <p className="text-xs text-text-muted">
+                  <p className="text-xs text-ink-3">
                     {selected.human_gene_id && `NCBI ${selected.human_gene_id}`}
                     {selected.human_protein && ` · UniProt ${selected.human_protein}`}
                   </p>
@@ -195,15 +195,15 @@ export default function ResearchAssistant() {
               <div>
                 <div className="flex items-center gap-2 mb-2">
                   <FileText className="w-4 h-4 text-accent" />
-                  <span className="font-semibold text-text-primary">Research Summary</span>
+                  <span className="font-semibold text-ink">Research Summary</span>
                 </div>
                 {narrativeLoading ? (
-                  <div className="flex items-center gap-2 py-4 text-text-muted">
+                  <div className="flex items-center gap-2 py-4 text-ink-3">
                     <Loader2 className="w-4 h-4 animate-spin" />
                     <span className="text-sm">Generating summary…</span>
                   </div>
                 ) : narrative ? (
-                  <div className="prose prose-invert prose-sm max-w-none text-text-primary whitespace-pre-wrap">
+                  <div className="prose prose-invert prose-sm max-w-none text-ink whitespace-pre-wrap">
                     {narrative}
                   </div>
                 ) : (
@@ -220,7 +220,7 @@ export default function ResearchAssistant() {
             </motion.div>
           )}
           {!selected && hits.length > 0 && (
-            <p className="text-sm text-text-muted py-8">Select a gene to see details and generate a summary.</p>
+            <p className="text-sm text-ink-3 py-8">Select a gene to see details and generate a summary.</p>
           )}
         </div>
       </div>

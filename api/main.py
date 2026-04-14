@@ -12,6 +12,7 @@ Start with:
   uvicorn api.main:app --host 0.0.0.0 --port 8000 --reload
 """
 
+import os
 import sys
 from pathlib import Path
 
@@ -26,9 +27,8 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 
-from api.routes import candidates, research, scores, species
+from api.routes import candidates, research, scores, species, auth as auth_routes
 from api.routes import pipeline as pipeline_routes
-from pipeline.config import get_api_key
 
 _REPO_ROOT = Path(__file__).resolve().parents[1]
 _STATIC_DIR = _REPO_ROOT / "api" / "static" / "dist"
@@ -45,25 +45,39 @@ app = FastAPI(
     redoc_url="/api/redoc",
 )
 
-# API key auth: when api.key is set in config, require X-API-Key header on all non-exempt paths
-_API_KEY_EXEMPT_PREFIXES = ("/api/health", "/api/docs", "/api/redoc", "/openapi.json", "/assets")
+# JWT auth: protect all data API routes. Auth routes, health, docs, and SPA paths are exempt.
+# Routes that require a valid Bearer token:
+_JWT_PROTECTED_PREFIXES = ("/candidates", "/species", "/scores", "/research", "/pipeline")
 
 
-class APIKeyMiddleware(BaseHTTPMiddleware):
+class JWTMiddleware(BaseHTTPMiddleware):
     async def dispatch(self, request: Request, call_next):
-        expected = get_api_key()
-        if not expected:
-            return await call_next(request)
         path = request.url.path
-        if path == "/" or any(path.startswith(p) for p in _API_KEY_EXEMPT_PREFIXES):
+
+        # Only protect data API routes — leave auth, health, docs, and SPA paths open
+        if not any(path.startswith(p) for p in _JWT_PROTECTED_PREFIXES):
             return await call_next(request)
-        key = request.headers.get("X-API-Key", "")
-        if key != expected:
-            return JSONResponse(status_code=401, content={"detail": "Invalid or missing X-API-Key"})
+
+        secret = os.environ.get("JWT_SECRET_KEY", "")
+        if not secret:
+            # JWT not configured — open access (dev / local mode)
+            return await call_next(request)
+
+        auth_header = request.headers.get("Authorization", "")
+        if not auth_header.startswith("Bearer "):
+            return JSONResponse(status_code=401, content={"detail": "Authentication required"})
+
+        token = auth_header[len("Bearer "):]
+        try:
+            from jose import jwt, JWTError
+            jwt.decode(token, secret, algorithms=["HS256"])
+        except Exception:
+            return JSONResponse(status_code=401, content={"detail": "Invalid or expired token"})
+
         return await call_next(request)
 
 
-app.add_middleware(APIKeyMiddleware)
+app.add_middleware(JWTMiddleware)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],   # Restrict before external deployment
@@ -72,6 +86,7 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+app.include_router(auth_routes.router, prefix="/auth", tags=["auth"])
 app.include_router(candidates.router, prefix="/candidates", tags=["candidates"])
 app.include_router(species.router, prefix="/species", tags=["species"])
 app.include_router(scores.router, prefix="/scores", tags=["scores"])

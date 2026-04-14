@@ -9,9 +9,11 @@ export default defineConfig({
   },
   server: {
     proxy: {
+      '/auth': 'http://localhost:8000',
       '/candidates': 'http://localhost:8000',
       '/species': 'http://localhost:8000',
       '/scores': 'http://localhost:8000',
+      '/research': 'http://localhost:8000',
       '/pipeline': 'http://localhost:8000',
       '/api': 'http://localhost:8000',
     },

@@ -5,6 +5,9 @@ All six layers are defined here. Phase 1 populates:
 
 Phase 2 adds data to:
   DiseaseAnnotation, DrugTarget, GeneTherapyScore, SafetyFlag
+
+Step 9b adds:
+  ConvergentPositionAnnotation — per-convergent-motif structural context
 """
 
 import uuid
@@ -334,6 +337,7 @@ class CandidateScore(Base):
     composite_score = Column(Float, default=0.0)
     tier = Column(String)                               # "Tier1", "Tier2", "Tier3"
     regulatory_score = Column(Float, default=0.0)       # Track B: AlphaGenome regulatory divergence
+    structural_score = Column(Float, default=0.0)       # Step 9b: structural context of convergent changes
     control_divergence_fraction = Column(Float, nullable=True)  # A3: fraction of control species also divergent
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
 
@@ -341,6 +345,65 @@ class CandidateScore(Base):
 
     def __repr__(self) -> str:
         return f"<CandidateScore gene={self.gene_id} composite={self.composite_score:.3f} {self.tier}>"
+
+
+# ---------------------------------------------------------------------------
+# Step 9b: Convergent position structural context
+# ---------------------------------------------------------------------------
+
+
+class ConvergentPositionAnnotation(Base):
+    """Per-convergent-motif structural annotation produced by Step 9b.
+
+    One row per DivergentMotif that shows convergent_aa_count >= threshold.
+    Each row captures the structural context of a convergently changed region
+    in the canonical human protein: UniProt functional site, AlphaMissense
+    pathogenicity, AlphaFold confidence, and 3D proximity to the top druggable
+    pocket.  The per-gene structural_score in CandidateScore aggregates these
+    rows into a single [0,1] signal for Phase 2 composite scoring.
+    """
+
+    __tablename__ = "convergent_position_annotation"
+    __table_args__ = (
+        UniqueConstraint("gene_id", "divergent_motif_id", name="uq_cpa_gene_motif"),
+    )
+
+    id = Column(String, primary_key=True, default=_uuid)
+    gene_id = Column(String, ForeignKey("gene.id", ondelete="CASCADE"), nullable=False)
+    divergent_motif_id = Column(
+        String, ForeignKey("divergent_motif.id", ondelete="CASCADE"), nullable=False
+    )
+    uniprot_accession = Column(String, nullable=True)   # Resolved UniProt accession (e.g. "P31749")
+
+    # Protein-space coordinates of the motif (1-indexed, UniProt canonical sequence)
+    protein_start_pos = Column(Integer, nullable=True)
+    protein_end_pos = Column(Integer, nullable=True)
+
+    # Convergence strength (copied from DivergentMotif for quick access)
+    convergent_lineage_count = Column(Integer, nullable=True)
+
+    # AlphaMissense — mean score for this specific region's divergent positions
+    am_score = Column(Float, nullable=True)             # Mean AM pathogenicity [0–1]
+    am_class = Column(String, nullable=True)            # 'likely_pathogenic', 'ambiguous', 'likely_benign'
+
+    # UniProt functional site annotation at this region
+    uniprot_feature = Column(String, nullable=True)     # 'active_site', 'binding_site', 'modified_residue', etc.
+    uniprot_feature_description = Column(String, nullable=True)
+
+    # AlphaFold structural confidence
+    plddt_mean = Column(Float, nullable=True)           # Mean pLDDT for residues in this region
+    is_disordered = Column(Boolean, nullable=True)      # plddt_mean < 70
+
+    # 3D pocket proximity (from fpocket top-ranked pocket)
+    pocket_distance_angstrom = Column(Float, nullable=True)  # Å from region Cα centroid to pocket centroid
+    is_pocket_adjacent = Column(Boolean, nullable=True)      # distance <= 8.0 Å
+
+    # Derived structural context classifier
+    structural_context = Column(String, nullable=True)  # 'active_site', 'binding_site', 'pocket_adjacent',
+                                                        # 'surface_near_pocket', 'disordered', 'distal'
+
+    gene = relationship("Gene")
+    divergent_motif = relationship("DivergentMotif")
 
 
 # ---------------------------------------------------------------------------
@@ -479,3 +542,31 @@ class PhyloConservationScore(Base):
 
     def __repr__(self) -> str:
         return f"<PhyloConservationScore gene={self.gene_id} cds={self.cds_phylo_score}>"
+
+
+# ---------------------------------------------------------------------------
+# Auth: Platform users
+# ---------------------------------------------------------------------------
+
+
+class User(Base):
+    """BioResilient platform user accounts.
+
+    Roles:
+      admin    — full access, can manage other users
+      operator — can view data and trigger pipeline runs
+      viewer   — read-only access to candidates and research pages
+    """
+
+    __tablename__ = "platform_user"
+
+    id              = Column(String, primary_key=True, default=_uuid)
+    email           = Column(String, nullable=False, unique=True, index=True)
+    name            = Column(String, nullable=False)
+    hashed_password = Column(String, nullable=False)
+    role            = Column(String, nullable=False, default="viewer")   # admin | operator | viewer
+    is_active       = Column(Boolean, nullable=False, default=True)
+    created_at      = Column(DateTime, default=datetime.utcnow, nullable=False)
+
+    def __repr__(self) -> str:
+        return f"<User {self.email} role={self.role} active={self.is_active}>"
