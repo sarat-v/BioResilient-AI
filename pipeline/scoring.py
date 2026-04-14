@@ -282,23 +282,30 @@ def druggability_score(dt: Optional[DrugTarget]) -> float:
     """Score in [0, 1] from pockets, ChEMBL, CanSAR tier, P2Rank, tractability, and convergent proximity.
 
     Scoring breakdown (max 1.0):
-      0.20  fpocket pocket count   — proxy for surface pocketability
-      0.20  fpocket top pocket score — direct druggability estimate
+      0.10  fpocket pocket existence — binary: has at least one pocket (was 0.20 count-based)
+      0.30  fpocket top pocket score — quality of best pocket (was 0.20; increased to compensate)
       0.10  P2Rank ML score        — independent ML pocket confidence
       0.15  ChEMBL target / existing drugs — chemical matter exists
       0.10  CanSAR tier            — curated druggability annotation
       0.10  OT tractability (SM/AB/PROTAC) — any modality tractable
       0.15  Convergent-pocket proximal — convergent residue near top pocket
+
+    Pocket count bias fix: the original 0.20 * min(count/5, 1) term rewarded proteins
+    with many mediocre pockets equally to those with one excellent pocket. Replaced with
+    a binary existence flag (0.10) plus increased weight on top_pocket_score (0.30).
+    Total pocket weight is unchanged at 0.40; quality now dominates over quantity.
     """
     if dt is None:
         return 0.0
     s = 0.0
 
-    # Pocket existence and quality
+    # Pocket existence (binary) + quality of best pocket
+    # Existence (0.10): answers "does this protein have any druggable surface at all?"
+    # Quality  (0.30): rewards the actual depth/score of the best pocket found.
     if dt.pocket_count is not None and dt.pocket_count > 0:
-        s += min(dt.pocket_count / 5.0, 1.0) * 0.20
+        s += 0.10  # binary: has at least one pocket
     if dt.top_pocket_score is not None:
-        s += min(dt.top_pocket_score, 1.0) * 0.20
+        s += min(dt.top_pocket_score, 1.0) * 0.30
 
     # P2Rank ML prediction
     p2rank = getattr(dt, "p2rank_score", None)

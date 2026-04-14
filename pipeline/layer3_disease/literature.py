@@ -273,8 +273,16 @@ def annotate_literature(
             if abstracts:
                 lit_score = _semantic_relevance_score(clean_symbol, abstracts, keywords)
             else:
-                # Fallback to log-count if efetch fails
-                lit_score = round(min(math.log10(1 + count) / 3.0, 1.0), 4)
+                # efetch failed — fall back to a heavily compressed log-count.
+                # Dividing by 5.0 (was 3.0) compresses the well-studied gene advantage:
+                #   TP53  ~90k papers → log10(90001)/5 ≈ 0.99  (was 1.0 — no difference at cap)
+                #   Novel ~20 papers  → log10(21)/5    ≈ 0.26  (was 0.43 — more proportionate)
+                #   Zero  papers      → 0.0
+                # The cap at 0.50 ensures no gene can reach the maximum lit_score via
+                # paper count alone — the full 1.0 is only reachable via the semantic
+                # proportion path (which requires actually-relevant abstracts).
+                raw = math.log10(1 + count) / 5.0
+                lit_score = round(min(raw, 0.50), 4)
         else:
             lit_score = 0.0
 
