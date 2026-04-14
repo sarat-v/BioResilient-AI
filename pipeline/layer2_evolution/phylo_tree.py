@@ -129,11 +129,18 @@ def _max_ogs() -> int:
     return int(get_tool_config().get("iqtree_max_ogs", 500))
 
 
-def run_iqtree(concat_alignment: dict[str, str]) -> Path:
+def run_iqtree(concat_alignment: dict[str, str], force_rerun: bool = False) -> Path:
     """Run IQ-TREE2 on the concatenated alignment.
 
     Args:
         concat_alignment: {species_id: aligned_sequence}
+        force_rerun: If False (default), reuse an existing species.treefile
+                     without running IQ-TREE again (fast resume).
+                     If True, always run IQ-TREE2 even when the treefile exists.
+                     Note: IQ-TREE's ``--redo`` flag is only effective when
+                     ``force_rerun=True``; with the default ``force_rerun=False``
+                     the existence check returns early before IQ-TREE is invoked,
+                     so ``--redo`` would never be reached.
 
     Returns:
         Path to the .treefile (Newick format).
@@ -160,8 +167,12 @@ def run_iqtree(concat_alignment: dict[str, str]) -> Path:
             f.write(f">{species_id}\n{seq}\n")
 
     treefile = tree_dir / "species.treefile"
-    if treefile.exists():
-        log.info("Species tree already exists at %s — skipping IQ-TREE.", treefile)
+
+    # Only skip IQ-TREE when force_rerun=False AND the treefile exists.
+    # When force_rerun=True we proceed to the subprocess call, which includes
+    # --redo to overwrite any existing checkpoints/treefiles.
+    if not force_rerun and treefile.exists():
+        log.info("Species tree already exists at %s — skipping IQ-TREE (pass force_rerun=True to regenerate).", treefile)
         return treefile
 
     # Support both 'iqtree2' (bioconda newer) and 'iqtree' (bioconda older/conda)
@@ -176,8 +187,12 @@ def run_iqtree(concat_alignment: dict[str, str]) -> Path:
         "--mem", "20G",       # hard cap to avoid OOM on 30GB instances
         "-o", "human",
         "--prefix", str(tree_dir / "species"),
-        "--redo",
     ]
+    if force_rerun:
+        # --redo tells IQ-TREE2 to overwrite existing checkpoints and output files.
+        # Only meaningful when force_rerun=True; including it when reuse is intended
+        # would cause IQ-TREE to rebuild even when the cached tree is valid.
+        cmd.append("--redo")
     # Bootstrap requires ≥4 sequences — skip for small test runs
     if len(concat_alignment) >= 4:
         cmd += ["-bb", str(bootstrap)]

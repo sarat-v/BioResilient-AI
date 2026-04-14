@@ -66,7 +66,7 @@ class Gene(Base):
     __tablename__ = "gene"
 
     id = Column(String, primary_key=True, default=_uuid)
-    human_gene_id = Column(String, nullable=False, unique=True)   # NCBI Gene ID
+    human_gene_id = Column(String, nullable=False, unique=True)   # UniProt accession (e.g. P04637), not NCBI Gene ID
     gene_symbol = Column(String, nullable=False)
     human_protein = Column(String)                                # UniProt accession
     narrative = Column(Text, nullable=True)                        # LLM-generated research summary (cached)
@@ -79,7 +79,11 @@ class Gene(Base):
     drug_target = relationship("DrugTarget", back_populates="gene", uselist=False)
     gene_therapy_score = relationship("GeneTherapyScore", back_populates="gene", uselist=False)
     safety_flag = relationship("SafetyFlag", back_populates="gene", uselist=False)
-    candidate_score = relationship("CandidateScore", back_populates="gene", uselist=False)
+    # CandidateScore has a composite PK (gene_id, trait_id) so a gene can have
+    # multiple rows (one per phenotype). Use uselist=True and plural name.
+    # API routes always query CandidateScore directly with (gene_id, trait_id) —
+    # this relationship exists for convenience only.
+    candidate_scores = relationship("CandidateScore", back_populates="gene", uselist=True)
     regulatory_divergences = relationship("RegulatoryDivergence", back_populates="gene")
 
     def __repr__(self) -> str:
@@ -159,7 +163,15 @@ class DivergentMotif(Base):
 
 
 class ExpressionResult(Base):
-    """Per-GEO-dataset expression evidence for traceability."""
+    """Per-GEO-dataset expression evidence for traceability.
+
+    Note on `log2fc`: despite the column name, this field stores a 0–1
+    normalised expression score computed by functional_evidence.py (via GTEx
+    median TPM log2-scaled and divided by 10), NOT a raw log2 fold-change from
+    DESeq2.  The column was named before the pipeline moved to GTEx/OT-based
+    scoring; renaming the column would require a migration and is deferred.
+    Treat `log2fc` as `normalised_expression_score` in all downstream code.
+    """
 
     __tablename__ = "expression_result"
     __table_args__ = (
@@ -170,6 +182,7 @@ class ExpressionResult(Base):
     gene_id = Column(String, ForeignKey("gene.id", ondelete="CASCADE"), nullable=False, index=True)
     geo_accession = Column(String, nullable=False)
     comparison = Column(String, nullable=True)  # e.g. species_id or condition
+    # Stores 0-1 normalised expression score (NOT raw log2FC — see class docstring).
     log2fc = Column(Float, nullable=True)
     padj = Column(Float, nullable=True)
     n_samples = Column(Integer, nullable=True)
@@ -291,6 +304,7 @@ class GeneTherapyScore(Base):
     tissue_tropism = Column(ARRAY(String))              # matching AAV serotypes
     crispr_sites = Column(Integer)                      # number of valid guide sites
     offtarget_risk = Column(String)                     # "low", "medium", "high"
+    crispr_efficiency = Column(Float, nullable=True)    # mean Rule Set 1 on-target efficiency [0-1]
 
     gene = relationship("Gene", back_populates="gene_therapy_score")
 
@@ -311,7 +325,7 @@ class SafetyFlag(Base):
     family_size = Column(Integer)                       # protein family size
 
     # Item 8: DepMap essentiality + GTEx expression breadth (populated in Step 14b)
-    depmap_score = Column(Float, nullable=True)         # DepMap CRISPR chronos score (more negative = more essential)
+    depmap_score = Column(Float, nullable=True)         # DepMap CRISPRGeneDependency probability 0-1 (higher = more essential; >0.7 = broadly essential)
     gtex_tissue_count = Column(Integer, nullable=True)  # Number of tissues with TPM > 1 (GTEx)
     gtex_max_tpm = Column(Float, nullable=True)         # Maximum median TPM across all GTEx tissues
 
@@ -341,7 +355,7 @@ class CandidateScore(Base):
     control_divergence_fraction = Column(Float, nullable=True)  # A3: fraction of control species also divergent
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
 
-    gene = relationship("Gene", back_populates="candidate_score")
+    gene = relationship("Gene", back_populates="candidate_scores")
 
     def __repr__(self) -> str:
         return f"<CandidateScore gene={self.gene_id} composite={self.composite_score:.3f} {self.tier}>"
@@ -570,3 +584,101 @@ class User(Base):
 
     def __repr__(self) -> str:
         return f"<User {self.email} role={self.role} active={self.is_active}>"
+
+
+# ---------------------------------------------------------------------------
+# Layer 7: Preclinical Readiness (Phase 2 — Step 17)
+# ---------------------------------------------------------------------------
+
+
+class PreclinicalReadiness(Base):
+    __tablename__ = "preclinical_readiness"
+
+    gene_id = Column(String, ForeignKey("gene.id", ondelete="CASCADE"), primary_key=True)
+    # Component scores (0-1)
+    synthesis_score     = Column(Float, nullable=True)   # AAV-compatible + gene size + no repeats
+    deliverability_score = Column(Float, nullable=True)  # druggability tier + tractability
+    model_score         = Column(Float, nullable=True)   # IMPC KO data + DepMap + cell line
+    assay_score         = Column(Float, nullable=True)   # existing drugs + ChEMBL assay count
+    # Aggregate
+    overall_readiness_score = Column(Float, nullable=True)
+    readiness_tier      = Column(String, nullable=True)  # "Ready" / "Needs Work" / "Exploratory"
+    notes               = Column(String, nullable=True)
+    updated_at          = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+    gene = relationship("Gene", foreign_keys=[gene_id])
+
+
+# ---------------------------------------------------------------------------
+# Layers 8–9: Lead Discovery & Optimization (Phase 3 & 4 — Steps 19–25)
+# ---------------------------------------------------------------------------
+
+
+class Compound(Base):
+    """One compound candidate per gene (from virtual screening or ligand search)."""
+    __tablename__ = "compound"
+
+    id          = Column(String, primary_key=True, default=_uuid)
+    gene_id     = Column(String, ForeignKey("gene.id", ondelete="CASCADE"), nullable=False, index=True)
+    smiles      = Column(String, nullable=False)
+    name        = Column(String, nullable=True)            # ZINC/ChEMBL name if known
+    source      = Column(String, nullable=True)            # "zinc", "chembl_analog", "known_drug"
+    zinc_id     = Column(String, nullable=True)            # ZINC ID if purchasable
+    chembl_id   = Column(String, nullable=True)            # ChEMBL molecule ID if matched
+
+    # Step 19: Virtual screening
+    docking_score       = Column(Float, nullable=True)     # DiffDock confidence or Vina kcal/mol
+    docking_method      = Column(String, nullable=True)    # "diffdock" | "vina" | "estimated"
+
+    # Step 20: Ligand similarity
+    tanimoto_to_known   = Column(Float, nullable=True)     # Morgan fp similarity to nearest known drug
+    nearest_known_drug  = Column(String, nullable=True)
+
+    # Step 21: Hit ranking
+    hit_score           = Column(Float, nullable=True)     # combined rank (0-1)
+    hit_tier            = Column(String, nullable=True)    # "A" | "B" | "C"
+    is_purchasable      = Column(Boolean, nullable=True)
+
+    created_at  = Column(DateTime, default=datetime.utcnow)
+
+    gene        = relationship("Gene", foreign_keys=[gene_id])
+    score       = relationship("CompoundScore", back_populates="compound", uselist=False)
+
+
+class CompoundScore(Base):
+    """ADMET, toxicity and selectivity profile per compound."""
+    __tablename__ = "compound_score"
+
+    id          = Column(String, primary_key=True, default=_uuid)
+    compound_id = Column(String, ForeignKey("compound.id", ondelete="CASCADE"), nullable=False, unique=True)
+
+    # Step 22: ADMET
+    mw              = Column(Float, nullable=True)         # Molecular weight (Da)
+    logp            = Column(Float, nullable=True)         # Wildman–Crippen LogP
+    hbd             = Column(Integer, nullable=True)       # H-bond donors
+    hba             = Column(Integer, nullable=True)       # H-bond acceptors
+    tpsa            = Column(Float, nullable=True)         # Topological polar surface area
+    lipinski_pass   = Column(Boolean, nullable=True)       # All Lipinski rules pass
+    bbb_permeable   = Column(Boolean, nullable=True)       # BBB permeability (LogP/MW heuristic)
+    cyp3a4_risk     = Column(Float, nullable=True)         # CYP3A4 inhibition probability [0-1]
+
+    # Step 23: Toxicity
+    tox21_score     = Column(Float, nullable=True)         # Aggregate Tox21 alert score [0-1]
+    herg_risk       = Column(Float, nullable=True)         # hERG liability [0-1]
+    pains_alerts    = Column(Integer, nullable=True)       # PAINS structural alert count
+    structural_alerts = Column(Integer, nullable=True)     # Other medicinal chemistry alerts
+
+    # Step 24: Selectivity
+    selectivity_score = Column(Float, nullable=True)       # 1 - max Tanimoto to off-target ligands
+    n_offtarget_similar = Column(Integer, nullable=True)   # Compounds with Tanimoto > 0.4
+
+    # Step 25: Synthesizability
+    sa_score        = Column(Float, nullable=True)         # RDKit SA Score [1=easy, 10=hard]
+    sa_normalized   = Column(Float, nullable=True)         # SA Score normalised to [0-1] (1=easy)
+    zinc_purchasable = Column(Boolean, nullable=True)      # Exact match found in ZINC
+
+    # Overall
+    overall_compound_score = Column(Float, nullable=True)  # Weighted composite [0-1]
+    compound_tier   = Column(String, nullable=True)        # "Lead" | "Hit" | "Fragment" | "Reject"
+
+    compound = relationship("Compound", back_populates="score")

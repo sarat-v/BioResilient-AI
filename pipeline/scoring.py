@@ -28,6 +28,7 @@ from sqlalchemy import func
 
 from db.models import (
     CandidateScore,
+    ConvergentPositionAnnotation,
     DiseaseAnnotation,
     DivergentMotif,
     DrugTarget,
@@ -301,30 +302,50 @@ def druggability_score(dt: Optional[DrugTarget]) -> float:
 def safety_score(sf: Optional[SafetyFlag]) -> float:
     """Score in [0, 1]; high hub_risk, essential, large family reduce score (inverted for composite).
 
-    Extended with DepMap CRISPR essentiality and GTEx expression breadth:
-      - depmap_score < -0.5: broadly essential across cell lines → significant penalty
-      - gtex_tissue_count > 30: ubiquitous expression → moderate off-target risk
-      - gtex_max_tpm > 5000: extreme expression in any tissue → modest penalty
+    Extended with DepMap CRISPR essentiality, GTEx expression breadth, and PheWAS disease
+    association breadth (step 14):
+
+      DepMap:
+        - depmap_score > 0.7: very broadly essential → serious toxicity concern (-0.30)
+        - depmap_score > 0.5: broadly essential (-0.15)
+        - depmap_score > 0.3: moderate essentiality (-0.05)
+
+      GTEx breadth:
+        - tissue_count > 40: ubiquitous → off-target risk (-0.20)
+        - tissue_count > 25: moderate breadth (-0.10)
+        - tissue_count > 15: slight breadth (-0.05)
+
+      GTEx depth:
+        - max_tpm > 1000: critical physiological role in at least one tissue (-0.15)
+        - max_tpm > 500: high peak expression (-0.08)
+
+      PheWAS (step 14):
+        Genes associated with many human diseases carry liability risk — modifying
+        them pharmacologically is more likely to cause unintended phenotypes.
+        The score is derived from phewas_hits, a dict {disease: association_score}.
+        We penalise based on the count of high-confidence associations (score > 0.3)
+        and the maximum association score.
+          - ≥ 15 disease associations at score > 0.3 → high pleiotropic risk (-0.20)
+          - ≥  5 disease associations at score > 0.3 → moderate risk (-0.10)
+          - max association score > 0.7 → severe on-target liability (-0.10)
     """
     if sf is None:
         return 0.5
     s = 1.0
     if sf.hub_risk:
-        s -= 0.3
+        s -= 0.1
     if sf.is_essential:
         s -= 0.2
     if sf.family_size is not None and sf.family_size > 100:
         s -= 0.2
-    # DepMap: broad essentiality is a red flag for drug targeting
     depmap = getattr(sf, "depmap_score", None)
     if depmap is not None:
-        if depmap < -0.7:
-            s -= 0.3   # Very broadly essential — serious toxicity concern
-        elif depmap < -0.5:
-            s -= 0.15  # Broadly essential
-        elif depmap < -0.3:
-            s -= 0.05  # Moderate essentiality — small penalty
-    # GTEx: ubiquitous expression → harder to target without side effects
+        if depmap > 0.7:
+            s -= 0.3
+        elif depmap > 0.5:
+            s -= 0.15
+        elif depmap > 0.3:
+            s -= 0.05
     gtex_count = getattr(sf, "gtex_tissue_count", None)
     if gtex_count is not None:
         if gtex_count > 40:
@@ -333,6 +354,24 @@ def safety_score(sf: Optional[SafetyFlag]) -> float:
             s -= 0.1
         elif gtex_count > 15:
             s -= 0.05
+    gtex_max = getattr(sf, "gtex_max_tpm", None)
+    if gtex_max is not None:
+        if gtex_max > 1000:
+            s -= 0.15
+        elif gtex_max > 500:
+            s -= 0.08
+    # PheWAS (step 14): pleiotropic disease liability from Open Targets disease associations.
+    # phewas_hits is stored as JSON {disease_name: association_score} by annotate_genes_phewas().
+    phewas = getattr(sf, "phewas_hits", None)
+    if phewas and isinstance(phewas, dict):
+        high_conf = sum(1 for v in phewas.values() if isinstance(v, (int, float)) and v > 0.3)
+        max_assoc = max((v for v in phewas.values() if isinstance(v, (int, float))), default=0.0)
+        if high_conf >= 15:
+            s -= 0.20   # Highly pleiotropic — many disease associations
+        elif high_conf >= 5:
+            s -= 0.10   # Moderate pleiotropic risk
+        if max_assoc > 0.7:
+            s -= 0.10   # Very strong single disease association — on-target liability
     return round(max(s, 0.0), 4)
 
 
@@ -435,8 +474,11 @@ def composite_score(sub_scores: dict[str, float], weights: dict[str, float]) -> 
     This prevents Phase 2 disease/druggability weights from diluting the score
     to near-zero when those databases return no annotations (e.g. small test runs).
     """
-    # Core signals always counted even if zero (they reflect real absence of signal)
-    core_keys = {"convergence", "selection", "expression"}
+    # Core signals always counted even if zero (they reflect real absence of signal),
+    # EXCEPT expression — when expression_score=0 it typically means no data rather
+    # than a genuinely zero score, so exclude it from the denominator in that case
+    # to avoid diluting strong evolutionary signal for genes lacking expression data.
+    core_keys = {"convergence", "selection"}
     total_weight = 0.0
     weighted_sum = 0.0
     for k, w in weights.items():
@@ -493,7 +535,7 @@ def human_genetics_score_from_disease(ann: Optional[DiseaseAnnotation]) -> float
         return 0.0
     score = 0.0
     # GWAS: direct human genetic evidence
-    if ann.gwas_pvalue is not None and ann.gwas_pvalue < 5e-8:
+    if ann.gwas_pvalue is not None and 0 < ann.gwas_pvalue < 5e-8:
         score += min(-math.log10(ann.gwas_pvalue) / 15.0, 0.5)
     elif ann.gwas_pvalue is not None and ann.gwas_pvalue < 1e-5:
         score += 0.1
@@ -670,13 +712,20 @@ def _run_scoring_rank_product(tid: str) -> None:
 
         for gid in gene_ids:
             ev = ev_map.get(gid)
-            # Only use PAML branch-site p-values as the selection signal.
-            # Proxy model genes have stale/placeholder p-values from old HyPhy runs;
-            # treat them as no selection signal (pval=1.0) to avoid false positives.
+            # Accept p-values from both PAML (paml_branch_site) and HyPhy
+            # (meme, MEME_episodic, busted_ph, aBSREL) — all write dnds_pvalue.
+            # Genes with no recognised model or NULL p-value get pval=1.0 (no signal).
+            _VALID_SELECTION_MODELS = {
+                "paml_branch_site", "meme", "MEME_episodic", "busted_ph", "aBSREL",
+                # Proxy model: computed from sequence divergence when CDS is unavailable.
+                # Included so genes without CDS data are not unfairly penalised with pval=1.0.
+                "protein_divergence_proxy",
+            }
             if (
                 ev is not None
-                and ev.selection_model == "paml_branch_site"
+                and ev.selection_model in _VALID_SELECTION_MODELS
                 and ev.dnds_pvalue is not None
+                and 0.0 < ev.dnds_pvalue <= 1.0
             ):
                 pval = ev.dnds_pvalue
             else:
@@ -831,6 +880,13 @@ def _run_scoring_weighted(weights: dict, tier_thresholds: dict, tid: str) -> Non
         ann_map = {r.gene_id: r for r in session.query(DiseaseAnnotation).all()}
         dt_map  = {r.gene_id: r for r in session.query(DrugTarget).all()}
         sf_map  = {r.gene_id: r for r in session.query(SafetyFlag).all()}
+        # Structural score pre-computed by Step 9b (compute_gene_structural_score).
+        # Read from CandidateScore.structural_score written during step 9b.
+        # We use the cs_map built below to avoid a second bulk query here.
+        # If the structural weight is zero (phase1) or the column is NULL (step 9b
+        # not yet run), the score defaults to 0.0 and is excluded from the weighted
+        # composite denominator by composite_score()'s missing-data guard.
+        struct_map: dict[str, float] = {}  # populated from cs_map after it is built
         expr_map = {
             r.gene_id: (r.expression_score or 0.0)
             for r in session.query(CandidateScore).filter_by(trait_id="").all()
@@ -848,6 +904,13 @@ def _run_scoring_weighted(weights: dict, tier_thresholds: dict, tid: str) -> Non
             r.gene_id: r
             for r in session.query(CandidateScore).filter_by(trait_id=tid).all()
         }
+        # Populate struct_map from the structural_score already stored by step 9b.
+        # Defaults to 0.0 for genes where step 9b has not run or found no motifs.
+        struct_map = {
+            gid: (cs.structural_score or 0.0)
+            for gid, cs in cs_map.items()
+            if cs.structural_score is not None
+        }
 
         for gene in genes:
             ev  = ev_map.get(gene.id)
@@ -855,10 +918,34 @@ def _run_scoring_weighted(weights: dict, tier_thresholds: dict, tid: str) -> Non
             dt  = dt_map.get(gene.id)
             sf  = sf_map.get(gene.id)
 
+            # Use the same convergence signal hierarchy as phase 1 scoring:
+            # permutation p-value → convergence_weight → phylop_score (legacy fallback)
+            if ev and ev.convergence_pval is not None:
+                _phylo_w = 1.0 - ev.convergence_pval
+            elif ev and ev.convergence_weight is not None:
+                _phylo_w = ev.convergence_weight
+            else:
+                _phylo_w = ev.phylop_score if ev and ev.phylop_score else None
             conv_score_val = convergence_score(
                 ev.convergence_count if ev else 0,
-                phylo_weight=ev.phylop_score if ev and ev.phylop_score else None,
+                phylo_weight=_phylo_w,
             )
+            # Apply control-divergence penalty stored by step9b (compute_control_divergence_fractions).
+            # We read the fraction from the *existing* CandidateScore row (pre-loaded in cs_map)
+            # before overwriting it below. This ensures run_scoring() is idempotent: if the
+            # fraction was stored by step9b, the composite_score correctly reflects it every time.
+            # Without this, apply_control_divergence_penalty() modifies convergence_score but
+            # the change is overwritten the next time _run_scoring_weighted runs.
+            existing_cs = cs_map.get(gene.id)
+            if existing_cs is not None and existing_cs.control_divergence_fraction is not None:
+                frac = existing_cs.control_divergence_fraction
+                if frac > 0.5:
+                    penalty = 1.0 - 0.6 * frac
+                    conv_score_val = round(max(0.0, conv_score_val * penalty), 4)
+                    log.debug(
+                        "Control divergence penalty (frac=%.2f → ×%.2f) applied to %s: conv=%.4f",
+                        frac, penalty, gene.id, conv_score_val,
+                    )
             sel_score_val = selection_score(
                 ev.dnds_ratio if ev else None,
                 ev.dnds_pvalue if ev else None,
@@ -872,7 +959,17 @@ def _run_scoring_weighted(weights: dict, tier_thresholds: dict, tid: str) -> Non
             expr_score_val = expr_map.get(gene.id, 0.0)
             dis_score = disease_score(ann) if weights.get("disease", 0) > 0 else 0.0
             drug_score = druggability_score(dt) if weights.get("druggability", 0) > 0 else 0.0
-            safe_score = safety_score(sf) if weights.get("safety", 0) > 0 else 0.5
+            # Structural score from Step 9b: pre-computed in annotate_convergent_structural_context
+            # and stored in CandidateScore.structural_score. Defaults to 0.0 if step 9b has not
+            # run (excluded from composite_score denominator when weight > 0 but score == 0.0 by
+            # composite_score's missing-data guard for non-core signals).
+            struct_score = struct_map.get(gene.id, 0.0) if weights.get("structural", 0) > 0 else 0.0
+            # Always compute safety_score even when safety weight is 0.
+            # The score is used as a hard multiplicative floor (safety_floor in
+            # scoring_weights.json) that zeros out unsafe genes regardless of
+            # evolutionary signal.  Never fall back to 0.5 — that would bypass
+            # the floor for every gene.
+            safe_score = safety_score(sf)
             if weights.get("regulatory", 0) > 0:
                 reg_rows_gene = reg_map.get(gene.id, [])
                 if reg_rows_gene:
@@ -904,6 +1001,7 @@ def _run_scoring_weighted(weights: dict, tier_thresholds: dict, tid: str) -> Non
                 "druggability": drug_score,
                 "safety": safe_score,
                 "regulatory": reg_score,
+                "structural": struct_score,
             }
 
             comp = composite_score(sub_scores, weights)
@@ -934,6 +1032,12 @@ def _run_scoring_weighted(weights: dict, tier_thresholds: dict, tid: str) -> Non
             cs.druggability_score = drug_score
             cs.safety_score = safe_score
             cs.regulatory_score = reg_score
+            # Preserve existing structural_score from step 9b — do NOT overwrite it
+            # here.  _run_scoring_weighted merely READS the structural_score to fold
+            # it into the composite.  The authoritative value is computed by
+            # annotate_convergent_structural_context() and must not be reset to 0.
+            if weights.get("structural", 0) > 0:
+                cs.structural_score = struct_score  # reflects what actually went into composite
             cs.composite_score = comp
             cs.tier = tier
             cs.updated_at = datetime.now(timezone.utc)

@@ -10,16 +10,17 @@
     "safety":           0.00,
     "regulatory":       0.00
   },
-  "_comment_phase2": "Safety is NOT additive — it is a multiplicative floor. safety_floor=0.40 means any gene with safety_score < 0.40 is zeroed out regardless of evolutionary signal. The freed 10% weight is redistributed to evolutionary + disease layers.",
+  "_comment_phase2": "Safety is NOT additive — it is a multiplicative floor. safety_floor=0.20 means any gene with safety_score < 0.20 is zeroed out regardless of evolutionary signal. The previous floor of 0.40 was too aggressive: a gene accumulating two independent moderate safety flags (e.g. hub_risk + modest GTEx breadth) would score ~0.35 and be zeroed, losing genes with strong evolutionary signal. 0.20 only eliminates genes with genuinely severe safety profiles (e.g. broadly essential + high PheWAS liability). structural (Step 9b) weight taken from druggability (0.18→0.13) — pocket proximity and AM score overlap with druggability evidence, so joint weight is still appropriate.",
   "phase2": {
     "convergence":      0.25,
     "selection":        0.20,
     "disease":          0.22,
-    "druggability":     0.18,
+    "druggability":     0.13,
     "expression":       0.10,
     "safety":           0.00,
     "regulatory":       0.05,
-    "safety_floor":     0.40
+    "structural":       0.05,
+    "safety_floor":     0.20
   },
   "tier_thresholds": {
     "tier1": 0.70,

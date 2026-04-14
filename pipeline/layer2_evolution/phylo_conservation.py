@@ -556,16 +556,25 @@ def run_phylo_conservation(
 
     Returns count of genes with at least one phylo score written.
     """
+    # Step 3d depends on the IQ-TREE species treefile produced by Step 5.
+    # In the full pipeline the orchestrator guarantees Step 5 runs before Step 3d,
+    # but when calling run_phylo_conservation() directly (e.g. in tests) the
+    # treefile may be absent.  Fail fast with a clear message rather than silently
+    # returning 0 and leaving all scores NULL.
+    if not treefile.exists():
+        raise FileNotFoundError(
+            f"Species treefile not found at {treefile}.\n"
+            "Step 3d (phylo_conservation) requires the IQ-TREE tree from Step 5. "
+            "Run Step 5 (phylo_tree.run_iqtree) before Step 3d, or pass the "
+            "correct treefile path."
+        )
+
     tool = _detect_phylo_tool()
     if not tool:
         log.warning(
             "phyloP and phastCons not found. Phylogenetic conservation scores will be NULL. "
             "Install the PHAST package: conda install -c bioconda phast"
         )
-        return 0
-
-    if not treefile.exists():
-        log.warning("Treefile not found at %s — phylo conservation skipped.", treefile)
         return 0
 
     # Fit a neutral evolutionary model with phyloFit — required by phyloP.
@@ -593,17 +602,27 @@ def run_phylo_conservation(
             ]
 
         # Skip genes already cleanly scored — safe to resume mid-run.
-        # Exclude genes with cds_phylo_score > 30: those are parsing artefacts
-        # (misparsed WIG header coordinates) that need to be rescored.
+        #
+        # A gene is "already scored" when:
+        #   (a) At least one phylo score column is non-NULL (cds OR promoter), AND
+        #   (b) The cds score (if present) is not a WIG-header parsing artefact.
+        #       Artefacts come from phyloP WIG "start=" coordinates being misread
+        #       as scores; legitimate phyloP scores are in [-30, 30].
+        #
+        # Genes with only a promoter score (cds=NULL) are treated as done — they
+        # may have had no CDS coverage in enough species.  Genes whose cds score
+        # falls outside [-30, 30] will be rescored to overwrite the artefact.
         already_scored = {
             r[0] for r in session.query(PhyloConservationScore.gene_id)
             .filter(
+                # Condition (a): at least one region scored
                 (PhyloConservationScore.cds_phylo_score.isnot(None)) |
                 (PhyloConservationScore.promoter_phylo_score.isnot(None))
             )
             .filter(
+                # Condition (b): cds score absent (only promoter) OR in valid range
                 PhyloConservationScore.cds_phylo_score.is_(None) |
-                (PhyloConservationScore.cds_phylo_score <= 30)
+                PhyloConservationScore.cds_phylo_score.between(-30.0, 30.0)
             )
             .all()
         }

@@ -8,7 +8,7 @@ GTEx (Genotype-Tissue Expression) provides median gene expression (TPM) across
   - Maximum expression: a gene highly expressed in a critical tissue (e.g.,
     heart, brain) is higher risk.
 
-We use the GTEx v10 gene median TPM file via the GTEx API.
+We use the GTEx v10 gene median TPM file via the GTEx Portal REST API.
 
 Safety interpretation:
   - gtex_tissue_count < 5: tissue-restricted → lower toxicity risk
@@ -17,60 +17,171 @@ Safety interpretation:
   - gtex_max_tpm > 1000 in heart/brain → flag as high-risk
 
 Data source:
-  GTEx Portal REST API: https://gtexportal.org/api/v2/expression/geneExpression
-  No auth required. Respects rate limits with 0.2s delay.
+  GTEx Portal REST API v2: https://gtexportal.org/api/v2/expression/geneExpression
+  No auth required. Gene symbol query via 'geneId' parameter.
 """
 
+import json
 import logging
+import statistics
 import time
+from pathlib import Path
 from typing import Optional
 
 import requests
 
 from db.models import Gene, SafetyFlag
 from db.session import get_session
+from pipeline.config import get_local_storage_root
 
 log = logging.getLogger(__name__)
 
-GTEX_API = "https://gtexportal.org/api/v2/expression/geneExpression"
-REQUEST_TIMEOUT = 20
-TPM_THRESHOLD = 1.0   # Tissue "expressed" threshold
+GTEX_GENE_SEARCH = "https://gtexportal.org/api/v2/reference/gene"
+GTEX_EXPRESSION  = "https://gtexportal.org/api/v2/expression/geneExpression"
+REQUEST_TIMEOUT  = 20
+TPM_THRESHOLD    = 1.0   # Tissue "expressed" threshold
+
+# ---------------------------------------------------------------------------
+# Shared GTEx expression disk cache
+# ---------------------------------------------------------------------------
+# aav.py (step 13) and gtex.py (step 14b) both call fetch_gtex_expression for
+# the same gene symbols.  Caching to disk eliminates the duplicate API calls
+# (~54 HTTP requests per gene → only done once per gene per run).
+
+_GTEX_EXPR_CACHE: dict[str, Optional[dict]] = {}
+_GTEX_EXPR_CACHE_DIRTY = False
+
+
+def _gtex_cache_path() -> Path:
+    return Path(get_local_storage_root()) / "gtex_expression_cache.json"
+
+
+def _load_gtex_cache() -> None:
+    p = _gtex_cache_path()
+    if p.exists():
+        try:
+            _GTEX_EXPR_CACHE.update(json.loads(p.read_text()))
+        except Exception:
+            pass
+
+
+def _save_gtex_cache() -> None:
+    if not _GTEX_EXPR_CACHE_DIRTY:
+        return
+    p = _gtex_cache_path()
+    try:
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text(json.dumps(_GTEX_EXPR_CACHE, indent=2))
+    except Exception:
+        pass
+
+
+def _hgnc_symbol(raw: str) -> str:
+    """Convert OMA entry name (AKT1_HUMAN) to bare HGNC symbol (AKT1)."""
+    if raw and "_" in raw:
+        return raw.split("_")[0]
+    return raw or ""
+
+
+def _get_gencode_id(gene_symbol: str) -> Optional[str]:
+    """Resolve HGNC gene symbol → Gencode ENSG ID via GTEx gene search API.
+
+    GTEx expression endpoint requires a versioned gencode ID (e.g. ENSG00000142208.17).
+    We get it from the GTEx /reference/gene endpoint which accepts gene symbols.
+    """
+    try:
+        r = requests.get(
+            GTEX_GENE_SEARCH,
+            params={"geneId": gene_symbol, "pageSize": 1},
+            timeout=REQUEST_TIMEOUT,
+        )
+        if r.status_code != 200:
+            log.warning("GTEx gene search %s: HTTP %d", gene_symbol, r.status_code)
+            return None
+        data = r.json()
+        genes = data.get("data", [])
+        if not genes:
+            log.info("GTEx gene search %s: no result.", gene_symbol)
+            return None
+        return genes[0].get("gencodeId")
+    except Exception as exc:
+        log.warning("GTEx gene search %s: %s", gene_symbol, exc)
+        return None
 
 
 def fetch_gtex_expression(gene_symbol: str) -> Optional[dict]:
     """Fetch GTEx median TPM for a gene symbol across all tissues.
 
+    Results are cached to disk so step 13 (aav.py tissue tropism) and
+    step 14b (gtex.py safety breadth) share results without duplicate HTTP calls.
+
     Returns dict: {tissue_name: median_tpm} or None on failure.
+    Uses gtex_v8 (gtex_v10 returns empty for most genes in the v2 API).
+
+    Response format: list of rows, each with:
+      - 'tissueSiteDetailId': tissue name
+      - 'data': list of per-sample TPM floats (we compute median)
     """
+    if not _GTEX_EXPR_CACHE:
+        _load_gtex_cache()
+
+    key = gene_symbol.upper()
+    if key in _GTEX_EXPR_CACHE:
+        cached = _GTEX_EXPR_CACHE[key]
+        log.debug("GTEx cache hit for %s", gene_symbol)
+        return cached  # may be None (previously unsuccessful lookup)
+
+    gencode_id = _get_gencode_id(gene_symbol)
+    if not gencode_id:
+        global _GTEX_EXPR_CACHE_DIRTY
+        _GTEX_EXPR_CACHE[key] = None
+        _GTEX_EXPR_CACHE_DIRTY = True
+        _save_gtex_cache()
+        return None
+
+    result: Optional[dict] = None
     try:
         r = requests.get(
-            GTEX_API,
+            GTEX_EXPRESSION,
             params={
-                "gencodeId": gene_symbol,   # GTEx accepts symbol or ENSEMBL
-                "datasetId": "gtex_v10",
+                "gencodeId": gencode_id,
+                "datasetId": "gtex_v8",
             },
             timeout=REQUEST_TIMEOUT,
         )
         if r.status_code != 200:
-            # Try ENSEMBL-style query (GTEx prefers ENSG IDs)
-            return None
-
-        data = r.json()
-        rows = data.get("data", [])
-        result = {}
-        for row in rows:
-            tissue = row.get("tissueSiteDetailId") or row.get("tissueSiteDetail")
-            tpm = row.get("median")
-            if tissue and tpm is not None:
-                try:
-                    result[tissue] = float(tpm)
-                except ValueError:
-                    pass
-        return result if result else None
+            log.warning("GTEx expression %s (%s): HTTP %d", gene_symbol, gencode_id, r.status_code)
+        else:
+            data = r.json()
+            rows = data.get("data", [])
+            expr: dict[str, float] = {}
+            for row in rows:
+                tissue = row.get("tissueSiteDetailId") or row.get("tissueSiteDetail")
+                tpm_values = row.get("data", [])
+                # Compute median from per-sample values (GTEx v2 API returns sample-level data)
+                if tissue and tpm_values:
+                    try:
+                        median_tpm = statistics.median(tpm_values)
+                        expr[tissue] = round(float(median_tpm), 3)
+                    except (TypeError, ValueError, statistics.StatisticsError):
+                        pass
+                # Fallback: direct 'median' field (some API versions)
+                elif tissue:
+                    tpm = row.get("median")
+                    if tpm is not None:
+                        try:
+                            expr[tissue] = float(tpm)
+                        except ValueError:
+                            pass
+            result = expr if expr else None
 
     except Exception as exc:
-        log.debug("GTEx fetch failed for %s: %s", gene_symbol, exc)
-        return None
+        log.warning("GTEx expression %s: %s", gene_symbol, exc)
+
+    _GTEX_EXPR_CACHE[key] = result
+    _GTEX_EXPR_CACHE_DIRTY = True
+    _save_gtex_cache()
+    return result
 
 
 def annotate_gtex(gene_ids: Optional[list[str]] = None) -> int:
@@ -94,14 +205,18 @@ def annotate_gtex(gene_ids: Optional[list[str]] = None) -> int:
         if not gene.gene_symbol:
             continue
 
-        expr = fetch_gtex_expression(gene.gene_symbol)
+        symbol = _hgnc_symbol(gene.gene_symbol)
+        log.info("GTEx querying: %s (raw: %s)", symbol, gene.gene_symbol)
+        expr = fetch_gtex_expression(symbol)
         time.sleep(0.2)
 
         if not expr:
+            log.info("GTEx %s: no expression data found.", symbol)
             continue
 
         expressed_tissues = [t for t, tpm in expr.items() if tpm >= TPM_THRESHOLD]
         max_tpm = max(expr.values()) if expr else 0.0
+        log.info("GTEx %s: tissues=%d  max_tpm=%.1f", symbol, len(expressed_tissues), max_tpm)
 
         with get_session() as session:
             sf = session.get(SafetyFlag, gene.id)

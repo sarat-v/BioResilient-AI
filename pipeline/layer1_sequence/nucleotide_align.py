@@ -62,15 +62,22 @@ _MIN_CONVERGENT_CLUSTERS = 2
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _detect_aligner() -> str:
-    """Return the first available nucleotide aligner: blastn → minimap2 → lastz.
+    """Return the first available nucleotide aligner.
 
-    blastn is preferred for cross-species comparisons since minimap2 presets
-    are optimised for same-species or high-identity assemblies.
+    Priority order: minimap2 → blastn → lastz
+
+    minimap2 (asm5 preset) is the primary choice: it is fast, handles large
+    indels well, and performs correctly for cross-species promoter/CDS windows
+    of 1–50 kb.  blastn is the secondary fallback for environments where only
+    BLAST is installed.  lastz is kept as a last-resort legacy option.
+
+    If you need to change the preference, update both the list below and this
+    docstring so they stay in sync.
     """
-    for tool in ("blastn", "minimap2", "lastz"):
+    for tool in ("minimap2", "blastn", "lastz"):
         if shutil.which(tool):
             return tool
-    log.warning("No nucleotide aligner found (blastn/minimap2/lastz). Alignment step will be skipped.")
+    log.warning("No nucleotide aligner found (minimap2/blastn/lastz). Alignment step will be skipped.")
     return ""
 
 

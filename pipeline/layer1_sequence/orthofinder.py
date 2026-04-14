@@ -17,6 +17,11 @@ from typing import Optional
 import pandas as pd
 from Bio import SeqIO
 
+import json
+import time
+
+import requests
+
 from db.models import Gene, Ortholog
 from db.session import get_session
 from pipeline.config import get_local_storage_root, get_tool_config
@@ -24,14 +29,89 @@ from pipeline.config import get_local_storage_root, get_tool_config
 log = logging.getLogger(__name__)
 
 
+_HGNC_CACHE_PATH = Path(get_local_storage_root()) / "hgnc_symbol_cache.json" if False else None
+_HGNC_CACHE: dict[str, str] = {}
+
+
+def _load_hgnc_cache() -> None:
+    global _HGNC_CACHE_PATH
+    _HGNC_CACHE_PATH = Path(get_local_storage_root()) / "hgnc_symbol_cache.json"
+    if _HGNC_CACHE_PATH.exists():
+        try:
+            _HGNC_CACHE.update(json.loads(_HGNC_CACHE_PATH.read_text()))
+        except Exception:
+            pass
+
+
+def _save_hgnc_cache() -> None:
+    if _HGNC_CACHE_PATH is None:
+        return
+    try:
+        _HGNC_CACHE_PATH.parent.mkdir(parents=True, exist_ok=True)
+        _HGNC_CACHE_PATH.write_text(json.dumps(_HGNC_CACHE, indent=2))
+    except Exception:
+        pass
+
+
+def _resolve_hgnc_symbol(uniprot_accession: str) -> str:
+    """Resolve a UniProt accession (e.g. P04637) to an HGNC gene symbol (e.g. TP53).
+
+    Falls back to the raw accession if the API is unavailable or returns no result.
+    Results are cached on disk between pipeline runs.
+    """
+    if not _HGNC_CACHE:
+        _load_hgnc_cache()
+
+    key = uniprot_accession.split("|")[-1].strip()
+    bare = key.split("_")[0] if "_" in key else key   # AKT1_HUMAN → AKT1
+
+    if bare in _HGNC_CACHE:
+        return _HGNC_CACHE[bare]
+
+    # Skip API call for already-readable symbols (e.g. AKT1, TP53)
+    if bare.isalpha() and bare.isupper() and 2 <= len(bare) <= 12:
+        _HGNC_CACHE[bare] = bare
+        return bare
+
+    # Query UniProt REST API for the gene symbol
+    try:
+        r = requests.get(
+            "https://rest.uniprot.org/uniprotkb/search",
+            params={
+                "query": f"accession:{bare} AND reviewed:true",
+                "fields": "gene_names",
+                "format": "json",
+                "size": 1,
+            },
+            timeout=8,
+        )
+        if r.status_code == 200:
+            results = r.json().get("results", [])
+            if results:
+                names = results[0].get("genes", [])
+                if names:
+                    symbol = names[0].get("geneName", {}).get("value", bare)
+                    _HGNC_CACHE[bare] = symbol
+                    _save_hgnc_cache()
+                    return symbol
+        time.sleep(0.05)
+    except Exception as exc:
+        log.debug("HGNC symbol lookup %s: %s", bare, exc)
+
+    _HGNC_CACHE[bare] = bare
+    return bare
+
+
 def _orthofinder_output_dir(proteomes_dir: Path) -> Optional[Path]:
-    """OrthoFinder creates a dated output folder — locate the most recent one."""
-    results_dir = proteomes_dir.parent / "orthofinder_out" / "Results_*"
+    """OrthoFinder creates a dated output folder — locate the most recently modified one."""
     import glob
-    matches = sorted(glob.glob(str(results_dir)))
-    if matches:
-        return Path(matches[-1])
-    return None
+    results_dir = proteomes_dir.parent / "orthofinder_out" / "Results_*"
+    matches = glob.glob(str(results_dir))
+    if not matches:
+        return None
+    # Sort by modification time (most recent last) rather than lexicographic order
+    # to correctly handle dates like Results_Jan01 vs Results_Dec31.
+    return Path(max(matches, key=lambda p: Path(p).stat().st_mtime))
 
 
 def _prepare_orthofinder_input(proteomes_dir: Path) -> Path:
@@ -118,9 +198,26 @@ def run_orthofinder(proteomes_dir: Path) -> Path:
     ]
 
     log.info("Running OrthoFinder: %s", " ".join(cmd))
-    result = subprocess.run(cmd, capture_output=False, check=False)
+    log_file = out_dir.parent / "orthofinder_run.log"
+    log.info("OrthoFinder stdout/stderr → %s", log_file)
+    with open(log_file, "w") as lf:
+        result = subprocess.run(
+            cmd,
+            stdout=lf,
+            stderr=subprocess.STDOUT,
+            check=False,
+        )
+    # Echo the tail of the log to the pipeline logger so errors are visible
+    try:
+        tail = log_file.read_text().splitlines()[-30:]
+        for line in tail:
+            log.debug("[orthofinder] %s", line)
+    except Exception:
+        pass
     if result.returncode != 0:
-        raise RuntimeError(f"OrthoFinder exited with code {result.returncode}")
+        raise RuntimeError(
+            f"OrthoFinder exited with code {result.returncode} — see {log_file}"
+        )
 
     results_path = _orthofinder_output_dir(proteomes_dir)
     if results_path is None:
@@ -230,6 +327,7 @@ def load_orthologs_to_db(
     long_df: pd.DataFrame,
     seq_map: dict[str, dict[str, str]],
     human_gene_map: dict[str, tuple[str, str]],
+    fresh_load: bool = False,
 ) -> int:
     """Insert orthologs into the database using bulk operations.
 
@@ -237,10 +335,21 @@ def load_orthologs_to_db(
         long_df: Output from parse_orthogroups().
         seq_map: Protein sequences per species.
         human_gene_map: {protein_id: (gene_id, gene_symbol)} for human proteins.
+        fresh_load: If True, truncate Gene and Ortholog tables before loading.
+                    Use when rerunning OrthoFinder from scratch on a new set of
+                    species — otherwise stale rows from prior runs accumulate.
 
     Returns:
         Number of rows inserted.
     """
+    if fresh_load:
+        with get_session() as session:
+            log.warning("fresh_load=True: truncating Gene and Ortholog tables before reload.")
+            session.query(Ortholog).delete()
+            session.query(Gene).delete()
+            session.commit()
+        log.info("Gene and Ortholog tables cleared.")
+
     with get_session() as session:
         existing_gene_ids = {g.id for g in session.query(Gene.id).all()}
         existing_orthologs = {
@@ -262,11 +371,17 @@ def load_orthologs_to_db(
 
         gene_db_id, gene_symbol = human_gene_map[human_protein_id]
 
+        # Resolve UniProt accession to HGNC gene symbol (e.g. P04637 → TP53).
+        # human_gene_map usually stores the OrthoFinder entry name (AKT1_HUMAN) or
+        # the bare UniProt accession. Convert to a human-readable HGNC symbol so
+        # Gene.gene_symbol is useful in the UI and scoring reports.
+        hgnc_symbol = _resolve_hgnc_symbol(gene_symbol or gene_db_id)
+
         if gene_db_id not in existing_gene_ids:
             genes_to_add.append(Gene(
                 id=gene_db_id,
                 human_gene_id=human_protein_id,
-                gene_symbol=gene_symbol,
+                gene_symbol=hgnc_symbol,
                 human_protein=human_protein_id,
             ))
             existing_gene_ids.add(gene_db_id)

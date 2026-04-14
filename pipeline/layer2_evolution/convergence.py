@@ -100,7 +100,7 @@ LINEAGE_DIVERGENCE_MY: dict[tuple[str, str], float] = {
     ("Salamanders",  "Cnidarians"):   800,
     ("Fishes",       "Cnidarians"):   800,
     ("Sharks",       "Cnidarians"):   750,
-    ("Molluscs",     "Cnidarians"):   100,
+    ("Molluscs",     "Cnidarians"):   750,  # ~750 MY (Bilateria divergence), not 100
     # ── Within Boreoeutheria: birds split from mammals at amniote root ─────
     ("Birds",        "Proboscideans"):310,
 }
@@ -111,6 +111,9 @@ _SPECIES_TREE_CACHE: Optional[object] = None   # lazy-loaded ete3 tree
 def _load_species_tree() -> Optional[object]:
     """Load the IQ-TREE species tree (step 5 output) for phylogenetic distance queries.
 
+    Uses get_species_treefile() from phylo_tree so the trusted-tree override
+    (use_fixed_tree: true in environment.yml) is respected here too.
+
     Returns an ete3 Tree object, or None if the tree file doesn't exist or ete3
     is not installed (falls back to LINEAGE_DIVERGENCE_MY table).
     """
@@ -118,8 +121,15 @@ def _load_species_tree() -> Optional[object]:
     if _SPECIES_TREE_CACHE is not None:
         return _SPECIES_TREE_CACHE
 
-    tree_path = Path(get_local_storage_root()) / "phylo" / "species.treefile"
-    if not tree_path.exists():
+    # Delegate path resolution to phylo_tree so use_fixed_tree / trusted tree
+    # preferences are honoured and the hardcoded path is not duplicated.
+    from pipeline.layer2_evolution.phylo_tree import get_species_treefile
+    tree_path = get_species_treefile()
+    if tree_path is None or not tree_path.exists():
+        log.debug(
+            "_load_species_tree: no species treefile found via get_species_treefile() "
+            "— falling back to LINEAGE_DIVERGENCE_MY table for convergence weighting."
+        )
         return None
     try:
         from ete3 import Tree  # type: ignore
@@ -172,7 +182,7 @@ def phylogenetic_convergence_weight(lineages: list[str]) -> float:
     if not non_primate:
         return 0.0
     if len(non_primate) == 1:
-        return 1.0  # single lineage, no pairwise distances
+        return 0.0  # single lineage — not convergence, no evolutionary weight
 
     # Compute all pairwise distances
     distances = []

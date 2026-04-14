@@ -312,15 +312,46 @@ def _find_gene_coords(gene_symbol: str, protein_id: str, gff_index: dict[str, di
 # Sequence extraction
 # ─────────────────────────────────────────────────────────────────────────────
 
-def _load_genome_index(fa_path: Path) -> dict[str, Seq]:
-    """Load a gzipped genomic FASTA into a dict: chrom → Seq.
+def _load_genome_index(fa_path: Path):
+    """Return an indexed genome object for on-demand random-access sequence extraction.
 
-    Large genomes are memory-expensive; we stream-parse and keep only the
-    sequences needed. For the first call we build and pickle an index of
-    chrom → (offset, length) for selective extraction, but for simplicity
-    we load the full genome here (manageable at ≤3 GB for most assemblies).
+    Uses pyfaidx when available — it builds a .fai index file on first open
+    and then reads only the requested byte ranges, keeping memory usage near-zero
+    regardless of genome size (e.g. 3 GB human genome → <5 MB RAM).
+
+    Falls back to loading the full genome into a dict[str, Seq] when pyfaidx is
+    not installed (legacy behaviour, safe for small genomes ≤500 MB).
+
+    For gzipped FASTAs, pyfaidx requires a bgzip-compressed file with a .gzi index.
+    If the .fai is missing for a gzipped FASTA, we decompress to a temp plain FASTA.
     """
-    log.info("    Loading genome index from %s...", fa_path.name)
+    # ── pyfaidx path (preferred) ────────────────────────────────────────────
+    try:
+        import pyfaidx
+
+        # pyfaidx can open plain .fa; for .gz it needs bgzip + .gzi
+        if fa_path.suffix == ".gz":
+            fa_plain = fa_path.with_suffix("")  # strip .gz → .fa
+            if not fa_plain.exists():
+                log.info("    Decompressing %s for pyfaidx indexing...", fa_path.name)
+                import gzip as _gz
+                with _gz.open(fa_path, "rb") as src, open(fa_plain, "wb") as dst:
+                    dst.write(src.read())
+            faidx_path = fa_plain
+        else:
+            faidx_path = fa_path
+
+        log.info("    Opening genome index (pyfaidx) for %s", faidx_path.name)
+        return pyfaidx.Fasta(str(faidx_path), one_based_attributes=False)
+
+    except ImportError:
+        log.debug("pyfaidx not installed — loading full genome into memory (install "
+                  "pyfaidx to avoid OOM on large genomes)")
+    except Exception as exc:
+        log.debug("pyfaidx failed for %s: %s — falling back to full load", fa_path.name, exc)
+
+    # ── Legacy fallback: load full genome dict ──────────────────────────────
+    log.info("    Loading genome into memory from %s...", fa_path.name)
     opener = gzip.open if fa_path.suffix == ".gz" else open
     seqs: dict[str, Seq] = {}
     with opener(fa_path, "rt") as fh:
@@ -330,12 +361,30 @@ def _load_genome_index(fa_path: Path) -> dict[str, Seq]:
     return seqs
 
 
-def _extract_window(genome: dict[str, Seq], chrom: str, start: int, end: int) -> Optional[str]:
-    """Extract a sequence window (1-indexed inclusive) from the genome dict."""
+def _extract_window(genome, chrom: str, start: int, end: int) -> Optional[str]:
+    """Extract a sequence window (1-indexed inclusive) from a genome object.
+
+    Accepts either a pyfaidx.Fasta handle (memory-efficient random access) or
+    the legacy dict[str, Seq] (full-genome in RAM).
+    """
+    # pyfaidx.Fasta supports key lookup; use 0-indexed slice
+    try:
+        import pyfaidx
+        if isinstance(genome, pyfaidx.Fasta):
+            if chrom not in genome:
+                return None
+            s = max(0, start - 1)
+            e = min(len(genome[chrom]), end)
+            if s >= e:
+                return None
+            return str(genome[chrom][s:e])
+    except ImportError:
+        pass
+
+    # Legacy dict path
     seq = genome.get(chrom)
     if seq is None:
         return None
-    # Convert to 0-indexed Python slice
     s = max(0, start - 1)
     e = min(len(seq), end)
     if s >= e:
