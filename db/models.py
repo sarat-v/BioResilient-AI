@@ -256,6 +256,7 @@ class DiseaseAnnotation(Base):
     gnomad_loeuf = Column(Float, nullable=True)         # gnomAD v4 LOEUF (< 0.6 = LoF intolerant)
     known_drug_name = Column(String, nullable=True)     # Best-phase known drug targeting this gene
     known_drug_phase = Column(Integer, nullable=True)   # Max clinical trial phase (4 = approved)
+    known_drug_indication_ids = Column(JSON, nullable=True)  # EFO/MONDO disease IDs the best-phase drug is indicated for
     ot_safety_liability = Column(String, nullable=True) # Comma-separated safety event labels from OT
 
     gene = relationship("Gene", back_populates="disease_annotation")

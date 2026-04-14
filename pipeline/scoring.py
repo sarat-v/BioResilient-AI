@@ -196,15 +196,27 @@ def expression_score_from_db(gene_id: str, session) -> float:
     return cs.expression_score or 0.0
 
 
-def disease_score(ann: Optional[DiseaseAnnotation]) -> float:
+def disease_score(
+    ann: Optional[DiseaseAnnotation],
+    phenotype_disease_ids: Optional[set[str]] = None,
+) -> float:
     """Score in [0, 1] from OpenTargets, GWAS, gnomAD, known drugs, protective variants.
 
     Scoring breakdown (max 1.0):
       0.30  OpenTargets association score — disease relevance breadth
       0.20  GWAS p-value                 — human genetic evidence
       0.15  gnomAD pLI or LOEUF          — LoF intolerance (functional importance)
-      0.20  known drug phase             — clinical validation (0=none → 4=approved)
+      0.20  known drug phase             — clinical validation (phenotype-aware):
+              Full credit (0.20) if the drug's indication overlaps with the target phenotype
+              Partial credit (0.08) if the drug demonstrates tractability but for a different disease
+              No credit (0.00) if phase is unknown
       0.15  protective variant           — PCSK9-paradigm human validation
+
+    phenotype_disease_ids: EFO/MONDO IDs for the current phenotype from
+        functional_evidence_config.json. When provided, drug phase credit is
+        conditional on indication overlap to avoid rewarding pharmaceutical attention
+        for off-phenotype drugs (e.g. a Phase 4 statin should not boost a
+        cancer_resistance run).
     """
     if ann is None:
         return 0.0
@@ -228,10 +240,34 @@ def disease_score(ann: Optional[DiseaseAnnotation]) -> float:
     elif pli is not None:
         s += min(pli, 1.0) * 0.15
 
-    # Known drug clinical phase (approved drug = strongest validation)
+    # Known drug phase — phenotype-aware credit
+    # Full credit: drug is approved/studied for an indication that matches the
+    #   current phenotype's disease ontology IDs → confirms clinical relevance.
+    # Partial credit: drug exists (target is tractable) but indication is off-phenotype
+    #   → confirms the gene can be modulated, but not for this phenotype.
     known_phase = getattr(ann, "known_drug_phase", None)
     if known_phase is not None and known_phase > 0:
-        s += min(known_phase / 4.0, 1.0) * 0.20  # phase 4 (approved) = full 0.20
+        indication_ids: list = getattr(ann, "known_drug_indication_ids", None) or []
+        phase_fraction = min(known_phase / 4.0, 1.0)
+        if phenotype_disease_ids and indication_ids:
+            # Normalise OT ID format: "EFO_0000311" ↔ "EFO:0000311"
+            normalised_indications = {
+                i.replace("_", ":").upper() for i in indication_ids
+            }
+            normalised_phenotype = {
+                i.replace("_", ":").upper() for i in phenotype_disease_ids
+            }
+            if normalised_indications & normalised_phenotype:
+                # Drug is relevant to this phenotype → full clinical validation credit
+                s += phase_fraction * 0.20
+            else:
+                # Drug is tractability evidence only — gene can be modulated, but
+                # indication is off-phenotype. Reduced credit (0.08 max).
+                s += phase_fraction * 0.08
+        else:
+            # No indication data stored yet (old pipeline runs) or no phenotype context
+            # provided — fall back to full credit to avoid penalising existing results.
+            s += phase_fraction * 0.20
 
     # Rare protective variant (PCSK9 paradigm) — binary bonus
     pv_count = ann.protective_variant_count
@@ -869,8 +905,34 @@ def _run_scoring_rank_product(tid: str) -> None:
         log.info("  %s: %d genes", tier_name, tier_counts[tier_name])
 
 
+def _load_phenotype_disease_ids(trait_id: str) -> set[str]:
+    """Return the set of EFO/MONDO disease IDs for this phenotype from functional_evidence_config.json.
+
+    Used by disease_score() to decide whether a known drug's indication matches the
+    current phenotype, avoiding credit for off-phenotype pharmaceutical attention.
+    Returns an empty set when the config is missing or the trait is not listed.
+    """
+    import json as _json
+    from pathlib import Path as _Path
+    cfg_path = _Path(__file__).parent.parent / "config" / "functional_evidence_config.json"
+    try:
+        with open(cfg_path) as f:
+            cfg = _json.load(f)
+        ot_cfg = cfg.get(trait_id, {}).get("opentargets", {})
+        return set(ot_cfg.get("disease_ids", []))
+    except Exception:
+        return set()
+
+
 def _run_scoring_weighted(weights: dict, tier_thresholds: dict, tid: str) -> None:
     """Phase 2+ weighted composite scoring (original method)."""
+
+    # Load phenotype disease IDs once for phenotype-aware drug phase credit in disease_score().
+    phenotype_disease_ids = _load_phenotype_disease_ids(tid) if tid else set()
+    if phenotype_disease_ids:
+        log.info("disease_score: phenotype-aware drug credit enabled (%d IDs for %r)", len(phenotype_disease_ids), tid)
+    else:
+        log.info("disease_score: no phenotype disease IDs found for %r — drug credit is phenotype-neutral", tid)
 
     with get_session() as session:
         genes = session.query(Gene).all()
@@ -957,7 +1019,7 @@ def _run_scoring_weighted(weights: dict, tier_thresholds: dict, tid: str) -> Non
                 selection_model=ev.selection_model if ev else None,
             )
             expr_score_val = expr_map.get(gene.id, 0.0)
-            dis_score = disease_score(ann) if weights.get("disease", 0) > 0 else 0.0
+            dis_score = disease_score(ann, phenotype_disease_ids=phenotype_disease_ids or None) if weights.get("disease", 0) > 0 else 0.0
             drug_score = druggability_score(dt) if weights.get("druggability", 0) > 0 else 0.0
             # Structural score from Step 9b: pre-computed in annotate_convergent_structural_context
             # and stored in CandidateScore.structural_score. Defaults to 0.0 if step 9b has not
