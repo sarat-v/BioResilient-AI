@@ -50,27 +50,38 @@ STEP_LABELS = {
     "step4c":  "ESM-1v structural variant effect scoring",
     "step4d":  "Variant direction inference (GoF / LoF / neutral)",
     "step5":   "Build phylogenetic tree",
-    "step6":   "Evolutionary selection (HyPhy MEME)",
+    "step6":   "PAML branch-site positive selection",
     "step6b":  "FEL + BUSTED supplementary selection tests",
     "step6c":  "RELAX branch-specific rate acceleration",
     "step7":   "Convergence & conservation scoring",
     "step7b":  "True convergent amino acid substitution detection",
     "step8":   "Functional evidence (Open Targets + GTEx + DepMap)",
-    "step8b":  "Functional evidence supplement (pass-through)",
     "step9":   "Compute composite scores",
+    "step9b":  "Structural context annotation (AlphaFold + fpocket + AlphaMissense + UniProt)",
     "step10":  "API ready",
     "step10b": "Regulatory divergence (AlphaGenome)",
     "step11":  "Disease annotation",
     "step11b": "Rare protective variant mapping (gnomAD)",
-    "step11c": "Literature validation sanity check (PubMed)",
+    "step11c": "Semantic literature scoring (PubMed)",
     "step11d": "Pathway-level convergence enrichment",
     "step12":  "Druggability assessment",
     "step12b": "P2Rank ML pocket prediction",
     "step13":  "Gene therapy feasibility",
     "step14":  "Safety pre-screen",
     "step14b": "DepMap essentiality + GTEx expression breadth",
-    "step15":  "Final rescore",
-    "step16":  "Pipeline complete",
+    "step15":  "Final rescore (Phase 2 composite)",
+    "step16":  "Translational status lookup",
+    "step17":  "Preclinical readiness scoring",
+    "step18":  "Target dossier generation",
+    # Phase 3 — Lead Discovery
+    "step19":  "Virtual screening (DiffDock/Vina + ZINC)",
+    "step20":  "Ligand similarity search (ChEMBL + ZINC analogs)",
+    "step21":  "Hit ranking (docking + purchasability + novelty)",
+    # Phase 4 — Lead Optimization
+    "step22":  "ADMET prediction (Lipinski, LogP, BBB, CYP3A4)",
+    "step23":  "Toxicity screening (Tox21 + hERG liability)",
+    "step24":  "Selectivity check (off-target fingerprint panel)",
+    "step25":  "Synthesizability (SA Score + ZINC purchasability)",
 }
 
 
@@ -115,7 +126,8 @@ def _mark_step(state: dict, step_name: str, status: str, elapsed: float | None =
                 run = session.get(PipelineRun, run_id)
                 if run:
                     run.step_statuses = state.get("steps", {})
-                    run.status = "running"
+                    # Use the actual pipeline-level status, not always "running"
+                    run.status = state.get("status", status)
                     session.commit()
         except Exception as exc:
             log.warning("Could not update PipelineRun %s in DB: %s", run_id, exc)
@@ -173,6 +185,11 @@ def step1_validate_environment() -> None:
         ("iqtree2",     ["iqtree2", "iqtree"]),
         ("hyphy",       ["hyphy", "HYPHYMP"]),
         ("diamond",     ["diamond"]),
+        # PAML codeml — required for step 6 branch-site positive selection
+        ("codeml",      ["codeml"]),
+        # PHAST suite — required for step 3d phylogenetic conservation
+        ("phyloFit",    ["phyloFit", "phylofit"]),
+        ("phyloP",      ["phyloP", "phylop"]),
     ]
     missing = []
     for name, binaries in tools:
@@ -517,33 +534,39 @@ def step6_evolutionary_selection(
     treefile: Path,
     dry_run: bool = False,
 ) -> None:
-    """Run MEME episodic selection analysis on candidate orthogroups.
+    """Run PAML branch-site model A positive selection analysis on candidate orthogroups.
 
-    Tries codon-guided HyPhy MEME first (statistically rigorous episodic
-    selection). Falls back to protein divergence proxy for any orthogroup
-    where CDS fetching fails (e.g. UniProt accessions without NCBI CDS links).
+    Uses PAML codeml (Yang & Nielsen 2002 / Zhang et al. 2005) which directly
+    tests for positive selection on cancer-resistant foreground lineages via an
+    LRT (H0: ω fixed at 1 vs H1: ω free in foreground).  This is statistically
+    more rigorous than MEME for phenotype-specific branch analysis.
+
+    Falls back to a null result (pval=1.0, no selection) for any orthogroup
+    where CDS codon alignment cannot be constructed.
     """
-    log.info("Step 6: Running MEME episodic selection analysis...")
+    log.info("Step 6: Running PAML branch-site positive selection analysis...")
     if dry_run:
         return
 
-    from pipeline.layer2_evolution.meme_selection import run_meme_pipeline
+    from pipeline.layer2_evolution.paml_selection import run_paml_pipeline
     from pipeline.layer2_evolution.selection import build_gene_og_map, load_selection_scores
 
     gene_by_og = build_gene_og_map()
 
-    # Skip OGs already written to DB — safe to resume mid-run
+    # Skip OGs already scored with PAML — safe to resume mid-run
     from db.models import EvolutionScore
     from db.session import get_session
     with get_session() as session:
         already_scored_genes = {
             r[0] for r in session.query(EvolutionScore.gene_id)
+            .filter(EvolutionScore.selection_model == "paml_branch_site")
             .filter(EvolutionScore.dnds_ratio.isnot(None))
             .all()
         }
-    already_scored_ogs = {og for og, gid in gene_by_og.items() if gid in already_scored_genes}
+    already_scored_ogs = {og for og, gids in gene_by_og.items()
+                          if any(g in already_scored_genes for g in gids)}
     if already_scored_ogs:
-        log.info("Skipping %d already-scored orthogroups; resuming from checkpoint.",
+        log.info("Skipping %d already PAML-scored orthogroups; resuming from checkpoint.",
                  len(already_scored_ogs))
         aligned_orthogroups = {k: v for k, v in aligned_orthogroups.items()
                                 if k not in already_scored_ogs}
@@ -552,7 +575,7 @@ def step6_evolutionary_selection(
     def _flush(batch: dict[str, dict]) -> None:
         load_selection_scores(batch, gene_by_og)
 
-    selection_results = run_meme_pipeline(
+    selection_results = run_paml_pipeline(
         aligned_orthogroups, motifs_by_og, treefile, flush_callback=_flush
     )
     if selection_results:
@@ -766,10 +789,9 @@ def step8_functional_evidence(phenotype: str = "cancer_resistance", dry_run: boo
 
 
 # Keep old name as alias for backward compatibility with any direct callers.
-def step8_expression(species_list: list[dict], dry_run: bool = False) -> None:
-    """Deprecated: delegates to step8_functional_evidence."""
-    phenotype = "cancer_resistance"
-    step8_functional_evidence(phenotype=phenotype, dry_run=dry_run)
+def step8_expression(species_list: list[dict], dry_run: bool = False, trait_id: str = "") -> None:
+    """Deprecated: delegates to step8_functional_evidence. Use --phenotype to set trait."""
+    step8_functional_evidence(phenotype=trait_id or "cancer_resistance", dry_run=dry_run)
 
 
 def step8b_bgee(dry_run: bool = False) -> None:
@@ -777,14 +799,14 @@ def step8b_bgee(dry_run: bool = False) -> None:
     log.info("Step 8b: Skipping — functional evidence is now unified in step 8.")
 
 
-def step9_composite_score(dry_run: bool = False) -> None:
+def step9_composite_score(dry_run: bool = False, trait_id: str = "") -> None:
     """Assemble composite scores and assign tiers."""
-    log.info("Step 9: Assembling composite scores...")
+    log.info("Step 9: Assembling composite scores (trait_id=%r)...", trait_id)
     if dry_run:
         return
 
     from pipeline.scoring import get_top_candidates, run_scoring
-    run_scoring(phase="phase1")
+    run_scoring(phase="phase1", trait_id=trait_id or None)
 
     top = get_top_candidates(n=10)
     log.info("  Top 10 candidates:")
@@ -798,6 +820,35 @@ def step10_start_api(dry_run: bool = False) -> None:
     log.info("Step 10: API ready. Start with: uvicorn api.main:app --host 0.0.0.0 --port 8000")
     if dry_run:
         return
+
+
+def step9b_structural_annotation(dry_run: bool = False) -> None:
+    """Step 9b: Structural context annotation for convergent motif regions.
+
+    For each Tier1/Tier2 gene, this step:
+      1. Downloads the AlphaFold PDB (if not already cached).
+      2. Runs fpocket to identify the top-ranked druggable pocket (if not already done).
+      3. Fetches UniProt functional site annotations (active site, binding site, PTM).
+      4. Scores each convergent motif (convergent_aa_count >= 3) with:
+         — AlphaMissense pathogenicity for the specific convergent substitution.
+         — Mean pLDDT across the motif residues (AlphaFold confidence).
+         — 3D Euclidean distance from motif Cα centroid to top fpocket centroid.
+      5. Classifies each motif region's structural context.
+      6. Stores results in ConvergentPositionAnnotation.
+      7. Writes per-gene structural_score to CandidateScore.
+
+    The structural_score is picked up by run_scoring(phase='phase2') in step15.
+    This step MUST run after step9 (tiers assigned) and before step15 (final rescore).
+    """
+    log.info("Step 9b: Structural context annotation for convergent motif regions...")
+    if dry_run:
+        return
+
+    from pipeline.layer1_sequence.structural_context import (
+        annotate_convergent_structural_context,
+    )
+    n = annotate_convergent_structural_context()
+    log.info("  Step 9b: %d genes annotated with structural context.", n)
 
 
 def step10b_alphagenome(dry_run: bool = False) -> None:
@@ -819,32 +870,20 @@ def step10b_alphagenome(dry_run: bool = False) -> None:
 def _get_tier12_gene_ids(trait_id: str = "") -> list[str]:
     """Return gene IDs for Tier1 and Tier2 candidates (for funnel gating of Phase 2 layers).
 
-    Phase 1 stores CandidateScore rows with trait_id='' (empty string).
-    If no rows match the requested trait_id, fall back to trait_id='' so that
-    Phase 2 steps always see the scored genes regardless of how Phase 1 was run.
+    Phase 1 stores CandidateScore rows with trait_id='' (empty string), regardless
+    of the --phenotype flag. We always query without a trait_id filter to ensure
+    Phase 2 steps always receive the full scored gene list.
     """
     from db.models import CandidateScore
     from db.session import get_session
     with get_session() as session:
-        q = session.query(CandidateScore.gene_id).filter(
-            CandidateScore.tier.in_(["Tier1", "Tier2"])
+        rows = (
+            session.query(CandidateScore.gene_id)
+            .filter(CandidateScore.tier.in_(["Tier1", "Tier2"]))
+            .distinct()  # prevent duplicate gene_ids when same gene has Tier1 rows for multiple trait_ids
+            .all()
         )
-        if trait_id:
-            q = q.filter(CandidateScore.trait_id == trait_id)
-        rows = q.all()
-        if not rows and trait_id:
-            # Phase 1 may have stored scores with empty trait_id — fall back
-            log.info(
-                "_get_tier12_gene_ids: no rows for trait_id=%r, falling back to trait_id=''", trait_id
-            )
-            rows = (
-                session.query(CandidateScore.gene_id)
-                .filter(
-                    CandidateScore.tier.in_(["Tier1", "Tier2"]),
-                    CandidateScore.trait_id == "",
-                )
-                .all()
-            )
+    log.info("_get_tier12_gene_ids: %d Tier1/Tier2 genes found", len(rows))
     return [r[0] for r in rows]
 
 
@@ -885,7 +924,7 @@ def step11_disease_annotation(dry_run: bool = False, trait_id: str = "") -> None
             except Exception as exc:
                 log.warning("  %s annotation failed (non-fatal, continuing): %s", name, exc)
 
-    # Pathways enrichment runs after OpenTargets completes (uses disease IDs)
+    # Pathways enrichment runs after OpenTargets completes (independent — uses UniProt, not OT disease IDs)
     try:
         n_pathways = pathways.annotate_genes_pathways(gene_ids)
         log.info("  Pathways/GO annotated for %d genes.", n_pathways)
@@ -917,7 +956,7 @@ def step11c_literature(dry_run: bool = False, trait_id: str = "") -> None:
         log.warning("  No Tier1/Tier2 candidates; skipping literature check.")
         return
     from pipeline.layer3_disease.literature import run_literature_pipeline
-    n = run_literature_pipeline(gene_ids)
+    n = run_literature_pipeline(gene_ids, trait_id=trait_id)
     log.info("  Literature: %d genes with citations in resilience literature.", n)
 
 
@@ -943,7 +982,22 @@ def step12_druggability(dry_run: bool = False, trait_id: str = "") -> None:
     pockets.annotate_pockets(gene_to_pdb)
     chembl.annotate_genes_chembl(gene_ids)
     cansar.annotate_genes_cansar(gene_ids)
-    peptide.annotate_motifs_peptide(None)
+    # Scope peptide annotation to motifs belonging to Tier1/Tier2 genes only
+    from db.models import DivergentMotif, Ortholog
+    from db.session import get_session as _gss
+    from sqlalchemy import text as _txt
+    with _gss() as _s:
+        motif_ids = [
+            str(r[0]) for r in _s.execute(
+                _txt("""
+                    SELECT dm.id FROM divergent_motif dm
+                    JOIN ortholog o ON o.id = dm.ortholog_id
+                    WHERE o.gene_id = ANY(:gids)
+                """),
+                {"gids": gene_ids},
+            )
+        ]
+    peptide.annotate_motifs_peptide(motif_ids if motif_ids else None)
 
 
 def step12b_p2rank(dry_run: bool = False, trait_id: str = "") -> None:
@@ -962,23 +1016,49 @@ def step12b_p2rank(dry_run: bool = False, trait_id: str = "") -> None:
 
 
 def step13_gene_therapy(dry_run: bool = False, trait_id: str = "") -> None:
-    """Layer 5: AAV + CRISPR (Tier1 only)."""
+    """Layer 5: AAV + CRISPR (Tier1 only).
+
+    Phase 1 stores CandidateScore rows with trait_id='' so we query without
+    a trait_id filter, matching the same pattern as _get_tier12_gene_ids.
+    """
     log.info("Step 13: Gene therapy (Layer 5)...")
     if dry_run:
         return
     from db.models import CandidateScore
     from db.session import get_session
     with get_session() as session:
-        q = session.query(CandidateScore.gene_id).filter(CandidateScore.tier == "Tier1")
-        if trait_id:
-            q = q.filter(CandidateScore.trait_id == trait_id)
-        tier1 = q.all()
+        tier1 = (
+            session.query(CandidateScore.gene_id)
+            .filter(CandidateScore.tier == "Tier1")
+            .distinct()  # prevent duplicates when same gene is Tier1 for multiple trait_ids
+            .all()
+        )
     gene_ids = [r[0] for r in tier1]
+    log.info("Step 13: %d Tier1 genes found", len(gene_ids))
     if not gene_ids:
+        log.warning("Step 13: no Tier1 genes found — skipping.")
         return
     from pipeline.layer5_gene_therapy import aav, crispr
+    from pipeline.config import get_local_storage_root as _get_storage_root
+    from pathlib import Path as _Path
+
     aav.annotate_genes_aav(gene_ids)
-    crispr.annotate_genes_crispr(gene_ids)
+
+    # Provide CDS sequences from the PAML/MEME disk cache so CRISPR scoring
+    # can compute guide efficiency and off-target risk.
+    cds_root = _Path(_get_storage_root()) / "cds"
+    def _cds_provider(gene_id: str) -> str:
+        from pipeline.layer2_evolution.meme_selection import fetch_cds_for_protein
+        from db.models import Gene as _Gene
+        from db.session import get_session as _gs
+        with _gs() as _s:
+            gene = _s.get(_Gene, gene_id)
+            if not gene or not gene.human_protein:
+                return ""
+        seq = fetch_cds_for_protein(gene.human_protein)
+        return seq or ""
+
+    crispr.annotate_genes_crispr(gene_ids, sequence_provider=_cds_provider)
 
 
 def step14_safety(dry_run: bool = False, trait_id: str = "") -> None:
@@ -1011,21 +1091,26 @@ def step14b_depmap_gtex(dry_run: bool = False, trait_id: str = "") -> None:
     log.info("  GTEx: %d genes annotated.", n_gtex)
 
 
-def step15_rescore(dry_run: bool = False) -> None:
+def step15_rescore(dry_run: bool = False, trait_id: str = "") -> None:
     """Re-run composite scoring with Phase 2 weights, then apply control species penalty."""
-    log.info("Step 15: Rescore (phase2 weights) + control divergence penalty...")
+    log.info("Step 15: Rescore (phase2 weights) + control divergence penalty (trait_id=%r)...", trait_id)
     if dry_run:
         return
-    from pipeline.scoring import get_top_candidates, run_scoring
-    run_scoring(phase="phase2")
-
     from pipeline.layer2_evolution.convergence import (
         apply_control_divergence_penalty,
         compute_control_divergence_fractions,
     )
+    from pipeline.scoring import get_top_candidates, run_scoring
+
+    # Store control-divergence fractions BEFORE run_scoring so that _run_scoring_weighted
+    # can read them from CandidateScore.control_divergence_fraction and fold the penalty
+    # directly into the composite_score and tier assignment.  Previously fractions were
+    # applied after run_scoring, meaning composite_score was never updated.
     fractions = compute_control_divergence_fractions()
     if fractions:
         apply_control_divergence_penalty(fractions)
+
+    run_scoring(phase="phase2", trait_id=trait_id or None)
 
     top = get_top_candidates(n=10)
     for i, c in enumerate(top, 1):
@@ -1033,11 +1118,122 @@ def step15_rescore(dry_run: bool = False) -> None:
                  i, c["gene_symbol"], c["composite_score"], c["tier"])
 
 
-def step16_start_api(dry_run: bool = False) -> None:
-    """Pipeline complete; API can be started separately."""
-    log.info("Step 16: Pipeline complete. Start API: uvicorn api.main:app --host 0.0.0.0 --port 8000")
+def step16_translational(dry_run: bool = False, trait_id: str = "") -> None:
+    """Step 16: ClinicalTrials.gov + ChEMBL translational status lookup."""
+    from layer7_translational.clinicaltrials import run_translational_pipeline
+    log.info("Step 16: Translational status lookup (ClinicalTrials + ChEMBL)")
     if dry_run:
         return
+    gene_ids = _get_tier12_gene_ids(trait_id)
+    run_translational_pipeline(gene_ids)
+
+
+def step17_preclinical_readiness(dry_run: bool = False, trait_id: str = "") -> None:
+    """Step 17: Preclinical readiness scoring."""
+    from layer7_translational.preclinical_readiness import run_preclinical_pipeline
+    log.info("Step 17: Preclinical readiness scoring")
+    if dry_run:
+        return
+    gene_ids = _get_tier12_gene_ids(trait_id)
+    run_preclinical_pipeline(gene_ids)
+
+
+def step18_dossier(dry_run: bool = False, trait_id: str = "") -> None:
+    """Step 18: Target dossier generation (Markdown per gene)."""
+    from layer7_translational.dossier import run_dossier_pipeline
+    log.info("Step 18: Target dossier generation")
+    if dry_run:
+        return
+    gene_ids = _get_tier12_gene_ids(trait_id)
+    written = run_dossier_pipeline(gene_ids, phenotype=trait_id)
+    log.info("Step 18 complete: %d dossiers written.", written)
+
+
+# ---------------------------------------------------------------------------
+# Phase 3 — Lead Discovery (Steps 19–21)
+# ---------------------------------------------------------------------------
+
+
+def step19_virtual_screening(dry_run: bool = False, trait_id: str = "") -> None:
+    """Step 19: Virtual screening — DiffDock / Vina / estimated docking on ZINC compounds."""
+    from layer8_lead_discovery.virtual_screening import run_virtual_screening
+    log.info("Step 19: Virtual screening")
+    if dry_run:
+        return
+    gene_ids = _get_tier12_gene_ids(trait_id)
+    stored = run_virtual_screening(gene_ids)
+    log.info("Step 19 complete: %d compound poses stored.", stored)
+
+
+def step20_ligand_search(dry_run: bool = False, trait_id: str = "") -> None:
+    """Step 20: Ligand similarity search — ChEMBL + ZINC analogs of known binders."""
+    from layer8_lead_discovery.ligand_search import run_ligand_search
+    log.info("Step 20: Ligand similarity search")
+    if dry_run:
+        return
+    gene_ids = _get_tier12_gene_ids(trait_id)
+    stored = run_ligand_search(gene_ids)
+    log.info("Step 20 complete: %d analogs stored.", stored)
+
+
+def step21_hit_ranking(dry_run: bool = False, trait_id: str = "") -> None:
+    """Step 21: Hit ranking — docking score + purchasability + novelty."""
+    from layer8_lead_discovery.hit_ranking import rank_hits
+    log.info("Step 21: Hit ranking")
+    if dry_run:
+        return
+    gene_ids = _get_tier12_gene_ids(trait_id)
+    ranked = rank_hits(gene_ids)
+    log.info("Step 21 complete: %d compounds ranked.", ranked)
+
+
+# ---------------------------------------------------------------------------
+# Phase 4 — Lead Optimization (Steps 22–25)
+# ---------------------------------------------------------------------------
+
+
+def step22_admet(dry_run: bool = False, trait_id: str = "") -> None:
+    """Step 22: ADMET prediction — RDKit descriptors + DeepChem fallback."""
+    from layer9_lead_optimization.admet import score_admet
+    log.info("Step 22: ADMET prediction")
+    if dry_run:
+        return
+    gene_ids = _get_tier12_gene_ids(trait_id)
+    scored = score_admet(gene_ids)
+    log.info("Step 22 complete: %d compounds ADMET-scored.", scored)
+
+
+def step23_toxicity(dry_run: bool = False, trait_id: str = "") -> None:
+    """Step 23: Toxicity screening — Tox21 SMARTS + hERG liability."""
+    from layer9_lead_optimization.toxicity import score_toxicity
+    log.info("Step 23: Toxicity screening")
+    if dry_run:
+        return
+    gene_ids = _get_tier12_gene_ids(trait_id)
+    scored = score_toxicity(gene_ids)
+    log.info("Step 23 complete: %d compounds tox-screened.", scored)
+
+
+def step24_selectivity(dry_run: bool = False, trait_id: str = "") -> None:
+    """Step 24: Selectivity check — fingerprint similarity vs off-target ligand panel."""
+    from layer9_lead_optimization.selectivity import score_selectivity
+    log.info("Step 24: Selectivity check")
+    if dry_run:
+        return
+    gene_ids = _get_tier12_gene_ids(trait_id)
+    scored = score_selectivity(gene_ids)
+    log.info("Step 24 complete: %d compounds selectivity-scored.", scored)
+
+
+def step25_synthesizability(dry_run: bool = False, trait_id: str = "") -> None:
+    """Step 25: Synthesizability — RDKit SA Score + ZINC purchasability + final tier."""
+    from layer9_lead_optimization.synthesizability import score_synthesizability
+    log.info("Step 25: Synthesizability scoring + final compound tiers")
+    if dry_run:
+        return
+    gene_ids = _get_tier12_gene_ids(trait_id)
+    scored = score_synthesizability(gene_ids)
+    log.info("Step 25 complete: %d compounds finalized.", scored)
 
 
 STEPS = {
@@ -1060,6 +1256,7 @@ STEPS = {
     "step8":   step8_functional_evidence,
     "step8b":  step8b_bgee,
     "step9":   step9_composite_score,
+    "step9b":  step9b_structural_annotation,
     "step10":  step10_start_api,
     "step10b": step10b_alphagenome,
     "step11":  step11_disease_annotation,
@@ -1072,7 +1269,18 @@ STEPS = {
     "step14":  step14_safety,
     "step14b": step14b_depmap_gtex,
     "step15":  step15_rescore,
-    "step16":  step16_start_api,
+    "step16":  step16_translational,
+    "step17":  step17_preclinical_readiness,
+    "step18":  step18_dossier,
+    # Phase 3 — Lead Discovery
+    "step19":  step19_virtual_screening,
+    "step20":  step20_ligand_search,
+    "step21":  step21_hit_ranking,
+    # Phase 4 — Lead Optimization
+    "step22":  step22_admet,
+    "step23":  step23_toxicity,
+    "step24":  step24_selectivity,
+    "step25":  step25_synthesizability,
 }
 
 
@@ -1307,13 +1515,19 @@ def run_pipeline(
                 step7b_convergent_aa(dry_run=dry_run)
 
             elif step_name == "step8":
-                step8_functional_evidence(phenotype=phenotype, dry_run=dry_run)
+                # Pass trait_id directly; functional_evidence falls back to cancer_resistance
+                # only when the phenotype key is missing from functional_evidence_config.json.
+                # Add your phenotype there to avoid the fallback.
+                step8_functional_evidence(phenotype=trait_id or "cancer_resistance", dry_run=dry_run)
 
             elif step_name == "step8b":
                 step8b_bgee(dry_run=dry_run)
 
             elif step_name == "step9":
-                step9_composite_score(dry_run=dry_run)
+                step9_composite_score(dry_run=dry_run, trait_id=trait_id)
+
+            elif step_name == "step9b":
+                step9b_structural_annotation(dry_run=dry_run)
 
             elif step_name == "step10":
                 step10_start_api(dry_run=dry_run)
@@ -1349,10 +1563,37 @@ def run_pipeline(
                 step14b_depmap_gtex(dry_run=dry_run, trait_id=trait_id)
 
             elif step_name == "step15":
-                step15_rescore(dry_run=dry_run)
+                step15_rescore(dry_run=dry_run, trait_id=trait_id)
 
             elif step_name == "step16":
-                step16_start_api(dry_run=dry_run)
+                step16_translational(dry_run=dry_run, trait_id=trait_id)
+
+            elif step_name == "step17":
+                step17_preclinical_readiness(dry_run=dry_run, trait_id=trait_id)
+
+            elif step_name == "step18":
+                step18_dossier(dry_run=dry_run, trait_id=trait_id)
+
+            elif step_name == "step19":
+                step19_virtual_screening(dry_run=dry_run, trait_id=trait_id)
+
+            elif step_name == "step20":
+                step20_ligand_search(dry_run=dry_run, trait_id=trait_id)
+
+            elif step_name == "step21":
+                step21_hit_ranking(dry_run=dry_run, trait_id=trait_id)
+
+            elif step_name == "step22":
+                step22_admet(dry_run=dry_run, trait_id=trait_id)
+
+            elif step_name == "step23":
+                step23_toxicity(dry_run=dry_run, trait_id=trait_id)
+
+            elif step_name == "step24":
+                step24_selectivity(dry_run=dry_run, trait_id=trait_id)
+
+            elif step_name == "step25":
+                step25_synthesizability(dry_run=dry_run, trait_id=trait_id)
 
             elapsed = time.time() - step_start
             log.info("  %s complete (%.1fs)", step_name, elapsed)

@@ -40,38 +40,85 @@ def _fmt(val, fmt=".3f", default="—") -> str:
         return str(val)
 
 
+_PHENOTYPE_ASSAY_CONTEXT: dict[str, dict[str, str]] = {
+    "cancer_resistance": {
+        "knockdown": "CRISPR/RNAi knockdown in cancer cell lines to confirm growth-inhibition phenotype",
+        "repurposing": "Repurposing screen: test {drug} in cancer-resistance model",
+        "in_vivo": "AAV-mediated gene overexpression in mouse tumour model to assess cancer resistance",
+        "organoid": "Patient-derived tumour organoid (PDO) screen with candidate inhibitors",
+    },
+    "longevity": {
+        "knockdown": "CRISPR/RNAi knockdown in C. elegans or Drosophila to assess lifespan impact",
+        "repurposing": "Senescence-reversal assay: test {drug} in aged primary fibroblasts",
+        "in_vivo": "AAV-mediated overexpression in aged mice; track metabolic health and survival curves",
+        "organoid": "Aged organoid system to test candidate modulators of cellular senescence",
+    },
+    "viral_immunity": {
+        "knockdown": "CRISPR/RNAi knockdown in primary macrophages followed by viral challenge assay",
+        "repurposing": "Innate immunity reporter assay: test {drug} in VSV/SARS-CoV-2 infection model",
+        "in_vivo": "AAV-mediated overexpression in mice; challenge with relevant virus and track viral load",
+        "organoid": "Lung organoid viral infection model with candidate innate-immune modulators",
+    },
+    "viral_resistance": {
+        "knockdown": "CRISPR/RNAi knockdown in primary macrophages followed by viral challenge assay",
+        "repurposing": "Innate immunity reporter assay: test {drug} in VSV/SARS-CoV-2 infection model",
+        "in_vivo": "AAV-mediated overexpression in mice; challenge with relevant virus and track viral load",
+        "organoid": "Lung organoid viral infection model with candidate innate-immune modulators",
+    },
+    "hypoxia_tolerance": {
+        "knockdown": "CRISPR/RNAi knockdown in cardiomyocytes under hypoxic (1% O₂) conditions",
+        "repurposing": "Hypoxia-survival assay: test {drug} in HIF-reporter cell line",
+        "in_vivo": "AAV-mediated overexpression in mouse chronic hypoxia model (normobaric 10% O₂)",
+        "organoid": "Cardiac organoid hypoxia-reoxygenation assay with candidate modulators",
+    },
+    "dna_repair": {
+        "knockdown": "CRISPR/RNAi knockdown followed by ionising radiation survival clonogenic assay",
+        "repurposing": "Synthetic lethality screen: test {drug} against BRCA1/2-null background",
+        "in_vivo": "AAV-mediated overexpression in mouse DNA-damage (irradiation) model",
+        "organoid": "DNA-damage organoid model (IR or cisplatin) to test candidate repair modulators",
+    },
+}
+
+_DEFAULT_ASSAY_CONTEXT = {
+    "knockdown": "CRISPR/RNAi knockdown in relevant primary cells to confirm phenotype",
+    "repurposing": "Cell-based assay: test {drug} in appropriate disease model",
+    "in_vivo": "AAV-mediated overexpression in mouse model to assess target phenotype",
+    "organoid": "Organoid screen with candidate modulators in disease-relevant model",
+}
+
+
 def _experiment_recommendations(
     tier: str,
     therapy: Optional[GeneTherapyScore],
     drug_target: Optional[DrugTarget],
     preclinical: Optional[PreclinicalReadiness],
+    phenotype: str = "",
 ) -> list[str]:
-    """Return 3 recommended first experiments based on available evidence."""
+    """Return 3 recommended first experiments based on available evidence and phenotype."""
+    ctx = _PHENOTYPE_ASSAY_CONTEXT.get(phenotype, _DEFAULT_ASSAY_CONTEXT)
     recs = []
 
-    # Knock-down / overexpression
-    recs.append("CRISPR/RNAi knockdown in cancer cell lines to confirm growth phenotype")
+    # Knock-down / overexpression validation
+    recs.append(ctx["knockdown"])
 
-    # Biochemical
+    # Biochemical / compound assay
     if drug_target and drug_target.top_pocket_score and drug_target.top_pocket_score > 0.5:
         recs.append("Fragment-based or virtual screening against the identified druggable pocket")
     elif drug_target and drug_target.existing_drugs:
-        recs.append(
-            f"Repurposing screen: test {drug_target.existing_drugs[0]} in cancer-resistance model"
-        )
+        recs.append(ctx["repurposing"].format(drug=drug_target.existing_drugs[0]))
     else:
         recs.append("Protein purification + differential scanning fluorimetry (DSF) for binding assay")
 
-    # In-vivo
+    # In-vivo / organoid
     if therapy and therapy.aav_compatible:
-        recs.append("AAV-mediated gene overexpression in mouse tumour model to assess cancer resistance")
+        recs.append(ctx["in_vivo"])
     else:
-        recs.append("Patient-derived organoid (PDO) screen with candidate inhibitors")
+        recs.append(ctx["organoid"])
 
     return recs[:3]
 
 
-def generate_dossier(gene_id: str) -> Optional[str]:
+def generate_dossier(gene_id: str, phenotype: str = "") -> Optional[str]:
     """Generate a Markdown dossier for one gene. Returns the output path or None."""
     with get_session() as session:
         gene = session.get(Gene, gene_id)
@@ -196,14 +243,15 @@ def generate_dossier(gene_id: str) -> Optional[str]:
 
     lines += ["## 7. Recommended First Experiments", ""]
 
-    recs = _experiment_recommendations(tier, gt, dt, pr)
+    recs = _experiment_recommendations(tier, gt, dt, pr, phenotype=phenotype)
     for i, rec in enumerate(recs, 1):
         lines.append(f"{i}. {rec}")
     lines.append("")
+    phenotype_label = phenotype or "unspecified"
     lines += [
         "---",
         "",
-        f"*Generated by BioResilient Pipeline | Gene: {gene_id}*",
+        f"*Generated by BioResilient Pipeline | Gene: {gene_id} | Phenotype: {phenotype_label}*",
     ]
 
     content = "\n".join(lines)
@@ -215,15 +263,15 @@ def generate_dossier(gene_id: str) -> Optional[str]:
     return str(out_path)
 
 
-def run_dossier_pipeline(gene_ids: list[str]) -> int:
+def run_dossier_pipeline(gene_ids: list[str], phenotype: str = "") -> int:
     """Entry point called from orchestrator step18. Returns number of dossiers written."""
     written = 0
     for gid in gene_ids:
         try:
-            path = generate_dossier(gid)
+            path = generate_dossier(gid, phenotype=phenotype)
             if path:
                 written += 1
         except Exception as exc:
             log.warning("Dossier generation failed for %s: %s", gid, exc)
-    log.info("Dossiers: %d written to %s/", written, OUTPUT_DIR)
+    log.info("Dossiers: %d written to %s/ (phenotype=%r)", written, OUTPUT_DIR, phenotype or "unspecified")
     return written

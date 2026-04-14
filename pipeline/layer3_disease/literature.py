@@ -40,7 +40,19 @@ from pipeline.config import get_ncbi_api_key, get_ncbi_email
 log = logging.getLogger(__name__)
 
 ENTREZ_ESEARCH = "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/esearch.fcgi"
-REQUEST_TIMEOUT = 15
+ENTREZ_EFETCH  = "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/efetch.fcgi"
+REQUEST_TIMEOUT = 20
+MAX_ABSTRACTS_PER_GENE = 20   # fetch up to 20 abstracts for semantic scoring
+
+_SPECIES_SUFFIXES = ("_HUMAN", "_MOUSE", "_RAT", "_DOG", "_CAT", "_WHALE", "_BAT", "_SHARK")
+
+
+def _hgnc_symbol(full_symbol: str) -> str:
+    """Strip UniProt species suffix to get clean HGNC gene symbol."""
+    for suffix in _SPECIES_SUFFIXES:
+        if full_symbol.upper().endswith(suffix):
+            return full_symbol[: -len(suffix)]
+    return full_symbol
 
 # Known landmark resilience/longevity genes — if these are NOT in our top
 # candidates, we log a warning as a sanity check.
@@ -67,53 +79,155 @@ TRAIT_KEYWORDS: dict[str, list[str]] = {
         "longevity", "aging", "ageing", "lifespan", "life span",
         "senescence", "anti-aging", "healthspan",
     ],
+    # "viral_resistance" kept as alias; canonical key is "viral_immunity"
+    # (matches functional_evidence_config.json).
     "viral_resistance": [
         "antiviral", "innate immunity", "interferon", "viral resistance",
         "pathogen resistance",
+    ],
+    "viral_immunity": [
+        "antiviral", "innate immunity", "interferon", "viral immunity",
+        "viral resistance", "pathogen resistance", "immune evasion",
+        "toll-like receptor", "type I interferon", "ISG",
+    ],
+    "hypoxia_tolerance": [
+        "hypoxia", "hypoxia tolerance", "oxygen deprivation", "HIF",
+        "angiogenesis", "low oxygen", "ischemia", "altitude adaptation",
+        "hypoxia-inducible factor",
+    ],
+    "dna_repair": [
+        "DNA repair", "double-strand break", "base excision repair",
+        "nucleotide excision repair", "mismatch repair", "DNA damage response",
+        "genomic stability", "mutagenesis", "synthetic lethality",
     ],
     "regeneration": [
         "regeneration", "tissue repair", "wound healing", "stem cell",
         "dedifferentiation",
     ],
     "default": [
-        "resilience", "adaptation", "longevity", "cancer resistance",
-        "stress response", "protective variant",
+        "resilience", "adaptation", "stress response", "protective variant",
+        "evolutionary conservation",
     ],
 }
 
 
-def _query_pubmed_count(gene_symbol: str, keywords: list[str]) -> int:
-    """Return PubMed paper count for gene + any of the given keywords.
+def _pubmed_headers(email: Optional[str] = None) -> dict:
+    return {"User-Agent": f"BioResilienceAI/1.0 ({email or 'noreply@example.com'})"}
 
-    Uses NCBI E-utilities esearch with a boolean OR query.
+
+def _query_pubmed(gene_symbol: str, keywords: list[str]) -> tuple[int, list[str]]:
+    """Search PubMed and return (count, list_of_pmids).
+
+    Fetches up to MAX_ABSTRACTS_PER_GENE PMIDs for semantic scoring.
     """
     api_key = get_ncbi_api_key()
-    email = get_ncbi_email()
+    email   = get_ncbi_email()
 
-    # Build query: gene symbol AND (keyword1 OR keyword2 OR ...)
-    kw_query = " OR ".join(f'"{kw}"' for kw in keywords[:5])  # limit to 5 to keep URL short
+    kw_query  = " OR ".join(f'"{kw}"' for kw in keywords[:5])
     full_query = f'"{gene_symbol}"[Gene Name] AND ({kw_query})'
 
     params: dict = {
         "db": "pubmed",
         "term": full_query,
-        "retmax": 0,   # We only want the count
+        "retmax": MAX_ABSTRACTS_PER_GENE,
         "retmode": "json",
+        "usehistory": "n",
     }
     if api_key:
         params["api_key"] = api_key
-    headers = {"User-Agent": f"BioResilienceAI/1.0 ({email or 'noreply@example.com'})"}
 
     try:
-        r = requests.get(ENTREZ_ESEARCH, params=params, headers=headers, timeout=REQUEST_TIMEOUT)
+        r = requests.get(
+            ENTREZ_ESEARCH, params=params,
+            headers=_pubmed_headers(email), timeout=REQUEST_TIMEOUT,
+        )
         if r.status_code != 200:
-            return 0
-        data = r.json()
-        count = int(data.get("esearchresult", {}).get("count", 0))
-        return count
+            return 0, []
+        data   = r.json().get("esearchresult", {})
+        count  = int(data.get("count", 0))
+        pmids  = data.get("idlist", [])
+        return count, pmids
     except Exception as exc:
-        log.debug("PubMed query failed for %s: %s", gene_symbol, exc)
-        return 0
+        log.debug("PubMed search failed for %s: %s", gene_symbol, exc)
+        return 0, []
+
+
+def _fetch_abstracts(pmids: list[str]) -> list[str]:
+    """Fetch abstract text for a list of PMIDs via efetch."""
+    if not pmids:
+        return []
+    api_key = get_ncbi_api_key()
+    email   = get_ncbi_email()
+    params: dict = {
+        "db": "pubmed",
+        "id": ",".join(pmids),
+        "rettype": "abstract",
+        "retmode": "text",
+    }
+    if api_key:
+        params["api_key"] = api_key
+    try:
+        r = requests.get(
+            ENTREZ_EFETCH, params=params,
+            headers=_pubmed_headers(email), timeout=REQUEST_TIMEOUT * 2,
+        )
+        if r.status_code != 200:
+            return []
+        # Split by paper delimiter — each abstract block starts with a number line
+        text  = r.text
+        blocks = [b.strip() for b in text.split("\n\n\n") if len(b.strip()) > 50]
+        return blocks
+    except Exception as exc:
+        log.debug("PubMed efetch failed: %s", exc)
+        return []
+
+
+def _semantic_relevance_score(
+    gene_symbol: str,
+    abstracts: list[str],
+    keywords: list[str],
+) -> float:
+    """Compute a 0-1 semantic relevance score from abstract text.
+
+    Algorithm (deterministic, no LLM):
+      1. Count keyword co-occurrences with gene_symbol across all abstracts.
+      2. Score = matched_docs / total_docs (proportion of abstracts mentioning
+         both the gene and at least one phenotype keyword).
+      3. Clamp to [0, 1].
+
+    This outperforms a raw paper count because a gene with 5 highly relevant
+    papers scores higher than a gene with 200 tangentially related papers.
+    """
+    if not abstracts:
+        return 0.0
+
+    symbol_lower  = gene_symbol.lower()
+    kws_lower     = [kw.lower() for kw in keywords]
+
+    # Phenotype-neutral expansion: only add terms that apply to any resilience trait.
+    # Do NOT include cancer-centric terms (tumor suppressor, oncogene) here — they
+    # would bias abstract scoring for non-cancer phenotypes. The caller passes
+    # phenotype-specific keywords via TRAIT_KEYWORDS; that is the right place.
+    mechanism_terms = [
+        "protective", "resistance", "resilience", "adaptation",
+        "evolutionary conservation", "positive selection",
+    ]
+    all_terms = kws_lower + mechanism_terms
+
+    matched = 0
+    for abstract in abstracts:
+        ab_lower = abstract.lower()
+        if symbol_lower in ab_lower:
+            if any(term in ab_lower for term in all_terms):
+                matched += 1
+
+    return round(matched / len(abstracts), 4)
+
+
+def _query_pubmed_count(gene_symbol: str, keywords: list[str]) -> int:
+    """Return PubMed paper count (backward-compat wrapper)."""
+    count, _ = _query_pubmed(gene_symbol, keywords)
+    return count
 
 
 def annotate_literature(
@@ -140,16 +254,29 @@ def annotate_literature(
     annotated = 0
     found_known = []
 
+    import math
     for gene in genes:
         if not gene.gene_symbol:
             continue
 
-        count = _query_pubmed_count(gene.gene_symbol, keywords)
+        clean_symbol = _hgnc_symbol(gene.gene_symbol)
+
+        # Phase 1: get count + top PMIDs
+        count, pmids = _query_pubmed(clean_symbol, keywords)
         time.sleep(0.12)  # NCBI rate limit: ~10 req/sec with API key
 
-        # lit_score: log10(1 + count) normalised so 1000 papers → 1.0
-        import math
-        lit_score = round(min(math.log10(1 + count) / 3.0, 1.0), 4)
+        # Phase 2: fetch abstracts and compute semantic relevance score
+        lit_score: float
+        if pmids:
+            abstracts = _fetch_abstracts(pmids[:MAX_ABSTRACTS_PER_GENE])
+            time.sleep(0.12)
+            if abstracts:
+                lit_score = _semantic_relevance_score(clean_symbol, abstracts, keywords)
+            else:
+                # Fallback to log-count if efetch fails
+                lit_score = round(min(math.log10(1 + count) / 3.0, 1.0), 4)
+        else:
+            lit_score = 0.0
 
         with get_session() as session:
             ann = session.get(DiseaseAnnotation, gene.id)
@@ -163,8 +290,8 @@ def annotate_literature(
 
         if count > 0:
             annotated += 1
-        if gene.gene_symbol.upper() in KNOWN_RESILIENCE_GENES:
-            found_known.append(gene.gene_symbol)
+        if clean_symbol.upper() in KNOWN_RESILIENCE_GENES:
+            found_known.append(clean_symbol)
 
     # Sanity check log
     if found_known:
