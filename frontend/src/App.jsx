@@ -22,19 +22,24 @@ function Animated({ children }) {
   return <motion.div {...PAGE_TRANSITION}>{children}</motion.div>
 }
 
+// Auth is only enforced when VITE_REQUIRE_AUTH=true is set (e.g. local dev with backend running).
+// Vercel (frontend-only) skips the login gate so the UI remains accessible.
+const AUTH_REQUIRED = import.meta.env.VITE_REQUIRE_AUTH === 'true'
+
 function AppInner() {
   const { isAuthenticated } = useAuth()
+  const authed = !AUTH_REQUIRED || isAuthenticated
 
   return (
     <Routes>
       <Route
         path="/login"
-        element={isAuthenticated ? <Navigate to="/" replace /> : <Login />}
+        element={authed ? <Navigate to="/" replace /> : <Login />}
       />
       <Route
         path="/*"
         element={
-          isAuthenticated ? (
+          authed ? (
             <Layout>
               <AnimatePresence mode="wait">
                 <Routes>
