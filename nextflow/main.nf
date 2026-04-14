@@ -48,7 +48,7 @@ def STEP_ORDER = [
     'step1','step2','step3','step3b','step3c',
     'step4','step4b','step4c','step4d',
     'step5','step3d','step6','step6b','step6c','step7','step7b',
-    'step8','step8b','step9',
+    'step8','step8b','step9','step9b',
     'step10b','step11','step11b','step11c','step11d',
     'step12','step12b','step13','step14','step14b','step15',
 ]
@@ -107,8 +107,8 @@ workflow {
         scored_ch = Channel.value(true)
     }
 
-    // ── Phase 2 Clinical translation (steps 10b–15) ──────────────────────
-    if (overlaps('step10b', 'step15')) {
+    // ── Phase 2 Clinical translation (steps 9b–15) ───────────────────────
+    if (overlaps('step9b', 'step15')) {
         PHASE2_CLINICAL(scored_ch)
     }
 }
@@ -143,6 +143,50 @@ workflow health_check {
         python /app/scripts/pipeline_health_check.py --output health_check.md || true
         """
     }
+}
+
+// ── Data quality check for SKIPPED steps ──────────────────────────────────
+// Runs inside AWS Batch (VPC → RDS access). Reports PASS/FAIL per skipped step.
+// Run with: nextflow run nextflow/main.nf -entry data_quality_check -profile aws
+
+process run_data_quality_check {
+    label 'base'
+    cpus 1
+    memory '4 GB'
+    time '30m'
+
+    script:
+    """
+    export DATABASE_URL='${params.db_url}'
+    export AWS_DEFAULT_REGION='ap-south-1'
+    export S3_BUCKET='${params.s3_bucket}'
+
+    # Download the quality check script from S3 using Python/boto3 (no aws CLI needed)
+    python3 - << 'PYEOF'
+import boto3, os, subprocess, sys
+
+s3 = boto3.client('s3', region_name='ap-south-1')
+bucket = os.environ.get('S3_BUCKET', 'bioresilient-data')
+
+# Download the script
+s3.download_file(bucket, 'scripts/data_quality_check.py', '/tmp/data_quality_check.py')
+
+# Run it
+result = subprocess.run([sys.executable, '/tmp/data_quality_check.py'], text=True)
+
+# Upload results to S3
+import os as _os
+if _os.path.exists('data_quality_report.json'):
+    s3.upload_file('data_quality_report.json', bucket, 'reports/data_quality_report.json')
+    print(f"Report uploaded to s3://{bucket}/reports/data_quality_report.json")
+
+sys.exit(result.returncode)
+PYEOF
+    """
+}
+
+workflow data_quality_check {
+    run_data_quality_check()
 }
 
 workflow.onComplete {
