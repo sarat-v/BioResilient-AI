@@ -2,8 +2,13 @@
  * Phase 1 — Evolution Module
  * Steps: 5, 3d, 6 (per-OG scatter), 6b, 6c, 7, 7b
  *
- * Key design: steps 6/6b/6c scatter across orthogroups.
- * Each OG is an independent job — max spot fault tolerance.
+ * Architecture (2024-redesign):
+ *   - PAML (step6) scatters over OGs that need a fresh run.
+ *   - FEL/BUSTED (step6b) and RELAX (step6c) are FULLY INDEPENDENT of PAML outputs.
+ *     They rebuild codon alignments from aligned_pkl + cds_cache directly, targeting
+ *     all paml_branch_site + paml_no_signal OGs that don't yet have fel_sites.
+ *   - This eliminates the fragile codon_aln.fna intermediate-file dependency and
+ *     makes HyPhy runs robust to Nextflow cache hits on the PAML step.
  */
 
 process build_species_tree {
@@ -20,10 +25,6 @@ process build_species_tree {
 
     script:
     """
-    # run_step.py handles both paths via STEP_OUTPUT_PROVIDERS + STEP_DONE_CHECKS:
-    # - skip:  done-check detects treefile in storage, copies it here, exits 0
-    # - run:   step5_phylogenetic_tree builds the tree then copies it here
-    # species.treefile is always present in the work dir after this call.
     python -m scripts.nf_wrappers.run_step \
         --step step5 \
         --skip-if-done \
@@ -252,59 +253,181 @@ process collect_all_paml_results {
     """
 }
 
+// Backfill busted_pvalue = dnds_pvalue for paml_branch_site genes.
+// The new parse_paml_results() emits busted_pvalue, but cached PAML result.json
+// files from previous runs don't have this field. This lightweight SQL UPDATE
+// ensures consistency without requiring a full PAML rerun.
+process backfill_busted_pvalue {
+    label 'base'
+    cpus 1
+    memory '2 GB'
+    time '10m'
+
+    input:
+    val paml_done
+
+    output:
+    val true, emit: backfill_done
+
+    script:
+    """
+    python3 << 'PYEOF'
+import psycopg2
+conn = psycopg2.connect('${params.db_url}')
+cur = conn.cursor()
+cur.execute("""
+    UPDATE evolution_score
+    SET busted_pvalue = dnds_pvalue
+    WHERE selection_model = 'paml_branch_site'
+      AND busted_pvalue IS NULL
+      AND dnds_pvalue IS NOT NULL
+""")
+updated = cur.rowcount
+conn.commit()
+print(f'Backfilled busted_pvalue for {updated} paml_branch_site genes')
+cur.execute("""
+    SELECT COUNT(*) FROM evolution_score
+    WHERE selection_model = 'paml_branch_site' AND busted_pvalue IS NULL
+""")
+remaining = cur.fetchone()[0]
+print(f'Remaining paml_branch_site with NULL busted_pvalue: {remaining}')
+conn.close()
+PYEOF
+    """
+}
+
+// extract_og_ids_for_hyphy queries ALL OGs with paml_branch_site or paml_no_signal
+// that do not yet have fel_sites filled. Uses storeDir with a versioned key so runs
+// are deterministic on -resume. Bump params.hyphy_og_cache_key to force a fresh query
+// (e.g. after adding new PAML results to the DB).
+process extract_og_ids_for_hyphy {
+    label 'base'
+    storeDir "${params.storage_root}/step_cache/${params.phenotype}/hyphy_og_batches_b${params.paml_batch_size}_${params.hyphy_og_cache_key}"
+    cpus 1
+    memory '16 GB'
+    time '20m'
+
+    input:
+    path aligned_pkl
+    val backfill_done
+
+    output:
+    path 'hyphy_batch_*.txt', emit: hyphy_batches
+
+    script:
+    """
+    python3 << 'PYEOF'
+import pickle, sys, math
+
+db_url     = '${params.db_url}'
+batch_size = int('${params.paml_batch_size}')
+
+with open('${aligned_pkl}', 'rb') as f:
+    data = pickle.load(f)
+aligned = data.get('aligned', data)
+
+import psycopg2
+conn = psycopg2.connect(db_url)
+cur = conn.cursor()
+
+# All OGs with a real PAML result that don't have FEL computed yet.
+# Include paml_no_signal: their scoring uses the HyPhy pathway, so FEL adds value.
+cur.execute('''
+    SELECT DISTINCT o.orthofinder_og
+    FROM evolution_score es
+    JOIN ortholog o ON o.gene_id = es.gene_id
+    WHERE es.selection_model IN (\'paml_branch_site\', \'paml_no_signal\')
+      AND es.fel_sites IS NULL
+      AND o.orthofinder_og IS NOT NULL
+''')
+og_ids = sorted({row[0] for row in cur.fetchall() if row[0] in aligned})
+conn.close()
+
+sys.stderr.write(f'HyPhy targets: {len(og_ids)} OGs with PAML results but no fel_sites\\n')
+
+if not og_ids:
+    sys.stderr.write('All paml OGs already have fel_sites — writing empty sentinel.\\n')
+    with open('hyphy_batch_0000.txt', 'w') as f:
+        f.write('')
+    sys.exit(0)
+
+n_batches = math.ceil(len(og_ids) / batch_size)
+for i in range(n_batches):
+    chunk = og_ids[i * batch_size : (i + 1) * batch_size]
+    with open(f'hyphy_batch_{i:04d}.txt', 'w') as f:
+        f.write('\\n'.join(chunk) + '\\n')
+
+sys.stderr.write(f'Wrote {len(og_ids)} OGs into {n_batches} HyPhy batch files\\n')
+PYEOF
+    echo "HyPhy batch files: \$(ls hyphy_batch_*.txt | wc -l)"
+    """
+}
+
+// run_fel_busted: self-sufficient FEL + BUSTED per batch.
+// Receives the same raw inputs as run_paml and rebuilds codon alignments independently.
+// No dependency on codon_aln.fna or any other PAML intermediate.
 process run_fel_busted {
     label 'paml'
     cpus params.paml_cpus
     memory { (params.paml_memory as nextflow.util.MemoryUnit) * task.attempt }
     time '12h'
-    tag "${meme_out.baseName}"
+    tag "${og_batch.baseName}"
+    maxForks params.paml_max_forks
     errorStrategy { task.attempt <= 3 ? 'retry' : 'finish' }
     maxRetries 3
 
     input:
-    path meme_out
-    path treefile
+    tuple path(og_batch), path(cds_cache), path(aligned_pkl), path(treefile)
 
     output:
-    path "${meme_out.baseName}_fb", emit: fb_result
+    path "${og_batch.baseName}_fb", emit: fb_result
 
     script:
     """
-    mkdir -p '${meme_out.baseName}_fb'
+    echo "fel_busted_v1_self_sufficient"
+    export NF_TASK_CPUS=${task.cpus}
+    mkdir -p '${og_batch.baseName}_fb'
     python -m scripts.nf_wrappers.run_step \
         --step step6b_batch \
-        --input-dir '${meme_out}' \
+        --og-id-file '${og_batch}' \
+        --input-pkl '${aligned_pkl}' \
+        --cds-cache '${cds_cache}' \
         --treefile '${treefile}' \
-        --output-dir '${meme_out.baseName}_fb' \
+        --output-dir '${og_batch.baseName}_fb' \
         --db-url '${params.db_url}' \
         --storage-root '${params.storage_root}'
     """
 }
 
+// run_relax: self-sufficient RELAX per batch.
 process run_relax {
     label 'paml'
     cpus params.paml_cpus
     memory { (params.paml_memory as nextflow.util.MemoryUnit) * task.attempt }
     time '12h'
-    tag "${meme_out.baseName}"
+    tag "${og_batch.baseName}"
+    maxForks params.paml_max_forks
     errorStrategy { task.attempt <= 3 ? 'retry' : 'finish' }
     maxRetries 3
 
     input:
-    path meme_out
-    path treefile
+    tuple path(og_batch), path(cds_cache), path(aligned_pkl), path(treefile)
 
     output:
-    path "${meme_out.baseName}_relax", emit: relax_result
+    path "${og_batch.baseName}_relax", emit: relax_result
 
     script:
     """
-    mkdir -p '${meme_out.baseName}_relax'
+    echo "relax_v1_self_sufficient"
+    export NF_TASK_CPUS=${task.cpus}
+    mkdir -p '${og_batch.baseName}_relax'
     python -m scripts.nf_wrappers.run_step \
         --step step6c_batch \
-        --input-dir '${meme_out}' \
+        --og-id-file '${og_batch}' \
+        --input-pkl '${aligned_pkl}' \
+        --cds-cache '${cds_cache}' \
         --treefile '${treefile}' \
-        --output-dir '${meme_out.baseName}_relax' \
+        --output-dir '${og_batch.baseName}_relax' \
         --db-url '${params.db_url}' \
         --storage-root '${params.storage_root}'
     """
@@ -323,7 +446,7 @@ process collect_fel_busted_results {
 
     script:
     """
-    echo "collect_v6_all_fixes"
+    echo "collect_v7_self_sufficient"
     python -m scripts.nf_wrappers.run_step \
         --step step6b_collect \
         --input-dir results/ \
@@ -347,7 +470,7 @@ process collect_relax_results {
 
     script:
     """
-    echo "collect_v6_all_fixes"
+    echo "collect_v7_self_sufficient"
     python -m scripts.nf_wrappers.run_step \
         --step step6c_collect \
         --input-dir results/ \
@@ -365,13 +488,16 @@ process convergence_scoring {
     time '3h'
 
     input:
-    val meme_done
+    val paml_done
+    val fb_done
+    val relax_done
 
     output:
     val true, emit: convergence_done
 
     script:
     """
+    echo "Running step7 convergence (after PAML + FEL/BUSTED + RELAX collects)"
     python -m scripts.nf_wrappers.run_step \
         --step step7 \
         --skip-if-done \
@@ -413,7 +539,6 @@ workflow PHASE1_EVOLUTION {
     directions_done
 
     main:
-    // Phase execution order — step3d runs after step5 in this workflow
     def EVO_STEPS = ['step5','step3d','step6','step6b','step6c','step7','step7b']
     def fromStep   = params.from_step ?: 'step1'
     def untilStep  = params['until'] ?: 'step7b'
@@ -423,11 +548,9 @@ workflow PHASE1_EVOLUTION {
     if (fromIdx < 0) fromIdx = 0
     if (untilIdx < 0) untilIdx = EVO_STEPS.size() - 1
 
-    // aligned_pkl is already a value channel in NF 25 (single-output process)
     aligned_pkl_val = aligned_pkl
 
     // ── Step 5: build species tree ────────────────────────────────────────
-    // Skip when resuming from step6 or later — tree already in S3.
     if (fromIdx < 0 || fromIdx <= step5Idx) {
         build_species_tree(aligned_pkl_val)
         treefile_ch  = build_species_tree.out.treefile
@@ -443,15 +566,13 @@ workflow PHASE1_EVOLUTION {
     }
 
     if (fromIdx <= EVO_STEPS.indexOf('step6') && untilIdx >= EVO_STEPS.indexOf('step6')) {
-        // Pre-fetch ALL CDS once (single task) — eliminates NCBI bottleneck in scatter
-        prefetch_cds(aligned_pkl_val)
-        cds_cache_ch = prefetch_cds.out.cds_cache
-
+        // ── PAML scatter ─────────────────────────────────────────────────
         extract_og_ids(aligned_pkl_val)
         og_batches_ch = extract_og_ids.out.og_batches.flatten()
 
-        // Combine: each og_batch paired with shared inputs via combine()
-        // Broadcasts cds_cache and aligned_pkl to all batches without breaking Fusion staging.
+        prefetch_cds(aligned_pkl_val)
+        cds_cache_ch = prefetch_cds.out.cds_cache
+
         run_paml_input_ch = og_batches_ch
             .combine(cds_cache_ch)
             .combine(aligned_pkl_val)
@@ -460,12 +581,43 @@ workflow PHASE1_EVOLUTION {
         run_paml(run_paml_input_ch)
         collect_all_paml_results(run_paml.out.paml_result.collect())
         all_paml_done_ch = collect_all_paml_results.out.all_paml_done
+
+        // ── HyPhy (FEL/BUSTED + RELAX) — self-sufficient scatter ─────────
+        // Runs AFTER PAML collect so the DB has the full paml_branch_site set.
+        // Targets ALL paml_branch_site + paml_no_signal OGs without fel_sites,
+        // not just the ones processed in this PAML scatter — ensuring backfill
+        // of existing rows from prior runs.
+        if (untilIdx >= EVO_STEPS.indexOf('step6b')) {
+            // Backfill busted_pvalue for cached PAML rows that predate the field
+            backfill_busted_pvalue(all_paml_done_ch)
+
+            // Extract HyPhy targets from DB (all PAML-scored OGs without FEL)
+            extract_og_ids_for_hyphy(aligned_pkl_val, backfill_busted_pvalue.out.backfill_done)
+            hyphy_batches_ch = extract_og_ids_for_hyphy.out.hyphy_batches.flatten()
+
+            hyphy_input_ch = hyphy_batches_ch
+                .combine(cds_cache_ch)
+                .combine(aligned_pkl_val)
+                .combine(treefile_ch)
+
+            run_fel_busted(hyphy_input_ch)
+            run_relax(hyphy_input_ch)
+            collect_fel_busted_results(run_fel_busted.out.fb_result.collect())
+            collect_relax_results(run_relax.out.relax_result.collect())
+            fb_done_ch    = collect_fel_busted_results.out.fb_done
+            relax_done_ch = collect_relax_results.out.relax_done
+        } else {
+            fb_done_ch    = Channel.value(true)
+            relax_done_ch = Channel.value(true)
+        }
     } else {
         all_paml_done_ch = Channel.value(true)
+        fb_done_ch       = Channel.value(true)
+        relax_done_ch    = Channel.value(true)
     }
 
     if (fromIdx <= EVO_STEPS.indexOf('step7') && untilIdx >= EVO_STEPS.indexOf('step7')) {
-        convergence_scoring(all_paml_done_ch)
+        convergence_scoring(all_paml_done_ch, fb_done_ch, relax_done_ch)
         convergence_done_ch = convergence_scoring.out.convergence_done
     } else {
         convergence_done_ch = Channel.value(true)
