@@ -34,4 +34,9 @@ COPY scripts/pipeline_health_check.py /app/scripts/pipeline_health_check.py
 # This prevents stale esm_chunk_size / threshold values from being baked in.
 COPY config/ /app/config/
 
+# Force rebuild: 2026-04-10 step14-final-fixes-phewas-selectivity-depmap
+# Force rebuild: 2026-04-10 step14-phewas-otp-page-arg-fix-depmap-unboundlocal-fix
+# Force rebuild: 2026-04-10 fix-scoring-depmap-probability-thresholds
+# Force rebuild: 2026-04-10 fix-safety-score-always-computed-fix-protac-modality-pr-code
 ENV PYTHONPATH=/app
+# Force rebuild: 2026-04-16 hyphy-self-sufficient-architecture
