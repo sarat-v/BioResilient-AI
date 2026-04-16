@@ -275,20 +275,20 @@ process backfill_busted_pvalue {
 import psycopg2
 conn = psycopg2.connect('${params.db_url}')
 cur = conn.cursor()
-cur.execute("""
+cur.execute('''
     UPDATE evolution_score
     SET busted_pvalue = dnds_pvalue
     WHERE selection_model = 'paml_branch_site'
       AND busted_pvalue IS NULL
       AND dnds_pvalue IS NOT NULL
-""")
+''')
 updated = cur.rowcount
 conn.commit()
 print(f'Backfilled busted_pvalue for {updated} paml_branch_site genes')
-cur.execute("""
+cur.execute('''
     SELECT COUNT(*) FROM evolution_score
-    WHERE selection_model = 'paml_branch_site' AND busted_pvalue IS NULL
-""")
+    WHERE selection_model = \'paml_branch_site\' AND busted_pvalue IS NULL
+''')
 remaining = cur.fetchone()[0]
 print(f'Remaining paml_branch_site with NULL busted_pvalue: {remaining}')
 conn.close()
