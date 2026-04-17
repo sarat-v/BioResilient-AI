@@ -77,7 +77,7 @@ tools:
   # this tree; PAML trees are gene-specific pruned subtrees derived from this file.
   use_fixed_tree: true
   # Fix 2: iterations for convergence permutation null model (200 is default).
-  convergence_permutation_iterations: 200
+  convergence_permutation_iterations: 1000
   # API concurrency — capped by external service rate limits, not CPU count.
   # Increase carefully; exceeding limits causes 429 errors and backoff delays.
   uniprot_batch_workers: 4        # Parallel HTTP requests to UniProt batch API

@@ -1,16 +1,28 @@
 """gnomAD v4 GraphQL API — gene constraint scores (pLI and LOEUF).
 
 pLI  (probability loss-of-function intolerant): classic metric, threshold ≥ 0.9.
-LOEUF (loss-of-function observed/expected upper bound fraction): continuous metric,
-      updated threshold for v4 is < 0.6 (replaces < 0.35 from v2.1.1).
+LOEUF (loss-of-function observed/expected upper bound fraction): continuous metric.
 
-Both are fetched in one query and stored on DiseaseAnnotation.
+Threshold used throughout this pipeline: LOEUF < 0.35 (highly LoF-intolerant).
+This corresponds to haploinsufficient / dosage-sensitive genes and is the threshold
+defined in Karczewski et al. (2020) *Nature* 581:434-443 (gnomAD v2.1.1) for the
+"high-confidence LoF intolerant" gene set. It is intentionally more conservative
+than the v4 general threshold (0.6) to restrict the loss_of_function motif class
+in Step 4d to genes where any LoF variant is robustly depleted from the population.
 
-Drug-target interpretation (Oxford BDI 2024):
-  - High LOEUF (LoF tolerant, > 0.6): target can likely be knocked out safely.
-  - Low LOEUF (LoF intolerant, < 0.6): must modulate, not eliminate; partial
-    inhibition / allosteric approach may be needed.
-  - Presence of healthy LoF carriers: best safety evidence (human knockout).
+This threshold is used consistently in:
+  - pipeline/layer3_disease/gnomad.py          (this file — constraint fetching)
+  - pipeline/layer1_sequence/variant_direction.py (Step 4d motif classification)
+  - pipeline/scoring.py disease_score()           (LoF constraint component)
+
+Reference: Karczewski et al. (2020) *Nature* 581:434–443. doi:10.1038/s41586-020-2308-7
+
+Drug-target interpretation:
+  - LOEUF < 0.35 (highly intolerant): modulate, do not eliminate; allosteric or
+    partial inhibition / PROTAC dosing strategy preferred.
+  - LOEUF ≥ 0.35 (tolerant): full LoF therapeutic approach is viable.
+  - Presence of healthy LoF carriers in gnomAD: strongest possible safety evidence
+    (natural human knockout validated).
   High pLI / low LOEUF does NOT automatically exclude a target — many successful
   drug targets (COX-1, HMGCR) score as LoF intolerant. What matters is the
   direction and magnitude of the desired therapeutic effect.
@@ -29,25 +41,43 @@ log = logging.getLogger(__name__)
 
 GNOMAD_GRAPHQL = "https://gnomad.broadinstitute.org/api"
 
+_SPECIES_SUFFIXES = ("_HUMAN", "_MOUSE", "_RAT", "_BOVIN", "_DANRE", "_YEAST", "_CAEEL", "_DROME")
+
+
+def _hgnc_symbol(gene_symbol: str) -> str:
+    """Strip UniProt species suffix to get an HGNC-style gene symbol (AKT1_HUMAN → AKT1)."""
+    upper = gene_symbol.upper()
+    for suffix in _SPECIES_SUFFIXES:
+        if upper.endswith(suffix):
+            return gene_symbol[: -len(suffix)]
+    return gene_symbol
+
 # gnomAD uses CloudFlare; rapid bursts trigger 429. 0.2 s = ~5 req/s per IP.
 # 60 genes × 2 calls each = 120 requests in ~24 s.
 _RATE_SLEEP = 0.2
 
-# gnomAD v4 thresholds (updated from v2.1.1)
-PLI_INTOLERANT_THRESHOLD = 0.9   # same as v2
-LOEUF_INTOLERANT_THRESHOLD = 0.6  # v4 update: was 0.35 in v2
+# Constraint thresholds — pipeline-wide constants.
+# LOEUF < 0.35: "high-confidence LoF intolerant" as defined in Karczewski et al.
+# (2020) Nature 581:434-443. Used identically in variant_direction.py (Step 4d)
+# and scoring.py (disease_score). Do NOT change without rerunning Steps 4d, 11–15.
+PLI_INTOLERANT_THRESHOLD   = 0.9    # pLI threshold (unchanged from v2/v4)
+LOEUF_INTOLERANT_THRESHOLD = 0.35   # LOEUF < 0.35 → highly LoF-intolerant gene
 
 
 def _symbol_to_ensembl_id(gene_symbol: str) -> Optional[str]:
-    """Resolve gene symbol to Ensembl gene ID via gnomAD search."""
+    """Resolve gene symbol to Ensembl gene ID via gnomAD search.
+
+    gnomAD v4 API requires reference_genome and returns ensembl_id (not gene_id).
+    """
     try:
         r = requests.post(
             GNOMAD_GRAPHQL,
             json={
                 "query": """
                 query GeneSearch($query: String!) {
-                  gene_search(query: $query) {
-                    hits { gene_id symbol }
+                  gene_search(query: $query, reference_genome: GRCh38) {
+                    ensembl_id
+                    symbol
                   }
                 }
                 """,
@@ -58,12 +88,12 @@ def _symbol_to_ensembl_id(gene_symbol: str) -> Optional[str]:
         if r.status_code != 200:
             return None
         data = r.json()
-        hits = data.get("data", {}).get("gene_search", {}).get("hits", [])
+        hits = (data.get("data") or {}).get("gene_search") or []
         for h in hits:
             if h.get("symbol", "").upper() == gene_symbol.upper():
-                return h.get("gene_id")
+                return h.get("ensembl_id")
         if hits:
-            return hits[0].get("gene_id")
+            return hits[0].get("ensembl_id")
     except Exception as exc:
         log.debug("gnomAD search for %s: %s", gene_symbol, exc)
     return None
@@ -86,7 +116,7 @@ def fetch_gnomad_constraint(ensembl_gene_id: str) -> Optional[dict]:
                       gene(gene_id: $geneId, reference_genome: $referenceGenome) {
                         gnomad_constraint {
                           pli
-                          loeuf
+                          oe_lof_upper
                         }
                       }
                     }
@@ -106,7 +136,7 @@ def fetch_gnomad_constraint(ensembl_gene_id: str) -> Optional[dict]:
                 continue
             constraint = gene_data.get("gnomad_constraint") or {}
             pli = constraint.get("pli")
-            loeuf = constraint.get("loeuf")
+            loeuf = constraint.get("oe_lof_upper")  # gnomAD v4: oe_lof_upper = LOEUF
             if pli is not None or loeuf is not None:
                 return {
                     "pli": round(float(pli), 4) if pli is not None else None,
@@ -173,7 +203,7 @@ def annotate_genes_gnomad(gene_ids: list[str]) -> int:
     fetch_results: dict[str, dict] = {}
     for i, gid in enumerate(todo):
         gene = gene_map[gid]
-        ensembl_id = _symbol_to_ensembl_id(gene.gene_symbol)
+        ensembl_id = _symbol_to_ensembl_id(_hgnc_symbol(gene.gene_symbol))
         if ensembl_id:
             time.sleep(_RATE_SLEEP)  # between symbol-lookup and constraint call
             constraint = fetch_gnomad_constraint(ensembl_id)

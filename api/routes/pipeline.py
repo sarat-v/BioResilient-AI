@@ -150,7 +150,11 @@ def _seqera_poll_and_update(workflow_id: str) -> None:
 
 class RunRequest(BaseModel):
     resume_from: str = "step1"
+    """Inclusive end step for Nextflow (must match ``params.until`` in nextflow.config)."""
+    until_step: str = "step15"
     dry_run: bool = False
+    phenotype: str = "cancer_resistance"
+    species_ids: list[str] = []
 
 
 class RunResponse(BaseModel):
@@ -214,8 +218,12 @@ def start_pipeline(req: RunRequest, background_tasks: BackgroundTasks):
 
         params = {
             "from_step": req.resume_from,
+            "until": req.until_step,
             "dry_run": str(req.dry_run).lower(),
+            "phenotype": req.phenotype,
         }
+        if req.species_ids:
+            params["species_ids"] = ",".join(req.species_ids)
         try:
             workflow_id = client.launch_workflow(pipeline_id, params)
         except Exception as exc:
@@ -235,7 +243,10 @@ def start_pipeline(req: RunRequest, background_tasks: BackgroundTasks):
             "started_at": started_at,
             "updated_at": started_at,
             "resume_from": req.resume_from,
+            "until_step": req.until_step,
             "dry_run": req.dry_run,
+            "phenotype": req.phenotype,
+            "species_ids": req.species_ids,
             "steps": {},
         })
 
@@ -292,14 +303,18 @@ def start_pipeline(req: RunRequest, background_tasks: BackgroundTasks):
             "-profile", profile,
             "-with-tower",
             "-resume",
-            "--resume_from", req.resume_from,
+            "--from_step", req.resume_from,
+            "--until", req.until_step,
             "--outdir", f"s3://{s3_bucket}/results",
-            "--work_dir", work_dir,
+            "-work-dir", work_dir,
+            "--phenotype", req.phenotype,
         ]
         if db_url:
             cmd += ["--db_url", db_url]
         if req.dry_run:
             cmd += ["--dry_run", "true"]
+        if req.species_ids:
+            cmd += ["--species_ids", ",".join(req.species_ids)]
 
         env = os.environ.copy()
         env["TOWER_ACCESS_TOKEN"] = token
@@ -359,7 +374,10 @@ def start_pipeline(req: RunRequest, background_tasks: BackgroundTasks):
             "started_at": started_at,
             "updated_at": started_at,
             "resume_from": req.resume_from,
+            "until_step": req.until_step,
             "dry_run": req.dry_run,
+            "phenotype": req.phenotype,
+            "species_ids": req.species_ids,
             "steps": {},
         })
 
@@ -407,9 +425,15 @@ def start_pipeline(req: RunRequest, background_tasks: BackgroundTasks):
     if run_id:
         env["PIPELINE_RUN_ID"] = run_id
 
-    cmd = [sys.executable, str(_ORCHESTRATOR), f"--resume-from={req.resume_from}"]
+    cmd = [
+        sys.executable, str(_ORCHESTRATOR),
+        f"--resume-from={req.resume_from}",
+        f"--phenotype={req.phenotype}",
+    ]
     if req.dry_run:
         cmd.append("--dry-run")
+    if req.species_ids:
+        cmd.append(f"--species-ids={','.join(req.species_ids)}")
 
     _current_process = subprocess.Popen(
         cmd,

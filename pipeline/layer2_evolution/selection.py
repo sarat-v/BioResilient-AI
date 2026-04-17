@@ -209,9 +209,22 @@ def load_selection_scores(
                 ev.dnds_ratio = result.get("dnds_ratio")
                 ev.dnds_pvalue = result.get("dnds_pvalue")
                 ev.selection_model = result.get("selection_model")
-                # PAML branch-site results don't emit branches_under_selection;
-                # HyPhy BUSTED results do. Use .get() so both formats work.
+                # PAML branch-site results don't emit branches_under_selection.
                 ev.branches_under_selection = result.get("branches_under_selection")
+
+                # HyPhy fields (busted_pvalue, relax_k, relax_pvalue, fel_sites):
+                # PAML parse_paml_results() explicitly sets these to None so that
+                # stale HyPhy-era values are overwritten with NULL.  Use the key's
+                # presence (via `in`) rather than truthiness so None correctly clears
+                # any old value from a prior run.
+                if "busted_pvalue" in result:
+                    ev.busted_pvalue = result["busted_pvalue"]
+                if "relax_k" in result:
+                    ev.relax_k = result["relax_k"]
+                if "relax_pvalue" in result:
+                    ev.relax_pvalue = result["relax_pvalue"]
+                if "fel_sites" in result:
+                    ev.fel_sites = result["fel_sites"]
                 saved += 1
 
     log.info("Saved evolution scores for %d genes.", saved)

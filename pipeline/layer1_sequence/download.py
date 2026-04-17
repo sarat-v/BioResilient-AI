@@ -19,6 +19,8 @@ from urllib.parse import urlencode
 import requests
 from Bio import SeqIO
 
+from db.models import Species
+from db.session import get_session
 from pipeline.config import (
     get_ncbi_api_key,
     get_ncbi_email,
@@ -118,21 +120,34 @@ def _download_via_entrez(species_id: str, taxid: int, out_path: Path) -> Optiona
         r.raise_for_status()
         time.sleep(_RATE_LIMIT_SLEEP)
 
-        webenv = re.search(r"<WebEnv>(\S+)</WebEnv>", r.text)
-        query_key = re.search(r"<QueryKey>(\d+)</QueryKey>", r.text)
-        count = re.search(r"<Count>(\d+)</Count>", r.text)
+        # Parse Entrez XML response with ElementTree (more robust than regex)
+        import xml.etree.ElementTree as _ET
+        try:
+            root = _ET.fromstring(r.text)
+            webenv_text = (root.findtext("WebEnv") or "").strip()
+            query_key_text = (root.findtext("QueryKey") or "").strip()
+            count_text = (root.findtext("Count") or "0").strip()
+        except _ET.ParseError as exc:
+            log.error("    Entrez XML parse error for %s: %s", species_id, exc)
+            return None
 
-        if not webenv or not query_key:
+        if not webenv_text or not query_key_text:
             log.error("    Entrez search returned no results for %s", species_id)
             return None
 
-        n_proteins = int(count.group(1)) if count else 0
+        n_proteins = int(count_text) if count_text.isdigit() else 0
         log.info("    Entrez: %d proteins found for taxid %s", n_proteins, taxid)
+        if n_proteins > 50000:
+            log.warning(
+                "    Entrez proteome for %s has %d proteins but fetch is capped at 50,000. "
+                "Consider using NCBI Datasets for a complete proteome.",
+                species_id, n_proteins,
+            )
 
         fetch_params = _ncbi_params({
             "db": "protein",
-            "query_key": query_key.group(1),
-            "WebEnv": webenv.group(1),
+            "query_key": query_key_text,
+            "WebEnv": webenv_text,
             "rettype": "fasta",
             "retmode": "text",
             "retmax": min(n_proteins, 50000),
@@ -231,6 +246,20 @@ def validate_proteome(path: Path, min_proteins: int = 100) -> bool:
     return True
 
 
+def _persist_proteome_path(species_id: str, fasta_path: Path) -> None:
+    """Write the local FASTA path to Species.proteome_path in the DB."""
+    try:
+        with get_session() as session:
+            sp = session.get(Species, species_id)
+            if sp is None:
+                log.debug("_persist_proteome_path: Species %s not in DB yet; skipping.", species_id)
+                return
+            sp.proteome_path = str(fasta_path)
+            session.commit()
+    except Exception as exc:
+        log.debug("Could not persist proteome_path for %s: %s", species_id, exc)
+
+
 def run_downloads(species_list: list[dict]) -> dict[str, Path]:
     """Download proteomes for all species. Returns map of species_id → FASTA path."""
     paths: dict[str, Path] = {}
@@ -245,6 +274,7 @@ def run_downloads(species_list: list[dict]) -> dict[str, Path]:
             if raw and validate_proteome(raw):
                 reheadered = reheader_fasta(raw, sid)
                 paths[sid] = reheadered
+                _persist_proteome_path(sid, reheadered)
             else:
                 log.error("  FAILED: %s proteome download or validation failed", sid)
         except Exception as exc:
@@ -257,6 +287,7 @@ def run_downloads(species_list: list[dict]) -> dict[str, Path]:
         if validate_proteome(human_raw, min_proteins=10000):
             human_reheadered = reheader_fasta(human_raw, "human")
             paths["human"] = human_reheadered
+            _persist_proteome_path("human", human_reheadered)
     except Exception as exc:
         log.error("  FAILED: human proteome — %s", exc)
 

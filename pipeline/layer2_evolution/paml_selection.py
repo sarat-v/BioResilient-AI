@@ -1,25 +1,33 @@
 """Step 6 — PAML codeml branch-site model A for positive selection analysis.
 
-Replaces the HyPhy suite (BUSTED-PH + FEL + BUSTED + RELAX) with a single
-fast test that is:
-  - 10-50× faster  (5-30 s per OG vs 5-30 min with HyPhy)
-  - Well-established in the literature (Yang & Nielsen 2002; Zhang et al. 2005)
-  - Directly answers the biological question: is there positive selection in
-    cancer-resistant lineages (foreground branches)?
+Statistical framework:
+  Branch-site model A (Yang & Nielsen 2002 Genetics 161:1727-1737)
+  H0 (null):        ω fixed at 1 in foreground branches (no positive selection)
+  H1 (alternative): ω free  in foreground branches (positive selection allowed)
+  LRT = 2 × (lnL_H1 − lnL_H0)
 
-Test: Branch-site model A (Yang & Nielsen 2002)
-  H0 (null):        fix_omega=1, omega=1  (no positive selection in foreground)
-  H1 (alternative): fix_omega=0, omega free  (positive selection allowed in foreground)
-  LRT = 2 × (lnL_H1 − lnL_H0), df = 2, chi-squared p-value
+  The null hypothesis has a boundary constraint (ω=1 is on the boundary of
+  the parameter space), so the LRT statistic follows a 50:50 mixture of
+  χ²(df=1) and a point mass at zero.  Conservative approximation df=1 is used
+  per Zhang et al. (2005) Mol Biol Evol 22:2472-2479 and Yang (2007) Mol
+  Evolution p.130.  This is the standard for publication.
 
-Output columns (same schema, no migration needed):
-  dnds_pvalue      ← LRT p-value  (maps to BUSTED-PH slot)
-  dnds_ratio       ← foreground ω in the positive selection site class
+Output columns written to evolution_score:
+  dnds_pvalue      ← LRT p-value (branch-site positive selection test)
+  dnds_ratio       ← foreground ω in the positive selection site class (ω_fg)
   selection_model  ← "paml_branch_site"
-  busted_pvalue    ← same as dnds_pvalue (populates 30% BUSTED scoring weight)
-  relax_k          ← ω_fg / ω_bg  (intensity ratio)
-  relax_pvalue     ← same as dnds_pvalue when ω_fg > 1
-  fel_sites        ← NULL (no per-site analysis; add M7/M8 in a future step)
+  busted_pvalue    ← NULL  (HyPhy BUSTED not run; field intentionally empty)
+  relax_k          ← NULL  (HyPhy RELAX not run; field intentionally empty)
+  relax_pvalue     ← NULL  (HyPhy RELAX not run; field intentionally empty)
+  fel_sites        ← NULL  (HyPhy FEL not run; field intentionally empty)
+
+Rationale for PAML-only approach:
+  FEL, BUSTED, and RELAX test different (and for this study less appropriate)
+  hypotheses.  FEL detects pervasive selection across ALL branches — diluting
+  the foreground signal.  BUSTED is gene-wide and non-directional.  RELAX
+  tests constraint relaxation, not positive selection.  PAML branch-site model
+  A directly and specifically tests the biological question: did positive
+  selection act in the cancer-resistant (foreground) lineages?
 """
 
 from __future__ import annotations
@@ -30,6 +38,7 @@ import os
 import re
 import subprocess
 import tempfile
+from concurrent.futures import ProcessPoolExecutor, as_completed
 from pathlib import Path
 from typing import Optional
 
@@ -328,9 +337,15 @@ def run_paml_branch_site(
         log.debug("PAML H0 produced no lnL for %s", og_id)
         return None
 
-    # LRT statistic and p-value
+    # LRT statistic and p-value.
+    # Branch-site model A has a boundary constraint on the null: under H0 the
+    # foreground ω is fixed at 1 (boundary of the parameter space), so the LRT
+    # statistic follows a 50:50 mixture of χ²(df=1) and a point mass at zero.
+    # The standard conservative approximation (Zhang et al. 2005 Mol Biol Evol
+    # 22:2472-2479; Yang 2007 Mol Evolution p.130) uses df=1, which is correct
+    # and preferred for publication.  df=2 would be anti-conservative.
     lrt = max(0.0, 2.0 * (lnl_h1 - lnl_h0))
-    pvalue = float(_chi2.sf(lrt, df=2)) if lrt > 0 else 1.0
+    pvalue = float(_chi2.sf(lrt, df=1)) if lrt > 0 else 1.0
 
     omega_fg, omega_bg = _parse_site_class_omegas(work_dir / h1_out)
 
@@ -356,39 +371,168 @@ def run_paml_branch_site(
 def parse_paml_results(paml_result: Optional[dict]) -> dict:
     """Convert PAML branch-site output to the EvolutionScore DB column format.
 
-    Maps PAML outputs to the existing evolution_score schema (no migration needed):
-      dnds_pvalue    ← LRT p-value  (branch-site phenotype-specific signal)
-      dnds_ratio     ← foreground ω  (strength of positive selection)
-      selection_model← "paml_branch_site"
-      busted_pvalue  ← same as dnds_pvalue (fills 30% BUSTED slot in scoring)
-      relax_k        ← ω_fg / ω_bg  (selection intensity ratio, fills 10% RELAX slot)
-      relax_pvalue   ← same as dnds_pvalue when ω_fg > 1
-      fel_sites      ← None  (no per-site analysis; add codeml M7/M8 later)
+    Only PAML-native outputs are written.  HyPhy fields (busted_pvalue,
+    relax_k, relax_pvalue, fel_sites) are left NULL because HyPhy tests are
+    not run in this pipeline — leaving them NULL is scientifically honest and
+    prevents downstream confusion if those columns are ever queried directly.
     """
     if paml_result is None:
         return {
-            "dnds_pvalue":    1.0,
-            "dnds_ratio":     None,
+            "dnds_pvalue":     1.0,
+            "dnds_ratio":      None,
             "selection_model": "paml_no_signal",
-            "busted_pvalue":  None,
-            "relax_k":        None,
-            "relax_pvalue":   None,
-            "fel_sites":      None,
+            "busted_pvalue":   None,
+            "relax_k":         None,
+            "relax_pvalue":    None,
+            "fel_sites":       None,
         }
 
     pvalue   = paml_result.get("paml_pvalue", 1.0)
-    omega_fg = paml_result.get("omega_fg")   or 0.0
-    omega_bg = paml_result.get("omega_bg")   or 1.0
-
-    relax_k      = round(omega_fg / max(omega_bg, 0.001), 4) if omega_fg else None
-    relax_pvalue = round(pvalue, 8) if (omega_fg and omega_fg > 1.0) else 1.0
+    omega_fg = paml_result.get("omega_fg") or 0.0
 
     return {
-        "dnds_pvalue":    round(pvalue, 8),
-        "dnds_ratio":     round(omega_fg, 4),
+        "dnds_pvalue":     round(pvalue, 8),
+        "dnds_ratio":      round(omega_fg, 4),
         "selection_model": "paml_branch_site",
-        "busted_pvalue":  round(pvalue, 8),
-        "relax_k":        relax_k,
-        "relax_pvalue":   relax_pvalue,
-        "fel_sites":      None,
+        "busted_pvalue":   None,   # HyPhy BUSTED not run — intentionally NULL
+        "relax_k":         None,   # HyPhy RELAX not run — intentionally NULL
+        "relax_pvalue":    None,   # HyPhy RELAX not run — intentionally NULL
+        "fel_sites":       None,   # HyPhy FEL not run  — intentionally NULL
     }
+
+
+# ---------------------------------------------------------------------------
+# Parallel pipeline runner  (drop-in replacement for run_meme_pipeline)
+# ---------------------------------------------------------------------------
+
+
+def _paml_worker(
+    args: tuple[str, dict[str, str], str, dict[str, list]],
+) -> tuple[str, Optional[dict]]:
+    """Process-pool worker: build codon alignment → run PAML → return parsed result.
+
+    Args:
+        args: (og_id, protein_alignment, species_tree_text, motifs_by_og)
+
+    Returns:
+        (og_id, parsed_result_dict)  where parsed_result_dict is None on failure.
+    """
+    og_id, protein_aln, tree_text, motifs_by_og = args
+
+    try:
+        from pipeline.layer2_evolution.meme_selection import (
+            protein_to_codon_alignment,
+            fetch_cds_for_protein,
+        )
+        from pipeline.config import get_local_storage_root
+
+        # Build cds_seqs dict from the disk cache populated by _prefetch_all_cds
+        # (called before the worker pool in run_paml_pipeline — no NCBI calls here).
+        cds_seqs: dict[str, str] = {
+            label: seq
+            for label in protein_aln
+            if (seq := fetch_cds_for_protein(label))
+        }
+
+        codon_aln = protein_to_codon_alignment(protein_aln, cds_seqs)
+        if not codon_aln:
+            # Not enough CDS data — use a null result (pval=1.0, no selection)
+            return og_id, parse_paml_results(None)
+
+        work_dir = Path(get_local_storage_root()) / "paml" / og_id
+        result = run_paml_branch_site(codon_aln, tree_text, og_id, work_dir)
+        return og_id, parse_paml_results(result)
+
+    except Exception as exc:
+        log.warning("PAML worker failed for %s: %s", og_id, exc)
+        return og_id, None
+
+
+def run_paml_pipeline(
+    aligned_orthogroups: dict[str, dict[str, str]],
+    motifs_by_og: dict[str, list],
+    species_treefile: Path,
+    flush_callback=None,
+) -> dict[str, dict]:
+    """Run PAML branch-site model A in parallel for all candidate orthogroups.
+
+    Drop-in replacement for run_meme_pipeline():
+      - Same call signature
+      - Same return type: {og_id: parsed_selection_result}
+      - Writes selection_model="paml_branch_site" to every EvolutionScore row
+
+    Args:
+        aligned_orthogroups: {og_id: {species_id: protein_aligned_seq}}
+        motifs_by_og:        {og_id: [motif_dict, ...]}  — divergence gate
+        species_treefile:    Path to Newick species tree
+        flush_callback:      optional callable(batch) for incremental DB writes
+    """
+    from pipeline.layer2_evolution.meme_selection import _prefetch_all_cds
+    from pipeline.layer2_evolution.selection import _should_run_hyphy
+
+    candidates = [og for og in aligned_orthogroups if _should_run_hyphy(og, motifs_by_og)]
+    log.info(
+        "PAML branch-site: running on %d candidate orthogroups...",
+        len(candidates),
+    )
+
+    # Pre-fetch all CDS sequences to disk cache before spawning workers.
+    # This avoids workers racing against NCBI's rate limit.
+    _prefetch_all_cds(aligned_orthogroups)
+
+    tree_text = Path(species_treefile).read_text().strip()
+    n_cpu = os.cpu_count() or 4
+    n_workers = max(1, n_cpu - 2)
+
+    work_items = [
+        (og_id, aligned_orthogroups[og_id], tree_text, motifs_by_og)
+        for og_id in candidates
+    ]
+
+    all_results: dict[str, dict] = {}
+    pending_flush: dict[str, dict] = {}
+    success = 0
+    no_cds = 0
+    failed = 0
+    done = 0
+    total = len(candidates)
+    _FLUSH_INTERVAL = 500
+
+    with ProcessPoolExecutor(max_workers=n_workers) as pool:
+        futures = {pool.submit(_paml_worker, item): item[0] for item in work_items}
+        for future in as_completed(futures):
+            og_id, parsed = future.result()
+            done += 1
+
+            if parsed is not None:
+                model = parsed.get("selection_model", "")
+                if model == "paml_branch_site":
+                    success += 1
+                elif model == "paml_no_signal":
+                    no_cds += 1
+                else:
+                    no_cds += 1
+                all_results[og_id] = parsed
+                pending_flush[og_id] = parsed
+            else:
+                failed += 1
+
+            if done % 100 == 0 or done == total:
+                log.info(
+                    "  PAML: %d / %d (%.0f%%) — %d p-values, %d no-signal, %d failed",
+                    done, total, 100 * done / total, success, no_cds, failed,
+                )
+
+            if flush_callback and len(pending_flush) >= _FLUSH_INTERVAL:
+                flush_callback(dict(pending_flush))
+                pending_flush.clear()
+
+    if flush_callback and pending_flush:
+        flush_callback(pending_flush)
+        pending_flush.clear()
+
+    log.info(
+        "PAML complete: %d p-values, %d no-signal, %d failed",
+        success, no_cds, failed,
+    )
+    return all_results

@@ -1,11 +1,14 @@
 /*
  * Phase 2 — Clinical Translation Module
- * Steps: 10b, 11, 11b, 11c, 11d, 12, 12b, 13, 14, 14b, 15
+ * Steps: 9b, 10b, 11, 11b, 11c, 11d, 12, 12b, 13, 14, 14b, 15
  *
  * All Phase 2 steps operate on Tier1/Tier2 genes from Phase 1 scoring.
  * Many annotation steps (11, 11b, 11c) are API-bound and run in parallel.
  *
  * Resource notes:
+ *   - step9b (structural context): clinical container (fpocket); 4 CPUs; 8 GB.
+ *     Downloads AlphaFold PDBs, runs fpocket per gene, loads AlphaMissense index
+ *     (~100 MB filtered), queries UniProt REST API once per gene.  2h is generous.
  *   - API-bound steps (step11, 11b, 11c, 14): 2 CPUs (ThreadPoolExecutor uses I/O threads,
  *     not CPU-bound). Paying for idle vCPUs on Batch is wasted cost.
  *   - step12 (fpocket): 4 CPUs — fpocket itself is single-threaded but we run it per-gene;
@@ -15,6 +18,28 @@
  *   - time limits: ALL steps have explicit limits to kill runaway containers on Spot
  *     and avoid holding the queue if a job hangs on a slow API.
  */
+
+process structural_annotation {
+    label 'clinical'    // requires fpocket binary; clinical image is built FROM base so run_step.py is current
+    cpus 4
+    memory '8 GB'       // AlphaMissense filtered index (~100 MB) + AlphaFold PDBs fit in 8 GB
+    time '2h'           // AlphaFold downloads + UniProt API + AlphaMissense scoring per gene
+
+    input:
+    val scored
+
+    output:
+    val true, emit: struct_done
+
+    script:
+    """
+    python -m scripts.nf_wrappers.run_step \
+        --step step9b \
+        --db-url '${params.db_url}' \
+        --storage-root '${params.storage_root}' \
+        --ncbi-api-key '${params.ncbi_api_key ?: ""}'
+    """
+}
 
 process alphagenome_regulatory {
     label 'base'
@@ -267,6 +292,7 @@ workflow PHASE2_CLINICAL {
 
     main:
     def CLINICAL_STEPS = [
+        'step9b',
         'step10b','step11','step11b','step11c','step11d',
         'step12','step12b','step13','step14','step14b','step15'
     ]
@@ -277,16 +303,25 @@ workflow PHASE2_CLINICAL {
     if (fromIdx < 0) fromIdx = 0
     if (untilIdx < 0) untilIdx = CLINICAL_STEPS.size() - 1
 
-    // step10b and step11 run in parallel after scoring
+    // step9b: structural context annotation — must run before step10b/step11
+    // Reads AlphaFold PDBs + AlphaMissense index; writes structural_score to CandidateScore.
+    if (fromIdx <= CLINICAL_STEPS.indexOf('step9b') && untilIdx >= CLINICAL_STEPS.indexOf('step9b')) {
+        structural_annotation(scored)
+        struct_done_ch = structural_annotation.out.struct_done
+    } else {
+        struct_done_ch = Channel.value(true)
+    }
+
+    // step10b and step11 run in parallel after step9b (structural annotation)
     if (fromIdx <= CLINICAL_STEPS.indexOf('step10b') && untilIdx >= CLINICAL_STEPS.indexOf('step10b')) {
-        alphagenome_regulatory(scored)
+        alphagenome_regulatory(struct_done_ch)
         alphagenome_done_ch = alphagenome_regulatory.out.alphagenome_done
     } else {
         alphagenome_done_ch = Channel.value(true)
     }
 
     if (fromIdx <= CLINICAL_STEPS.indexOf('step11') && untilIdx >= CLINICAL_STEPS.indexOf('step11')) {
-        disease_annotation(scored)
+        disease_annotation(struct_done_ch)
         disease_done_ch = disease_annotation.out.disease_done
     } else {
         disease_done_ch = Channel.value(true)

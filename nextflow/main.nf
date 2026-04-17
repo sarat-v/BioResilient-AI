@@ -16,7 +16,7 @@
  * Profiles: local, aws, gcp, seqera
  *
  * Key features:
- *   - Per-orthogroup scatter for HyPhy steps (6, 6b, 6c) — spot-safe
+ *   - Per-orthogroup scatter for PAML step 6 — spot-safe
  *   - Automatic retries on spot/preemptible interruptions
  *   - Parallel execution of independent steps within each phase
  *   - Cloud-agnostic: same workflow runs on AWS Batch, GCP Batch, or local
@@ -35,7 +35,7 @@ log.info """
 ╠══════════════════════════════════════════════════════════╣
 ║  Phenotype    : ${params.phenotype}
 ║  From step    : ${params.from_step}
-║  Until step   : ${params.until ?: 'step15'}
+║  Until step   : ${params.until ?: 'step18'}
 ║  DB URL       : ${params.db_url?.take(40)}...
 ║  Storage      : ${params.storage_root}
 ║  Profile      : ${workflow.profile}
@@ -43,15 +43,88 @@ log.info """
 ╚══════════════════════════════════════════════════════════╝
 """
 
-// Actual workflow execution order — used for from_step / until gating
+// Actual workflow execution order — used for from_step / until gating.
+// Pipeline boundary: step18 (target dossier) is the final computational step.
+// Steps 19-25 (virtual screening, lead optimisation) are a separate product
+// requiring wet-lab inputs and are NOT part of this pipeline.
 def STEP_ORDER = [
     'step1','step2','step3','step3b','step3c',
     'step4','step4b','step4c','step4d',
-    'step5','step3d','step6','step6b','step6c','step7','step7b',
+    'step5','step3d','step6','step7','step7b',
     'step8','step8b','step9','step9b',
     'step10b','step11','step11b','step11c','step11d',
     'step12','step12b','step13','step14','step14b','step15',
+    'step16','step17','step18',
 ]
+
+// ── Phase 3 processes (steps 16-18) ────────────────────────────────────────
+// These are lightweight API / DB-write steps — 2 CPUs, 4 GB RAM each.
+
+process translational_status {
+    label 'base'
+    cpus 2
+    memory '4 GB'
+    time '1h'
+
+    input:
+    val ready
+
+    output:
+    val true, emit: trans_done
+
+    script:
+    """
+    export DATABASE_URL='${params.db_url}'
+    export BIORESILIENT_STORAGE_ROOT='${params.storage_root}'
+    python -m scripts.nf_wrappers.run_step \
+        --step step16 \
+        --phenotype '${params.phenotype}'
+    """
+}
+
+process preclinical_readiness {
+    label 'base'
+    cpus 2
+    memory '4 GB'
+    time '1h'
+
+    input:
+    val ready
+
+    output:
+    val true, emit: preclinical_done
+
+    script:
+    """
+    export DATABASE_URL='${params.db_url}'
+    export BIORESILIENT_STORAGE_ROOT='${params.storage_root}'
+    python -m scripts.nf_wrappers.run_step \
+        --step step17 \
+        --phenotype '${params.phenotype}'
+    """
+}
+
+process target_dossier {
+    label 'base'
+    cpus 2
+    memory '4 GB'
+    time '1h'
+
+    input:
+    val ready
+
+    output:
+    val true
+
+    script:
+    """
+    export DATABASE_URL='${params.db_url}'
+    export BIORESILIENT_STORAGE_ROOT='${params.storage_root}'
+    python -m scripts.nf_wrappers.run_step \
+        --step step18 \
+        --phenotype '${params.phenotype}'
+    """
+}
 
 workflow {
     start = Channel.value(true)
@@ -110,6 +183,31 @@ workflow {
     // ── Phase 2 Clinical translation (steps 9b–15) ───────────────────────
     if (overlaps('step9b', 'step15')) {
         PHASE2_CLINICAL(scored_ch)
+        phase2_done_ch = PHASE2_CLINICAL.out.pipeline_done
+    } else {
+        phase2_done_ch = Channel.value(true)
+    }
+
+    // ── Phase 3 Translational / Dossier (steps 16–18) ────────────────────
+    // Pipeline boundary: step18 (target dossier) is the final computational
+    // output. Steps 19-25 (virtual screening, ADMET, lead optimisation)
+    // require wet-lab validation inputs and are a separate downstream product.
+    if (overlaps('step16', 'step16')) {
+        translational_status(phase2_done_ch)
+        translational_done_ch = translational_status.out.trans_done
+    } else {
+        translational_done_ch = Channel.value(true)
+    }
+
+    if (overlaps('step17', 'step17')) {
+        preclinical_readiness(translational_done_ch)
+        preclinical_done_ch = preclinical_readiness.out.preclinical_done
+    } else {
+        preclinical_done_ch = Channel.value(true)
+    }
+
+    if (overlaps('step18', 'step18')) {
+        target_dossier(preclinical_done_ch)
     }
 }
 
@@ -132,7 +230,7 @@ workflow health_check {
         export BIORESILIENT_STORAGE_ROOT='${params.storage_root}'
 
         echo "=== Per-step reports ==="
-        STEPS="step1 step2 step3 step3b step3c step4 step4b step4c step4d step3d step5 step6 step6b step6c step7 step7b step8 step8b step9"
+        STEPS="step1 step2 step3 step3b step3c step4 step4b step4c step4d step3d step5 step6 step7 step7b step8 step8b step9"
         for step in \$STEPS; do
             echo "--- \$step ---"
             python -m pipeline.step_reporter --step "\$step" || true
@@ -187,6 +285,84 @@ PYEOF
 
 workflow data_quality_check {
     run_data_quality_check()
+}
+
+// ── Stage 1 (step4c–4d) success verification ──────────────────────────────
+// Runs inside AWS Batch (VPC → RDS). Local machines cannot reach private RDS.
+// Run with: nextflow run nextflow/main.nf -entry stage1_verify -profile aws
+
+process stage1_success_verify {
+    label 'base'
+    cpus 1
+    memory '2 GB'
+    time '15m'
+
+    script:
+    """
+    export DATABASE_URL='${params.db_url}'
+    python3 << 'PYEOF'
+import os
+import sys
+import psycopg2
+
+conn = psycopg2.connect(os.environ['DATABASE_URL'])
+cur = conn.cursor()
+
+print('=== Stage 1 success checks (after step4c + step4d) ===')
+# Note: exact 0.0 can be a genuine mean LLR (neutral substitution), not only
+# the old sentinel. Pre-step A clears false zeros before 4c; 4c may write 0.0 again.
+cur.execute('SELECT COUNT(*) FROM divergent_motif WHERE esm1v_score = 0.0')
+zeros = cur.fetchone()[0]
+cur.execute('SELECT COUNT(*) FROM divergent_motif WHERE esm1v_score IS NOT NULL')
+scored = cur.fetchone()[0]
+pct_zero = 100.0 * zeros / scored if scored else 0.0
+print(f"1) esm1v_score = 0.0: {zeros:,} of {scored:,} scored ({pct_zero:.1f}%) — OK if neutral LLRs; investigate if >40%")
+
+cur.execute('SELECT COUNT(*) FROM divergent_motif WHERE esm1v_score IS NULL')
+nulls = cur.fetchone()[0]
+cur.execute('SELECT COUNT(*) FROM divergent_motif')
+total = cur.fetchone()[0]
+print(f"2) esm1v_score IS NULL: {nulls} / {total} motifs")
+
+cur.execute(
+    'SELECT motif_direction, COUNT(*) AS n,'
+    ' ROUND(100.0 * COUNT(*) / SUM(COUNT(*)) OVER (), 2) AS pct'
+    ' FROM divergent_motif WHERE motif_direction IS NOT NULL'
+    ' GROUP BY motif_direction ORDER BY n DESC'
+)
+rows = cur.fetchall()
+print('')
+print('3) motif_direction distribution:')
+for r in rows:
+    print(f"   {str(r[0]):22s}  n={r[1]:>10,}  pct={r[2]}%")
+
+neutral_pct = None
+for r in rows:
+    if r[0] == 'neutral':
+        neutral_pct = float(r[2])
+        break
+if neutral_pct is not None:
+    ok = neutral_pct < 90.0
+    print('')
+    print(f"4) neutral < 90% (plan gate): {neutral_pct}%  {'PASS' if ok else 'FAIL (variant direction still dominated by neutral)'}")
+
+cur.execute(
+    "SELECT COUNT(*) FROM divergent_motif WHERE motif_direction = 'loss_of_function'"
+)
+lof = cur.fetchone()[0]
+print(f"5) loss_of_function count: {lof:,}  {'PASS' if lof > 0 else 'WARN (zero LoF — check LOEUF / step4d logic)'}")
+
+conn.close()
+print('')
+print('=== End Stage 1 checks ===')
+# Exit 0: informational verify; inspect printed FAIL/WARN above for biology.
+sys.exit(0)
+PYEOF
+    """
+}
+
+workflow stage1_verify {
+    stage1_success_verify()
 }
 
 workflow.onComplete {

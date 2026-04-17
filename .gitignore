@@ -73,3 +73,4 @@ Thumbs.db
 
 # Node modules (anywhere)
 node_modules/
+.vercel

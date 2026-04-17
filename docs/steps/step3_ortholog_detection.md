@@ -126,8 +126,10 @@ Conservation scores computed for each gene–region pair by global pairwise alig
 > The `conservation_score` here measures *variance* in conservation — low average values indicate most CDS positions are highly variable across the 18 species (expected: even conserved proteins vary in faster-evolving lineages like sharks and hydra). The `percent_identity` of ~82–84% across all regions reflects the average pairwise similarity between human and a given species ortholog.
 
 **Regulatory divergence events (pairwise, all species vs. human):**
-- Total divergence events: **1,242,496**
-- Total regulatory convergence events: **1,241,969**
+- Total divergence events: **1,242,496** — positions where a cancer-resistant species sequence *differs* from human at that promoter/downstream base
+- Total regulatory convergence events: **1,241,969** — positions where a cancer-resistant species sequence *matches* human (i.e., convergently returned to the human/ancestral state)
+
+> **Terminology note:** "Regulatory convergence event" in the database schema denotes the complementary set of "same-as-human" positions in the pairwise alignment — not evolutionary convergence between cancer-resistant species. Evolutionary convergence across multiple independent cancer-resistant lineages is quantified in Step 7 using the permutation-based convergence scoring framework.
 
 **Top genes by promoter divergence (most changed across species):**
 

@@ -28,7 +28,10 @@ RUN wget -qO /tmp/p2rank.tar.gz \
 # Use base image Python (not conda pip on PATH) + quote >= for shell
 RUN /usr/local/bin/python3 -m pip install 'rpy2>=3.5.0'
 
-ENV P2RANK_JAR=/opt/p2rank/p2rank.jar
+ENV P2RANK_JAR=/opt/p2rank/bin/p2rank.jar
+ENV P2RANK_BIN=/opt/p2rank/prank
 
 RUN fpocket --help > /dev/null 2>&1 || true
-RUN java -jar /opt/p2rank/p2rank.jar --help > /dev/null 2>&1 || true
+RUN /opt/p2rank/prank --help > /dev/null 2>&1 || true
+
+# Force rebuild: 2026-04-10 p2rank-strip-csv-whitespace

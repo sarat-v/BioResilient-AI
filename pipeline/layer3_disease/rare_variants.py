@@ -44,6 +44,19 @@ GNOMAD_GRAPHQL = "https://gnomad.broadinstitute.org/api"
 GWAS_API = "https://www.ebi.ac.uk/gwas/rest/api"
 REQUEST_TIMEOUT = 20
 
+_SPECIES_SUFFIXES = ("_HUMAN", "_MOUSE", "_RAT", "_DOG", "_CAT", "_WHALE", "_BAT", "_SHARK")
+
+
+def _hgnc_symbol(full_symbol: str) -> str:
+    """Strip UniProt species suffix to get clean HGNC gene symbol.
+
+    e.g. 'AKT1_HUMAN' -> 'AKT1', 'CDK4_HUMAN' -> 'CDK4'
+    """
+    for suffix in _SPECIES_SUFFIXES:
+        if full_symbol.upper().endswith(suffix):
+            return full_symbol[: -len(suffix)]
+    return full_symbol
+
 # Miyata biochemical groupings for amino acid similarity
 # Source: Miyata et al. (1979) J Mol Evol 12:219
 _MIYATA_GROUPS: dict[str, int] = {
@@ -76,7 +89,7 @@ def _get_gene_coordinates_hg38(gene_symbol: str) -> Optional[tuple[str, int, int
         api_key = get_ncbi_api_key()
         params = {
             "db": "gene",
-            "term": f"{gene_symbol}[gene] AND 9606[taxid]",
+            "term": f"{_hgnc_symbol(gene_symbol)}[gene] AND 9606[taxid]",
             "retmax": 1,
             "retmode": "json",
         }
@@ -135,6 +148,7 @@ def _query_gnomad_variants(
         elif chrom_short == "24":
             chrom_short = "Y"
 
+    # gnomAD v4: af is a Float directly, not an object
     query = """
     query($geneSymbol: String!, $referenceGenome: ReferenceGenomeId!) {
       gene(gene_symbol: $geneSymbol, reference_genome: $referenceGenome) {
@@ -143,35 +157,39 @@ def _query_gnomad_variants(
           pos
           ref
           alt
-          exome { af { af } }
-          genome { af { af } }
+          exome { af }
+          genome { af }
           consequence
           hgvsp
         }
       }
     }
     """
+    clean_symbol = _hgnc_symbol(gene_symbol)
     try:
         r = requests.post(
             GNOMAD_GRAPHQL,
-            json={"query": query, "variables": {"geneSymbol": gene_symbol, "referenceGenome": "GRCh38"}},
+            json={"query": query, "variables": {"geneSymbol": clean_symbol, "referenceGenome": "GRCh38"}},
             timeout=30,
         )
         if r.status_code != 200:
             return []
         data = r.json()
+        if data.get("errors"):
+            log.debug("gnomAD variants query errors for %s: %s", clean_symbol, data["errors"])
+            return []
         variants_raw = data.get("data", {}).get("gene", {}).get("variants", []) or []
 
         rare_variants = []
         for v in variants_raw:
-            # Get AF from exome or genome
+            # gnomAD v4: exome.af and genome.af are plain floats
             af = None
-            exome_af = (v.get("exome") or {}).get("af", {})
-            genome_af = (v.get("genome") or {}).get("af", {})
-            if exome_af and exome_af.get("af") is not None:
-                af = exome_af["af"]
-            elif genome_af and genome_af.get("af") is not None:
-                af = genome_af["af"]
+            exome_af = (v.get("exome") or {}).get("af")
+            genome_af = (v.get("genome") or {}).get("af")
+            if exome_af is not None:
+                af = exome_af
+            elif genome_af is not None:
+                af = genome_af
 
             if af is None or af > max_af:
                 continue
@@ -219,53 +237,55 @@ def _parse_hgvsp_position(hgvsp: str) -> Optional[tuple[str, int, str]]:
 def _fetch_gwas_associations(gene_symbol: str) -> list[dict]:
     """Fetch GWAS Catalog associations for a gene, returning protective hits.
 
-    Returns list of {trait, pvalue, is_protective} dicts.
+    Returns list of {trait, pvalue} dicts.
+    Uses GWAS Catalog v2 gene search (not the deprecated /genes endpoint).
     """
+    clean_symbol = _hgnc_symbol(gene_symbol)
     try:
         r = requests.get(
-            f"{GWAS_API}/genes",
-            params={"geneName": gene_symbol, "size": 1},
+            f"{GWAS_API}/singleNucleotidePolymorphisms/search/findByGene",
+            params={"geneName": clean_symbol, "size": 200},
             timeout=REQUEST_TIMEOUT,
         )
         if r.status_code != 200:
             return []
         data = r.json()
-        embeds = data.get("_embedded", {}).get("genes", [])
-        if not embeds:
+        snps = data.get("_embedded", {}).get("singleNucleotidePolymorphisms", [])
+        if not snps:
             return []
 
-        self_link = embeds[0].get("_links", {}).get("self", {}).get("href", "")
-        if not self_link:
-            return []
-
-        r2 = requests.get(
-            f"https://www.ebi.ac.uk{self_link}/associations",
-            params={"size": 200},
-            timeout=REQUEST_TIMEOUT,
-        )
-        if r2.status_code != 200:
-            return []
-
-        assoc_list = r2.json().get("_embedded", {}).get("associations", [])
         hits = []
-        for assoc in assoc_list:
-            pval = assoc.get("pvalue")
-            if pval is None:
+        for snp in snps[:50]:
+            snp_link = snp.get("_links", {}).get("self", {}).get("href", "")
+            if not snp_link:
                 continue
-            try:
-                pval_float = float(pval)
-            except ValueError:
+            r2 = requests.get(
+                f"{snp_link}/associations",
+                params={"size": 50},
+                timeout=REQUEST_TIMEOUT,
+            )
+            if r2.status_code != 200:
                 continue
-            traits = assoc.get("efoTraits") or []
-            for trait in traits:
-                name = trait.get("trait", "") if isinstance(trait, dict) else str(trait)
-                if name:
-                    hits.append({"trait": name, "pvalue": pval_float})
+            time.sleep(0.1)
+            assoc_list = r2.json().get("_embedded", {}).get("associations", [])
+            for assoc in assoc_list:
+                pval = assoc.get("pvalue")
+                if pval is None:
+                    continue
+                try:
+                    pval_float = float(pval)
+                except (ValueError, TypeError):
+                    continue
+                traits = assoc.get("efoTraits") or []
+                for trait in traits:
+                    name = trait.get("trait", "") if isinstance(trait, dict) else str(trait)
+                    if name:
+                        hits.append({"trait": name, "pvalue": pval_float})
 
         return hits
 
     except Exception as exc:
-        log.debug("GWAS Catalog fetch failed for %s: %s", gene_symbol, exc)
+        log.debug("GWAS Catalog fetch failed for %s: %s", clean_symbol, exc)
         return []
 
 
@@ -288,6 +308,8 @@ def annotate_protective_variants(gene_ids: Optional[list[str]] = None) -> int:
     for gene in genes:
         if not gene.gene_symbol:
             continue
+
+        clean_symbol = _hgnc_symbol(gene.gene_symbol)
 
         # Collect divergent positions from all motifs for this gene
         with get_session() as session:
@@ -312,16 +334,16 @@ def annotate_protective_variants(gene_ids: Optional[list[str]] = None) -> int:
         if not divergent_positions:
             continue
 
-        # Get gene coordinates
-        coords = _get_gene_coordinates_hg38(gene.gene_symbol)
+        # Get gene coordinates using clean HGNC symbol
+        coords = _get_gene_coordinates_hg38(clean_symbol)
         if not coords:
             continue
         chrom, start, stop = coords
 
         time.sleep(0.15)
 
-        # Query gnomAD for rare variants
-        rare_variants = _query_gnomad_variants(gene.gene_symbol, chrom, start, stop)
+        # Query gnomAD for rare variants using clean HGNC symbol
+        rare_variants = _query_gnomad_variants(clean_symbol, chrom, start, stop)
         if not rare_variants:
             continue
 
@@ -345,8 +367,8 @@ def annotate_protective_variants(gene_ids: Optional[list[str]] = None) -> int:
         if matching_count == 0:
             continue
 
-        # Fetch GWAS associations for this gene
-        gwas_hits = _fetch_gwas_associations(gene.gene_symbol)
+        # Fetch GWAS associations for this gene using clean HGNC symbol
+        gwas_hits = _fetch_gwas_associations(clean_symbol)
         time.sleep(0.15)
 
         best_trait = None
@@ -371,7 +393,7 @@ def annotate_protective_variants(gene_ids: Optional[list[str]] = None) -> int:
 
         log.info(
             "  %s: %d protective variants (best trait: %s, p=%.2e)",
-            gene.gene_symbol, matching_count, best_trait or "none", best_pvalue,
+            clean_symbol, matching_count, best_trait or "none", best_pvalue,
         )
         found += 1
 

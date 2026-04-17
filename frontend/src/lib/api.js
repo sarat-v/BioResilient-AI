@@ -49,7 +49,7 @@ export const api = {
   // Pipeline
   getPipelineStatus: () => get('/pipeline/status'),
   startPipeline: (body) => post('/pipeline/run', body),
-  // body shape: { resume_from, dry_run, phenotype, species_ids }
+  // body: { resume_from, until_step?, dry_run, phenotype, species_ids }
   stopPipeline: () => post('/pipeline/stop'),
   // Research assistant
   searchGenes: (q) => get('/research/search', { q }),

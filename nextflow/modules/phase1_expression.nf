@@ -58,6 +58,53 @@ process bgee_expression {
     """
 }
 
+// Pre-step B: remove orphan candidate_score rows before step9 rescores.
+// Rows that have no matching evolution_score are stale genes from earlier
+// runs (e.g. genes removed from the target set). If left in, they inflate
+// tier counts and cause unexpected joins during composite scoring.
+// Idempotent: safe to run even when there are no orphans.
+process purge_orphan_scores {
+    label 'base'
+    cpus 1
+    memory '2 GB'
+    time '10m'
+
+    input:
+    val bgee_done
+
+    output:
+    val true, emit: scores_clean
+
+    script:
+    """
+    export DATABASE_URL='${params.db_url}'
+    python3 << 'PYEOF'
+import psycopg2, os
+
+conn = psycopg2.connect(os.environ['DATABASE_URL'])
+cur  = conn.cursor()
+
+cur.execute(
+    'SELECT COUNT(*) FROM candidate_score cs'
+    ' WHERE NOT EXISTS (SELECT 1 FROM evolution_score es WHERE es.gene_id = cs.gene_id)'
+)
+orphan_count = cur.fetchone()[0]
+
+if orphan_count > 0:
+    cur.execute(
+        'DELETE FROM candidate_score'
+        ' WHERE gene_id NOT IN (SELECT gene_id FROM evolution_score)'
+    )
+    conn.commit()
+    print(f'Pre-step B: deleted {orphan_count} orphan candidate_score rows')
+else:
+    print('Pre-step B: no orphan candidate_score rows found (already clean)')
+
+conn.close()
+PYEOF
+    """
+}
+
 process composite_score_phase1 {
     label 'base'
     cpus 4
@@ -65,7 +112,7 @@ process composite_score_phase1 {
     time '1h'
 
     input:
-    val bgee_done
+    val scores_clean
     val phylo_done
 
     output:
@@ -100,7 +147,7 @@ process generate_phase1_reports {
     path 'health_check.json', emit: health_json, optional: true
 
     script:
-    def allSteps = "step1 step2 step3 step3b step3c step4 step4b step4c step4d step3d step5 step6 step6b step6c step7 step7b step8 step8b step9"
+    def allSteps = "step1 step2 step3 step3b step3c step4 step4b step4c step4d step3d step5 step6 step7 step7b step8 step8b step9"
     """
     export DATABASE_URL='${params.db_url}'
     export BIORESILIENT_STORAGE_ROOT='${params.storage_root}'
@@ -148,7 +195,8 @@ workflow PHASE1_EXPRESSION {
     }
 
     if (fromIdx <= EXPR_STEPS.indexOf('step9') && untilIdx >= EXPR_STEPS.indexOf('step9')) {
-        composite_score_phase1(bgee_done_ch, phylo_done)
+        purge_orphan_scores(bgee_done_ch)
+        composite_score_phase1(purge_orphan_scores.out.scores_clean, phylo_done)
         scored_ch = composite_score_phase1.out.scored
     } else {
         scored_ch = Channel.value(true)

@@ -51,8 +51,6 @@ STEP_LABELS = {
     "step4d":  "Variant direction inference (GoF / LoF / neutral)",
     "step5":   "Build phylogenetic tree",
     "step6":   "PAML branch-site positive selection",
-    "step6b":  "FEL + BUSTED supplementary selection tests",
-    "step6c":  "RELAX branch-specific rate acceleration",
     "step7":   "Convergence & conservation scoring",
     "step7b":  "True convergent amino acid substitution detection",
     "step8":   "Functional evidence (Open Targets + GTEx + DepMap)",
@@ -72,16 +70,16 @@ STEP_LABELS = {
     "step15":  "Final rescore (Phase 2 composite)",
     "step16":  "Translational status lookup",
     "step17":  "Preclinical readiness scoring",
-    "step18":  "Target dossier generation",
-    # Phase 3 — Lead Discovery
-    "step19":  "Virtual screening (DiffDock/Vina + ZINC)",
-    "step20":  "Ligand similarity search (ChEMBL + ZINC analogs)",
-    "step21":  "Hit ranking (docking + purchasability + novelty)",
-    # Phase 4 — Lead Optimization
-    "step22":  "ADMET prediction (Lipinski, LogP, BBB, CYP3A4)",
-    "step23":  "Toxicity screening (Tox21 + hERG liability)",
-    "step24":  "Selectivity check (off-target fingerprint panel)",
-    "step25":  "Synthesizability (SA Score + ZINC purchasability)",
+    "step18":  "Target dossier generation",  # <-- PIPELINE BOUNDARY (computational output)
+    # Steps 19-25 are OUT OF SCOPE for this product.
+    # They require wet-lab validation inputs and form a separate lead-discovery product.
+    # "step19":  "Virtual screening (DiffDock/Vina + ZINC)",      # OUT OF SCOPE
+    # "step20":  "Ligand similarity search (ChEMBL + ZINC analogs)", # OUT OF SCOPE
+    # "step21":  "Hit ranking (docking + purchasability + novelty)", # OUT OF SCOPE
+    # "step22":  "ADMET prediction (Lipinski, LogP, BBB, CYP3A4)", # OUT OF SCOPE
+    # "step23":  "Toxicity screening (Tox21 + hERG liability)",    # OUT OF SCOPE
+    # "step24":  "Selectivity check (off-target fingerprint panel)", # OUT OF SCOPE
+    # "step25":  "Synthesizability (SA Score + ZINC purchasability)", # OUT OF SCOPE
 }
 
 
@@ -582,84 +580,6 @@ def step6_evolutionary_selection(
         load_selection_scores(selection_results, gene_by_og)
 
 
-def step6b_fel_busted(dry_run: bool = False) -> None:
-    """Run FEL (pervasive selection) and BUSTED (gene-level episodic) supplementary tests.
-
-    Reuses codon alignments from step6. Skips gracefully if alignments are missing.
-    Updates EvolutionScore.fel_sites and EvolutionScore.busted_pvalue.
-    """
-    log.info("Step 6b: FEL + BUSTED supplementary selection tests...")
-    if dry_run:
-        return
-
-    from pipeline.config import get_local_storage_root
-    from pipeline.layer2_evolution.meme_selection import run_fel_busted_pipeline
-    from pipeline.layer2_evolution.selection import build_gene_og_map, load_fel_busted_scores
-
-    import pickle
-    _cache_path = Path(get_local_storage_root()) / "aligned_orthogroups.pkl"
-    if not _cache_path.exists():
-        log.warning("  Aligned orthogroups cache not found; skipping step 6b.")
-        return
-
-    with open(_cache_path, "rb") as _f:
-        cached = pickle.load(_f)
-
-    aligned = cached.get("aligned", {})
-    motifs_by_og = cached.get("motifs_by_og", {})
-
-    treefile = Path(get_local_storage_root()) / "phylo" / "species.treefile"
-    if not treefile.exists():
-        log.warning("  Species treefile not found; skipping step 6b.")
-        return
-
-    gene_by_og = build_gene_og_map()
-
-    def _flush_fel_busted(batch: dict) -> None:
-        load_fel_busted_scores(batch, gene_by_og)
-
-    run_fel_busted_pipeline(aligned, motifs_by_og, treefile, flush_callback=_flush_fel_busted)
-    log.info("  FEL/BUSTED: complete.")
-
-
-def step6c_relax(dry_run: bool = False) -> None:
-    """Run RELAX to detect branch-specific rate acceleration in resilient species.
-
-    Reuses codon alignments from step6. Skips gracefully if alignments are missing.
-    Updates EvolutionScore.relax_k and EvolutionScore.relax_pvalue.
-    """
-    log.info("Step 6c: RELAX branch acceleration tests...")
-    if dry_run:
-        return
-
-    from pipeline.config import get_local_storage_root
-    from pipeline.layer2_evolution.meme_selection import run_relax_pipeline
-    from pipeline.layer2_evolution.selection import build_gene_og_map, load_relax_scores
-
-    import pickle
-    _cache_path = Path(get_local_storage_root()) / "aligned_orthogroups.pkl"
-    if not _cache_path.exists():
-        log.warning("  Aligned orthogroups cache not found; skipping step 6c.")
-        return
-
-    with open(_cache_path, "rb") as f:
-        cached = pickle.load(f)
-
-    aligned = cached.get("aligned", {})
-    motifs_by_og = cached.get("motifs_by_og", {})
-
-    treefile = Path(get_local_storage_root()) / "phylo" / "species.treefile"
-    if not treefile.exists():
-        log.warning("  Species treefile not found; skipping step 6c.")
-        return
-
-    gene_by_og = build_gene_og_map()
-
-    def _flush_relax(batch: dict) -> None:
-        load_relax_scores(batch, gene_by_og)
-
-    run_relax_pipeline(aligned, motifs_by_og, treefile, flush_callback=_flush_relax)
-    log.info("  RELAX: complete.")
 
 
 def step7_convergence(dry_run: bool = False) -> None:
@@ -868,22 +788,27 @@ def step10b_alphagenome(dry_run: bool = False) -> None:
 
 
 def _get_tier12_gene_ids(trait_id: str = "") -> list[str]:
-    """Return gene IDs for Tier1 and Tier2 candidates (for funnel gating of Phase 2 layers).
+    """Return gene IDs for Tier1, Tier2, and Validated candidates (Phase 2/3 funnel gating).
 
     Phase 1 stores CandidateScore rows with trait_id='' (empty string), regardless
     of the --phenotype flag. We always query without a trait_id filter to ensure
-    Phase 2 steps always receive the full scored gene list.
+    Phase 2/3 steps always receive the full scored gene list.
+
+    "Validated" genes are Tier1/Tier2 genes that have corroborating human genetic
+    evidence (GWAS, Open Targets genetic association, or protective variant) and are
+    assigned the Validated tier by step15. They must be included here so that Phase 3
+    translational steps (step16–18) produce dossiers for all actionable candidates.
     """
     from db.models import CandidateScore
     from db.session import get_session
     with get_session() as session:
         rows = (
             session.query(CandidateScore.gene_id)
-            .filter(CandidateScore.tier.in_(["Tier1", "Tier2"]))
-            .distinct()  # prevent duplicate gene_ids when same gene has Tier1 rows for multiple trait_ids
+            .filter(CandidateScore.tier.in_(["Tier1", "Tier2", "Validated"]))
+            .distinct()  # prevent duplicate gene_ids when same gene has rows for multiple trait_ids
             .all()
         )
-    log.info("_get_tier12_gene_ids: %d Tier1/Tier2 genes found", len(rows))
+    log.info("_get_tier12_gene_ids: %d Tier1/Tier2/Validated genes found", len(rows))
     return [r[0] for r in rows]
 
 
@@ -1150,12 +1075,24 @@ def step18_dossier(dry_run: bool = False, trait_id: str = "") -> None:
 
 
 # ---------------------------------------------------------------------------
-# Phase 3 — Lead Discovery (Steps 19–21)
+# Steps 19-25 — Lead Discovery & Optimisation (OUT OF SCOPE)
+# ---------------------------------------------------------------------------
+# These steps perform virtual screening, ADMET prediction, toxicity screening,
+# selectivity analysis, and synthesizability assessment.  They require wet-lab
+# validation inputs (binding assay data, cellular IC50s) and constitute a
+# separate downstream product.  They are intentionally disabled in the default
+# STEP_ORDER and must not be run as part of the computational dossier pipeline.
+# The computational pipeline ends at step18 (target dossier).
 # ---------------------------------------------------------------------------
 
 
 def step19_virtual_screening(dry_run: bool = False, trait_id: str = "") -> None:
-    """Step 19: Virtual screening — DiffDock / Vina / estimated docking on ZINC compounds."""
+    """Step 19: Virtual screening — OUT OF SCOPE for this product."""
+    raise NotImplementedError(
+        "Step 19 (virtual screening) is out of scope for the BioResilient computational "
+        "dossier pipeline.  The pipeline ends at step18 (target dossier).  "
+        "Steps 19-25 form a separate lead-discovery product requiring wet-lab inputs."
+    )
     from layer8_lead_discovery.virtual_screening import run_virtual_screening
     log.info("Step 19: Virtual screening")
     if dry_run:
@@ -1249,8 +1186,6 @@ STEPS = {
     "step5":   step5_phylogenetic_tree,
     "step3d":  step3d_phylo_conservation,
     "step6":   step6_evolutionary_selection,
-    "step6b":  step6b_fel_busted,
-    "step6c":  step6c_relax,
     "step7":   step7_convergence,
     "step7b":  step7b_convergent_aa,
     "step8":   step8_functional_evidence,
@@ -1501,12 +1436,6 @@ def run_pipeline(
                 step6_evolutionary_selection(
                     aligned_for_hyphy, motifs_by_og, treefile, dry_run=dry_run
                 )
-
-            elif step_name == "step6b":
-                step6b_fel_busted(dry_run=dry_run)
-
-            elif step_name == "step6c":
-                step6c_relax(dry_run=dry_run)
 
             elif step_name == "step7":
                 step7_convergence(dry_run=dry_run)

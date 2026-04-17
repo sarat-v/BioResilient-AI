@@ -52,14 +52,14 @@ PROCESS_TO_STEP: dict[str, str] = {
     "build_species_tree":         "step5",
     "phylo_conservation":         "step3d",
     # Scatter steps: individual task instances mark step as "running"
+    "run_paml":                   "step6",
+    "collect_all_paml_results":   "step6",       # completion signal for step6 (PAML scatter)
     "run_meme":                   "step6",
-    "collect_meme_results":       "step6",       # completion signal for step6
-    "run_fel_busted":             "step6b",
-    "collect_fel_busted_results": "step6b",      # completion signal for step6b
-    "run_relax":                  "step6c",
-    "collect_relax_results":      "step6c",      # completion signal for step6c
+    "collect_meme_results":       "step6",
+    "structural_annotation":      "step9b",
     "convergence_scoring":        "step7",
     "convergent_aa":              "step7b",
+    "functional_evidence":        "step8",
     "expression_analysis":        "step8",
     "bgee_expression":            "step8b",
     "composite_score_phase1":     "step9",
@@ -79,6 +79,7 @@ PROCESS_TO_STEP: dict[str, str] = {
 # Collect processes are the definitive "step is done" signal for scatter steps
 COLLECT_PROCESSES: frozenset[str] = frozenset({
     "collect_meme_results",
+    "collect_all_paml_results",
     "collect_fel_busted_results",
     "collect_relax_results",
 })
@@ -86,6 +87,7 @@ COLLECT_PROCESSES: frozenset[str] = frozenset({
 # Scatter runner processes completing does NOT mean the step is finished yet
 SCATTER_RUNNER_PROCESSES: frozenset[str] = frozenset({
     "run_meme",
+    "run_paml",
     "run_fel_busted",
     "run_relax",
 })

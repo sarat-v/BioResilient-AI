@@ -49,7 +49,7 @@ _CANCER_BENCHMARKS = {
 _EXPLANATIONS: dict[str, str] = {
     "step1": (
         "Validates that every required bioinformatics tool is installed (OrthoFinder, MAFFT, "
-        "IQ-TREE2, HyPhy, DIAMOND), the AWS RDS PostgreSQL database is reachable, and optional "
+        "IQ-TREE2, PAML codeml, DIAMOND), the AWS RDS PostgreSQL database is reachable, and optional "
         "GPU acceleration is detected. Nothing analytical — purely a safety check."
     ),
     "step2": (
@@ -118,19 +118,12 @@ _EXPLANATIONS: dict[str, str] = {
         "topology would conflate inherited changes with convergent ones."
     ),
     "step6": (
-        "HyPhy MEME tests each codon site in every candidate orthogroup for episodic positive selection "
-        "(dN/dS > 1 in a subset of branches). Returns a p-value per site. Genes where divergent motifs "
-        "overlap MEME-positive sites have statistical evidence the change was actively selected for."
-    ),
-    "step6b": (
-        "FEL detects pervasive (site-wide) selection across all branches — complementary to MEME's episodic test. "
-        "BUSTED is a gene-level test asking whether any sites anywhere show positive selection. "
-        "Together with MEME they give three statistically orthogonal lines of selection evidence."
-    ),
-    "step6c": (
-        "RELAX asks whether selective constraints are intensified (k>1) or relaxed (k<1) in resilient species "
-        "vs background. k>1 in DNA repair genes = enhanced purifying selection (consistent with elephant's "
-        "extra TP53). k<1 in growth signalling = relaxed constraint on the pathway."
+        "PAML codeml branch-site model A tests each orthogroup for positive selection specifically in "
+        "cancer-resistant foreground branches (Yang & Nielsen 2002; Zhang et al. 2005). "
+        "H0 (null): foreground ω fixed at 1. H1 (alternative): foreground ω free. "
+        "LRT statistic follows a 50:50 mixture of χ²(df=1) and a point mass at zero — "
+        "conservative df=1 approximation used per Zhang et al. 2005. "
+        "Outputs: dnds_pvalue (LRT p-value), dnds_ratio (foreground ω)."
     ),
     "step7": (
         "Counts how many independent evolutionary lineage groups show the same divergent motif. "
@@ -788,8 +781,7 @@ def _collect_step6() -> dict:
             s.query(func.count(func.distinct(EvolutionScore.gene_id))).scalar() or 0
         )
 
-        # PAML branch-site model: dnds_pvalue is the primary signal (LRT p-value)
-        # meme_qvalue is the legacy HyPhy field — may be NULL for PAML runs
+        # PAML branch-site model A: dnds_pvalue = LRT p-value (df=1, Zhang et al. 2005)
         paml_count = (
             s.query(func.count(EvolutionScore.gene_id))
             .filter(EvolutionScore.dnds_pvalue != None).scalar() or 0
@@ -829,14 +821,6 @@ def _collect_step6() -> dict:
         )
         data["model_counts"] = model_counts
 
-        # Also check legacy HyPhy MEME field (0 for PAML runs)
-        meme_positive = (
-            s.query(func.count(EvolutionScore.gene_id))
-            .filter(EvolutionScore.meme_qvalue != None, EvolutionScore.meme_qvalue < 0.1)
-            .scalar() or 0
-        )
-        data["meme_positive_genes"] = meme_positive
-
         # Top 20 genes by PAML significance (lowest p-value)
         top = (
             s.query(EvolutionScore.gene_id, EvolutionScore.dnds_pvalue, EvolutionScore.dnds_ratio)
@@ -866,75 +850,6 @@ def _collect_step6() -> dict:
             {"gene": r["gene"], "meme_qvalue": r["dnds_pvalue"], "dnds": r["dnds_ratio"]}
             for r in data["top20_paml_genes"]
         ]
-    return data
-
-
-def _collect_step6b() -> dict:
-    from db.session import get_session
-    from db.models import EvolutionScore, Gene
-    from sqlalchemy import func
-
-    data: dict[str, Any] = {"step": "step6b", "timestamp": _now()}
-    with get_session() as s:
-        data["fel_positive_genes"] = (
-            s.query(func.count(EvolutionScore.gene_id))
-            .filter(EvolutionScore.fel_sites != None, EvolutionScore.fel_sites > 0)
-            .scalar() or 0
-        )
-        data["busted_positive_genes"] = (
-            s.query(func.count(EvolutionScore.gene_id))
-            .filter(EvolutionScore.busted_pvalue != None, EvolutionScore.busted_pvalue < 0.05)
-            .scalar() or 0
-        )
-        # Overlap: MEME + BUSTED both positive
-        both = (
-            s.query(func.count(EvolutionScore.gene_id))
-            .filter(
-                EvolutionScore.meme_qvalue < 0.1,
-                EvolutionScore.busted_pvalue < 0.05,
-            )
-            .scalar() or 0
-        )
-        data["meme_and_busted_both_positive"] = both
-    return data
-
-
-def _collect_step6c() -> dict:
-    from db.session import get_session
-    from db.models import EvolutionScore, Gene
-    from sqlalchemy import func
-
-    data: dict[str, Any] = {"step": "step6c", "timestamp": _now()}
-    with get_session() as s:
-        data["relax_intensified"] = (
-            s.query(func.count(EvolutionScore.gene_id))
-            .filter(EvolutionScore.relax_k != None, EvolutionScore.relax_k > 1,
-                    EvolutionScore.relax_pvalue < 0.05)
-            .scalar() or 0
-        )
-        data["relax_relaxed"] = (
-            s.query(func.count(EvolutionScore.gene_id))
-            .filter(EvolutionScore.relax_k != None, EvolutionScore.relax_k < 1,
-                    EvolutionScore.relax_pvalue < 0.05)
-            .scalar() or 0
-        )
-
-        for label, filt in [("intensified", EvolutionScore.relax_k > 1),
-                             ("relaxed", EvolutionScore.relax_k < 1)]:
-            top = (
-                s.query(EvolutionScore.gene_id, EvolutionScore.relax_k, EvolutionScore.relax_pvalue)
-                .filter(EvolutionScore.relax_k != None, EvolutionScore.relax_pvalue < 0.05, filt)
-                .order_by(EvolutionScore.relax_pvalue.asc())
-                .limit(10)
-                .all()
-            )
-            gene_ids = [r[0] for r in top]
-            sym = dict(s.query(Gene.id, Gene.gene_symbol).filter(Gene.id.in_(gene_ids)).all())
-            data[f"top10_{label}"] = [
-                {"gene": sym.get(gid, gid), "k": round(float(k), 3) if k else None,
-                 "pvalue": round(float(p), 5) if p else None}
-                for gid, k, p in top
-            ]
     return data
 
 
@@ -1386,22 +1301,14 @@ def validate(step: str, data: dict) -> ValidationResult:
         paml_sig = data.get("paml_significant_genes", 0)
         omega_pos = data.get("omega_positive_genes", 0)
 
-        if paml_scored > 0:
-            # PAML branch-site run — validate on LRT p-values
-            vr.add("paml_scored_genes", "PASS" if paml_scored >= 1000 else "WARN",
-                   paml_scored, "≥1000",
-                   "" if paml_scored >= 1000 else "Fewer orthogroups scored than expected — some PAML jobs may have failed.")
-            vr.add("paml_significant_genes", "PASS" if paml_sig >= 100 else "WARN",
-                   paml_sig, "≥100",
-                   f"{paml_sig} genes with LRT p<0.05 positive selection signal. {omega_pos} have foreground ω>1.")
-        else:
-            # Legacy HyPhy MEME path
-            meme_pos = data.get("meme_positive_genes", 0)
-            vr.add("meme_positive", "PASS" if meme_pos >= 100 else "WARN",
-                   meme_pos, "≥100",
-                   "" if meme_pos >= 100 else "Few MEME-positive genes — check HyPhy ran on all orthogroups.")
+        vr.add("paml_scored_genes", "PASS" if paml_scored >= 1000 else "WARN",
+               paml_scored, "≥1000",
+               "" if paml_scored >= 1000 else "Fewer orthogroups scored than expected — some PAML jobs may have failed.")
+        vr.add("paml_significant_genes", "PASS" if paml_sig >= 100 else "WARN",
+               paml_sig, "≥100",
+               f"{paml_sig} genes with LRT p<0.05 (df=1, Zhang et al. 2005). {omega_pos} have foreground ω>1.")
 
-        benchmarks = data.get("benchmark_genes_in_top20", data.get("benchmark_genes_in_top20_meme", []))
+        benchmarks = data.get("benchmark_genes_in_top20", [])
         if benchmarks:
             vr.add("benchmark_recall", "PASS", benchmarks, "any known gene",
                    f"Known cancer genes in top selection results: {benchmarks}")
@@ -1409,10 +1316,7 @@ def validate(step: str, data: dict) -> ValidationResult:
             vr.add("benchmark_recall", "INFO", "none in top 20",
                    "any known gene",
                    "Known benchmark genes (TP53, ATM, BRCA1) not in top 20 by p-value — "
-                   "this is expected since PAML tests all OGs including those without divergent motifs.")
-
-    elif step in ("step6b", "step6c"):
-        pass  # informational only
+                   "expected: PAML tests all OGs, not just those with divergent motifs.")
 
     elif step in ("step7", "step7b"):
         if step == "step7":
@@ -1662,40 +1566,23 @@ def _render_md(step: str, data: dict, vr: ValidationResult) -> str:
         if data.get("newick"):
             lines += ["", "**Newick topology:**", "", "```", data["newick"][:300] + ("..." if len(data["newick"]) > 300 else ""), "```"]
 
-    elif step in ("step6", "step6b", "step6c"):
-        if step == "step6":
-            lines.append(f"- Genes with selection scores: {data.get('genes_with_selection', 0):,}")
-            if data.get("paml_scored_genes", 0) > 0:
-                lines.append(f"- PAML branch-site scored: {data.get('paml_scored_genes', 0):,}")
-                lines.append(f"- PAML significant (LRT p<0.05): **{data.get('paml_significant_genes', 0):,}**")
-                lines.append(f"- Foreground ω>1 (positive selection): {data.get('omega_positive_genes', 0):,}")
-                lines.append(f"- Mean ω for significant genes: {data.get('mean_omega_significant')}")
-                mc = data.get("model_counts", {})
-                if mc:
-                    lines.append(f"- Models: {', '.join(f'{k}: {v}' for k,v in mc.items())}")
-            else:
-                lines.append(f"- MEME-positive genes (p<0.1): {data.get('meme_positive_genes', 0):,}")
-                lines.append(f"- Mean MEME q-value: {data.get('avg_meme_pvalue')}")
-            bm = data.get("benchmark_genes_in_top20", data.get("benchmark_genes_in_top20_meme", []))
-            if bm:
-                lines.append(f"- Known benchmark genes in top 20: **{', '.join(bm)}**")
-            top = data.get("top20_paml_genes", data.get("top20_meme_genes", []))
-            if top:
-                if data.get("paml_scored_genes", 0) > 0:
-                    lines += ["", "**Top 20 by PAML branch-site LRT p-value:**", "", "| Gene | LRT p-value | dN/dS (ω) |", "|------|------------|-----------|"]
-                    for r in top:
-                        lines.append(f"| {r['gene']} | {r.get('dnds_pvalue', r.get('meme_qvalue'))} | {r.get('dnds_ratio', r.get('dnds'))} |")
-                else:
-                    lines += ["", "**Top 20 by MEME evidence:**", "", "| Gene | MEME q-value | dN/dS |", "|------|-------------|-------|"]
-                    for r in top:
-                        lines.append(f"| {r['gene']} | {r.get('meme_qvalue')} | {r.get('dnds')} |")
-        elif step == "step6b":
-            lines.append(f"- FEL-positive genes: {data.get('fel_positive_genes', 0):,}")
-            lines.append(f"- BUSTED-positive genes: {data.get('busted_positive_genes', 0):,}")
-            lines.append(f"- MEME+BUSTED both positive: {data.get('meme_and_busted_both_positive', 0):,}")
-        elif step == "step6c":
-            lines.append(f"- RELAX intensified (k>1, p<0.05): {data.get('relax_intensified', 0):,}")
-            lines.append(f"- RELAX relaxed (k<1, p<0.05): {data.get('relax_relaxed', 0):,}")
+    elif step == "step6":
+        lines.append(f"- Genes with selection scores: {data.get('genes_with_selection', 0):,}")
+        lines.append(f"- PAML branch-site scored: {data.get('paml_scored_genes', 0):,}")
+        lines.append(f"- PAML significant (LRT p<0.05, df=1): **{data.get('paml_significant_genes', 0):,}**")
+        lines.append(f"- Foreground ω>1 (positive selection): {data.get('omega_positive_genes', 0):,}")
+        lines.append(f"- Mean ω for significant genes: {data.get('mean_omega_significant')}")
+        mc = data.get("model_counts", {})
+        if mc:
+            lines.append(f"- Models: {', '.join(f'{k}: {v}' for k,v in mc.items())}")
+        bm = data.get("benchmark_genes_in_top20", [])
+        if bm:
+            lines.append(f"- Known benchmark genes in top 20: **{', '.join(bm)}**")
+        top = data.get("top20_paml_genes", [])
+        if top:
+            lines += ["", "**Top 20 by PAML branch-site LRT p-value:**", "", "| Gene | LRT p-value | dN/dS (ω) |", "|------|------------|-----------|"]
+            for r in top:
+                lines.append(f"| {r['gene']} | {r.get('dnds_pvalue')} | {r.get('dnds_ratio')} |")
 
     elif step in ("step7", "step7b"):
         lines.append(f"- Genes at convergence ≥3: **{data.get('genes_conv_ge3', 0):,}**")
@@ -1786,8 +1673,6 @@ def collect(step: str) -> dict:
         "step4d": _collect_step4d,
         "step5": _collect_step5,
         "step6": _collect_step6,
-        "step6b": _collect_step6b,
-        "step6c": _collect_step6c,
         "step7": _collect_step7,
         "step7b": _collect_step7b,
         "step8": _collect_step8,

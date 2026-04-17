@@ -191,6 +191,51 @@ process domain_and_consequence {
     """
 }
 
+// Pre-step A: clear false-zero ESM-1v sentinels before rescoring.
+// ESM-1v resume logic uses WHERE esm1v_score IS NULL. Any existing 0.0
+// values are treated as already-scored and skipped. This process converts
+// them to NULL so step4c re-evaluates them correctly.
+// Idempotent: safe to run even when there are no sentinels.
+process clear_esm1v_sentinels {
+    label 'base'
+    cpus 1
+    memory '2 GB'
+    time '10m'
+
+    input:
+    val motifs_loaded
+
+    output:
+    val true, emit: sentinels_cleared
+
+    script:
+    """
+    export DATABASE_URL='${params.db_url}'
+    python3 << 'PYEOF'
+import psycopg2, os
+
+conn = psycopg2.connect(os.environ['DATABASE_URL'])
+cur  = conn.cursor()
+
+cur.execute('SELECT COUNT(*) FROM divergent_motif WHERE esm1v_score = 0.0')
+before = cur.fetchone()[0]
+
+if before > 0:
+    cur.execute('UPDATE divergent_motif SET esm1v_score = NULL WHERE esm1v_score = 0.0')
+    conn.commit()
+    print(f'Pre-step A: cleared {before} ESM-1v false-zero sentinels -> NULL')
+else:
+    print('Pre-step A: no ESM-1v sentinels to clear (already clean)')
+
+cur.execute('SELECT COUNT(*) FROM divergent_motif WHERE esm1v_score = 0.0')
+after = cur.fetchone()[0]
+assert after == 0, f'Expected 0 remaining zeros, got {after}'
+print(f'Pre-step A complete: {after} zeros remaining')
+conn.close()
+PYEOF
+    """
+}
+
 process esm1v_scatter {
     label 'base'
     cpus 1
@@ -395,7 +440,8 @@ workflow PHASE1_SEQUENCE {
     }
 
     if (fromIdx <= SEQ_STEPS.indexOf('step4c') && untilIdx >= SEQ_STEPS.indexOf('step4c')) {
-        esm1v_scatter(motifs_done_ch)
+        clear_esm1v_sentinels(motifs_done_ch)
+        esm1v_scatter(clear_esm1v_sentinels.out.sentinels_cleared)
         esm1v_score_chunk(esm1v_scatter.out.chunks.flatten(), )
         esm1v_report(esm1v_score_chunk.out.collect())
         esm_done_ch = esm1v_report.out.esm_done

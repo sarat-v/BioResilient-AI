@@ -72,6 +72,7 @@ class Gene(Base):
     narrative = Column(Text, nullable=True)                        # LLM-generated research summary (cached)
     go_terms = Column(ARRAY(String), default=list)                # GO biological process/function terms
     pathway_ids = Column(ARRAY(String), default=list)              # Reactome/pathway identifiers
+    loeuf = Column(Float, nullable=True)                          # gnomAD v4.1 LOEUF; None = unknown; <=0.5 = LoF intolerant
 
     orthologs = relationship("Ortholog", back_populates="gene")
     evolution_score = relationship("EvolutionScore", back_populates="gene", uselist=False)
@@ -482,6 +483,7 @@ class PathwayConvergence(Base):
     gene_count = Column(Integer)                            # background gene count in pathway
     candidate_count = Column(Integer)                       # convergent candidates in pathway
     log_pvalue = Column(Float)                              # log10 hypergeometric p-value (negative = enriched)
+    adjusted_pvalue = Column(Float, nullable=True)          # BH-FDR adjusted p-value (Benjamini-Hochberg, 2001)
     evolutionary_weight = Column(Float)                     # sum of convergence_scores
     pathway_score = Column(Float)                           # combined ranking score
     gene_symbols = Column(ARRAY(String), default=list)      # gene symbols in this pathway

@@ -23,6 +23,7 @@ from pipeline.config import get_local_storage_root, get_storage_root
 log = logging.getLogger(__name__)
 
 ALPHAFOLD_FILES_BASE = "https://alphafold.ebi.ac.uk/files"
+ALPHAFOLD_API_BASE  = "https://alphafold.ebi.ac.uk/api"
 _S3_STRUCTURES_PREFIX = "cache/structures"
 
 
@@ -66,53 +67,111 @@ def _s3_store(uniprot_id: str, local_path: Path) -> None:
         log.debug("AlphaFold S3 store failed (non-fatal): %s", exc)
 
 
-def download_alphafold_structure(uniprot_id: str) -> Optional[Path]:
-    """Download AlphaFold PDB for a UniProt ID.
+def _oma_to_entry_name(human_protein: str) -> str:
+    """Strip OMA species prefix from human_protein field.
 
-    Uses three-tier caching: local disk → S3 → EBI portal.
-    Returns path to local file or None on failure.
+    OMA stores IDs as 'human|AKT1_HUMAN'. AlphaFold API expects 'AKT1_HUMAN'.
     """
-    if not uniprot_id or len(uniprot_id) < 2:
-        return None
-    out_path = _structures_dir() / f"{uniprot_id}.pdb"
+    return human_protein.split("|", 1)[-1] if "|" in human_protein else human_protein
 
-    # Tier 1: local disk (already in container from this run)
+
+def _entry_name_to_accession(entry_name: str) -> Optional[str]:
+    """Resolve a UniProt entry name (e.g. AKT1_HUMAN) to a UniProt accession (e.g. P31749).
+
+    AlphaFold API requires accession, not entry name.
+    """
+    try:
+        r = requests.get(
+            "https://rest.uniprot.org/uniprotkb/search",
+            params={"query": f"id:{entry_name}", "fields": "accession", "format": "json"},
+            timeout=15,
+        )
+        if r.status_code == 200:
+            results = r.json().get("results", [])
+            if results:
+                return results[0].get("primaryAccession")
+    except Exception as exc:
+        log.debug("UniProt accession lookup %s: %s", entry_name, exc)
+    return None
+
+
+def _accession_to_pdb_url(accession: str) -> Optional[str]:
+    """Get the latest AlphaFold PDB URL for a UniProt accession via the AlphaFold API."""
+    try:
+        r = requests.get(
+            f"{ALPHAFOLD_API_BASE}/prediction/{accession}",
+            timeout=15,
+        )
+        if r.status_code == 200:
+            data = r.json()
+            if data and data[0].get("pdbUrl"):
+                return data[0]["pdbUrl"]
+    except Exception as exc:
+        log.debug("AlphaFold API lookup %s: %s", accession, exc)
+    return None
+
+
+def download_alphafold_structure(human_protein: str) -> Optional[Path]:
+    """Download AlphaFold PDB for a gene's human_protein identifier.
+
+    Accepts both OMA-style ('human|AKT1_HUMAN') and bare entry names ('AKT1_HUMAN').
+    Uses three-tier caching: local disk → S3 → EBI portal.
+    Returns path to local PDB file or None on failure.
+    """
+    if not human_protein:
+        return None
+
+    entry_name = _oma_to_entry_name(human_protein.strip())
+    if not entry_name:
+        return None
+
+    out_path = _structures_dir() / f"{entry_name}.pdb"
+
+    # Tier 1: local disk
     if out_path.exists() and out_path.stat().st_size > 500:
         return out_path
 
-    # Tier 2: S3 cache (survives spot interruptions)
-    if _s3_restore(uniprot_id, out_path):
-        if out_path.exists() and out_path.stat().st_size > 500:
-            return out_path
+    # Tier 3: EBI AlphaFold portal — resolve entry name → accession → PDB URL
+    accession = _entry_name_to_accession(entry_name)
+    if not accession:
+        log.debug("No UniProt accession found for %s", entry_name)
+        return None
 
-    # Tier 3: EBI AlphaFold portal (v4 model)
-    url = f"{ALPHAFOLD_FILES_BASE}/AF-{uniprot_id}-F1-model_v4.pdb"
+    # Also check S3 cache by accession
+    acc_path = _structures_dir() / f"{accession}.pdb"
+    if _s3_restore(accession, acc_path):
+        if acc_path.exists() and acc_path.stat().st_size > 500:
+            return acc_path
+
+    pdb_url = _accession_to_pdb_url(accession)
+    if not pdb_url:
+        log.debug("No AlphaFold structure found for %s (%s)", entry_name, accession)
+        return None
     try:
-        r = requests.get(url, timeout=60, stream=True)
+        r = requests.get(pdb_url, timeout=60, stream=True)
         if r.status_code != 200:
+            log.debug("AlphaFold download %s (%s): HTTP %d", entry_name, accession, r.status_code)
             return None
-        out_path.write_bytes(r.content)
-        # Populate S3 cache for future retries
-        _s3_store(uniprot_id, out_path)
-        return out_path
+        acc_path.write_bytes(r.content)
+        _s3_store(accession, acc_path)
+        return acc_path
     except Exception as exc:
-        log.debug("AlphaFold download %s: %s", uniprot_id, exc)
+        log.debug("AlphaFold download %s: %s", entry_name, exc)
         return None
 
 
 def ensure_structures_for_genes(gene_ids: list[str]) -> dict[str, Path]:
-    """Download AlphaFold structures for genes (using Gene.human_protein as UniProt ID).
+    """Download AlphaFold structures for genes using Gene.human_protein.
 
-    Returns {gene_id: path}.
+    Returns {gene_id: local_pdb_path}.
     """
     with get_session() as session:
         gene_list = session.query(Gene).filter(Gene.id.in_(gene_ids)).all()
     result = {}
     for g in gene_list:
-        uniprot = (g.human_protein or "").strip()
-        if not uniprot:
+        if not g.human_protein:
             continue
-        path = download_alphafold_structure(uniprot)
+        path = download_alphafold_structure(g.human_protein)
         if path:
             result[g.id] = path
     log.info("AlphaFold structures: %d / %d genes.", len(result), len(gene_ids))

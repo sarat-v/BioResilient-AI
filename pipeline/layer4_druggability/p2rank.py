@@ -45,14 +45,23 @@ def run_p2rank(pdb_path: Path) -> Optional[list[dict]]:
     Returns list of pocket dicts: [{"rank": int, "score": float, "probability": float}, ...]
     sorted by rank (best first). Returns None if P2Rank is unavailable or fails.
     """
+    import os as _os
     tools = get_tool_config()
-    p2rank_jar = tools.get("p2rank_jar")
+    # Use the prank shell script (sets full classpath with Groovy + lib/*).
+    # Check YAML config first, then P2RANK_BIN env var (set in clinical Dockerfile).
+    prank_bin = tools.get("prank_bin") or _os.environ.get("P2RANK_BIN", "")
+    if not prank_bin:
+        # Fallback: derive prank script path from P2RANK_JAR env var
+        jar = tools.get("p2rank_jar") or _os.environ.get("P2RANK_JAR", "")
+        if jar:
+            prank_bin = str(Path(jar).parent.parent / "prank")
 
-    if not p2rank_jar:
-        log.debug("p2rank_jar not configured — skipping P2Rank.")
+    log.info("P2Rank prank script: %r  (P2RANK_BIN env=%r)", prank_bin, _os.environ.get("P2RANK_BIN"))
+    if not prank_bin:
+        log.warning("prank_bin not configured — skipping P2Rank.")
         return None
-    if not Path(p2rank_jar).exists():
-        log.debug("P2Rank JAR not found at %s — skipping.", p2rank_jar)
+    if not Path(prank_bin).exists():
+        log.warning("prank script not found at %s — skipping.", prank_bin)
         return None
 
     out_dir = _p2rank_output_dir(pdb_path)
@@ -66,7 +75,7 @@ def run_p2rank(pdb_path: Path) -> Optional[list[dict]]:
 
     try:
         cmd = [
-            "java", "-jar", p2rank_jar,
+            str(prank_bin),
             "predict", "-f", str(pdb_path),
             "-o", str(out_dir),
         ]
@@ -77,32 +86,41 @@ def run_p2rank(pdb_path: Path) -> Optional[list[dict]]:
             timeout=120,
         )
         if result.returncode != 0:
-            log.debug("P2Rank failed for %s: %s", pdb_path.name, result.stderr[:300])
+            log.warning("P2Rank failed for %s (rc=%d):\nstdout: %s\nstderr: %s",
+                        pdb_path.name, result.returncode, result.stdout[:200], result.stderr[:300])
             return None
 
         if not predictions_csv.exists():
             # P2Rank may use a slightly different output filename
             csvs = list(out_dir.glob("*.csv"))
+            log.info("P2Rank output CSVs for %s: %s", pdb_path.name, [c.name for c in csvs])
             if csvs:
                 predictions_csv = csvs[0]
             else:
+                log.warning("P2Rank produced no CSV for %s; out_dir contents: %s",
+                            pdb_path.name, [f.name for f in out_dir.iterdir()] if out_dir.exists() else "dir missing")
                 return None
 
-        return _parse_p2rank_predictions(predictions_csv)
+        pockets = _parse_p2rank_predictions(predictions_csv)
+        log.info("P2Rank parsed %d pockets for %s", len(pockets), pdb_path.name)
+        return pockets
 
     except subprocess.TimeoutExpired:
-        log.debug("P2Rank timed out for %s", pdb_path.name)
+        log.warning("P2Rank timed out for %s", pdb_path.name)
         return None
     except FileNotFoundError:
-        log.debug("Java not found — P2Rank requires Java 11+.")
+        log.warning("Java not found — P2Rank requires Java 11+.")
         return None
     except Exception as exc:
-        log.debug("P2Rank error: %s", exc)
+        log.warning("P2Rank error for %s: %s", pdb_path.name, exc)
         return None
 
 
 def _parse_p2rank_predictions(csv_path: Path) -> list[dict]:
     """Parse P2Rank _predictions.csv output file.
+
+    P2Rank uses space-padded column headers (e.g., " probability", " rank").
+    We strip whitespace from all keys and values before reading.
 
     Columns: name, rank, score, probability, sas_points, surf_atoms, ...
     """
@@ -110,18 +128,27 @@ def _parse_p2rank_predictions(csv_path: Path) -> list[dict]:
     try:
         with open(csv_path, newline="") as f:
             reader = csv.DictReader(f)
+            # Normalise header names: strip surrounding whitespace
+            if reader.fieldnames:
+                reader.fieldnames = [h.strip() for h in reader.fieldnames]
+            _header_logged = False
             for row in reader:
+                # Strip whitespace from values too
+                row = {k.strip(): v.strip() if isinstance(v, str) else v for k, v in row.items()}
+                if not _header_logged:
+                    log.info("P2Rank CSV columns: %s", list(row.keys()))
+                    _header_logged = True
                 try:
                     pockets.append({
-                        "rank": int(row.get("rank", 0)),
-                        "score": float(row.get("score", 0)),
-                        "probability": float(row.get("probability", 0)),
+                        "rank": int(row.get("rank") or 0),
+                        "score": float(row.get("score") or 0),
+                        "probability": float(row.get("probability") or 0),
                     })
                 except (ValueError, TypeError):
                     continue
         pockets.sort(key=lambda p: p["rank"])
     except Exception as exc:
-        log.debug("P2Rank CSV parse error: %s", exc)
+        log.warning("P2Rank CSV parse error for %s: %s", csv_path.name, exc)
     return pockets
 
 

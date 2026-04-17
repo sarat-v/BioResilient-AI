@@ -79,6 +79,21 @@ log = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 
 
+# Normalisation ceiling for phylogenetically-weighted convergence score.
+#
+# Derivation: empirical maximum over 12,533 EvolutionScore rows from the
+# BioResilience April 2026 run = 20.4577 (AKT1, 8 convergent lineages spanning
+# mammals + teleosts + chondrichthyes). A theoretical maximum for 8 lineages at
+# 530 MY max divergence time would be ~22.4, but we use the empirical value so
+# that the top-scoring gene anchors at 1.0 and all others scale proportionally.
+#
+# Do NOT lower this constant without re-examining actual score distributions,
+# as reducing the denominator would incorrectly inflate scores for most genes.
+# Reference for phylogenetic distance weighting:
+#   Stern (2013) Convergent evolution. Science 342:1031-1032.
+_MAX_PHYLO_WEIGHT: float = 20.46
+
+
 def convergence_score(convergence_count: int, max_lineages: int = 8, phylo_weight: Optional[float] = None) -> float:
     """Score in [0, 1] based on convergent evolution signal.
 
@@ -90,12 +105,13 @@ def convergence_score(convergence_count: int, max_lineages: int = 8, phylo_weigh
     When only convergence_count is available (test runs, legacy data), falls
     back to a sigmoid on count alone.
 
-    Max expected phylo_weight:
-      - 8 lineages at 310 MY avg spacing ≈ 8 × 2.06 = 16.5
-      - Normalise by capping at 16.0 for a [0,1] range.
+    Normalisation ceiling: _MAX_PHYLO_WEIGHT = 20.46 (empirical max from
+    12,533 evolution scores in the April 2026 BioResilience run).
+    Previous hardcoded value of 16.0 under-estimated the range and compressed
+    top-scoring genes to 1.0 prematurely while other genes were over-represented.
     """
     if phylo_weight is not None and phylo_weight > 0:
-        return round(min(phylo_weight / 16.0, 1.0), 4)
+        return round(min(phylo_weight / _MAX_PHYLO_WEIGHT, 1.0), 4)
     if convergence_count is None or convergence_count <= 0:
         return 0.0
     return round(1.0 / (1.0 + math.exp(-1.5 * (convergence_count - 2))), 4)
@@ -113,18 +129,18 @@ def selection_score(
 ) -> float:
     """Score in [0, 1] combining selection evidence.
 
-    PAML branch-site model A (selection_model="paml_branch_site"):
-        70% p-value component  — LRT p-value (H0 vs H1, chi-squared df=2)
-        30% omega component    — foreground dN/dS in positive selection class
-        This is the primary pathway going forward.
+    PAML branch-site model A (selection_model="paml_branch_site") — primary pathway:
+        70% p-value component  — LRT p-value (H0 vs H1, chi-squared df=1;
+                                 Zhang et al. 2005 Mol Biol Evol 22:2472-2479)
+        30% omega component    — foreground dN/dS (ω_fg) in positive selection class
 
-    HyPhy suite (selection_model="busted_ph", legacy):
-        FEL       35%  — pervasive positive selection (site-level)
-        BUSTED    30%  — gene-wide episodic selection
-        BUSTED-PH 25%  — phenotype-specific episodic selection (foreground)
-        RELAX     10%  — selection intensity shift in test vs reference branches
+        Guard: returns 0.0 if ω_fg ≤ 1.0 (no positive selection regardless of p-value).
 
     Legacy MEME results (selection_model="meme") use backward-compatible scoring.
+
+    Note: HyPhy FEL/BUSTED/RELAX branches (selection_model="busted_ph") are retained
+    for backward-compatibility with any existing DB rows but are no longer produced
+    by new pipeline runs.
     """
     # --- PAML branch-site model A (primary pathway) ---
     if selection_model == "paml_branch_site":
@@ -231,11 +247,12 @@ def disease_score(
         s += min(-math.log10(ann.gwas_pvalue) / 15.0, 1.0) * 0.20
 
     # LoF constraint — prefer LOEUF (v4, continuous) over pLI (binary-ish).
-    # LOEUF < 0.6 = intolerant; invert so low LOEUF → high score.
+    # Pipeline threshold: LOEUF < 0.35 = high-confidence LoF-intolerant (Karczewski et al. 2020).
+    # Scoring: 1 − LOEUF maps [0, 1] LOEUF linearly to [1, 0]; clamped at 0 for LOEUF > 1.
+    # LOEUF 0.0 → score 1.0 (most intolerant), LOEUF 0.35 → score 0.65, LOEUF 1.0 → score 0.0.
     loeuf = getattr(ann, "gnomad_loeuf", None)
     pli = ann.gnomad_pli
     if loeuf is not None:
-        # 1 − LOEUF/1.0 maps [0, 1] LOEUF to [1, 0] score; clamp at 0
         s += max(0.0, min(1.0 - loeuf, 1.0)) * 0.15
     elif pli is not None:
         s += min(pli, 1.0) * 0.15

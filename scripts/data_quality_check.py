@@ -438,56 +438,6 @@ try:
 except Exception as e:
     check("species.treefile S3 check", WARN, f"Could not check: {e}", "step5")
 
-# ---------------------------------------------------------------------------
-# STEP 6b — FEL + BUSTED
-# ---------------------------------------------------------------------------
-
-section("STEP 6b — FEL + BUSTED")
-
-evo_total = scalar("SELECT COUNT(*) FROM evolution_score")
-with_fel = scalar("SELECT COUNT(*) FROM evolution_score WHERE fel_sites IS NOT NULL")
-with_busted = scalar("SELECT COUNT(*) FROM evolution_score WHERE busted_pvalue IS NOT NULL")
-fel_pct = round(100 * (with_fel or 0) / max(evo_total or 1, 1), 1)
-busted_pct = round(100 * (with_busted or 0) / max(evo_total or 1, 1), 1)
-check(
-    "FEL coverage",
-    PASS if fel_pct >= 50 else FAIL,
-    f"{with_fel}/{evo_total} genes ({fel_pct}%) have fel_sites",
-    "step6b",
-)
-check(
-    "BUSTED coverage",
-    PASS if busted_pct >= 50 else FAIL,
-    f"{with_busted}/{evo_total} genes ({busted_pct}%) have busted_pvalue",
-    "step6b",
-)
-
-busted_sig = scalar("SELECT COUNT(*) FROM evolution_score WHERE busted_pvalue < 0.05")
-busted_sig_pct = round(100 * (busted_sig or 0) / max(with_busted or 1, 1), 1)
-check(
-    "BUSTED significant rate (5–60 %)",
-    PASS if 5 <= busted_sig_pct <= 60 else FAIL,
-    f"{busted_sig} genes significant (p<0.05) = {busted_sig_pct}% of tested",
-    "step6b",
-)
-
-cross_signal = run_query("""
-    SELECT
-        CASE WHEN busted_pvalue < 0.05 THEN 'sig' ELSE 'not_sig' END AS grp,
-        ROUND(AVG(fel_sites)::numeric, 2) AS avg_fel
-    FROM evolution_score
-    WHERE busted_pvalue IS NOT NULL AND fel_sites IS NOT NULL
-    GROUP BY 1
-""")
-grp_map = {r["grp"]: float(r["avg_fel"] or 0) for r in cross_signal}
-sig_fel = grp_map.get("sig", 0)
-not_sig_fel = grp_map.get("not_sig", 0)
-check(
-    "BUSTED-sig genes have more FEL sites",
-    PASS if sig_fel > not_sig_fel else FAIL,
-    f"avg FEL sites: sig={sig_fel}, not_sig={not_sig_fel} — sig must be higher",
-    "step6b",
-)
 
 # ---------------------------------------------------------------------------
 # STEP 7b — True Convergent AA Substitutions

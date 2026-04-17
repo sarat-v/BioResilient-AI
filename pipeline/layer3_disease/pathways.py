@@ -45,6 +45,15 @@ def fetch_go_and_pathways(uniprot_id: str) -> tuple[list[str], list[str]]:
     return go_terms, pathway_ids
 
 
+def _uniprot_entry_name(human_protein: str) -> str:
+    """Extract UniProt entry name from OMA-style sequence ID.
+
+    OMA stores sequence IDs as "{species}|{entry_name}", e.g. "human|AKT1_HUMAN".
+    UniProt REST API expects just the entry name: "AKT1_HUMAN".
+    """
+    return human_protein.split("|", 1)[-1]
+
+
 def annotate_genes_pathways(gene_ids: list[str]) -> int:
     """Fetch GO/pathway data for each gene with human_protein and update Gene rows."""
     updated = 0
@@ -53,7 +62,8 @@ def annotate_genes_pathways(gene_ids: list[str]) -> int:
             gene = session.get(Gene, gene_id)
             if not gene or not gene.human_protein:
                 continue
-            go_terms, pathway_ids = fetch_go_and_pathways(gene.human_protein)
+            entry_name = _uniprot_entry_name(gene.human_protein)
+            go_terms, pathway_ids = fetch_go_and_pathways(entry_name)
             gene.go_terms = go_terms
             gene.pathway_ids = pathway_ids
             updated += 1

@@ -12,6 +12,17 @@ log = logging.getLogger(__name__)
 
 IMPC_SOLR = "https://www.ebi.ac.uk/mi/impc/solr/genotype-phenotype/select"
 
+_SPECIES_SUFFIXES = ("_HUMAN", "_MOUSE", "_RAT", "_BOVIN", "_DANRE", "_YEAST", "_CAEEL", "_DROME")
+
+
+def _hgnc_symbol(gene_symbol: str) -> str:
+    """Strip UniProt species suffix to get an HGNC-style gene symbol (AKT1_HUMAN → AKT1)."""
+    upper = gene_symbol.upper()
+    for suffix in _SPECIES_SUFFIXES:
+        if upper.endswith(suffix):
+            return gene_symbol[: -len(suffix)]
+    return gene_symbol
+
 
 def fetch_impc_phenotype(gene_symbol: str) -> Optional[str]:
     """Fetch top mouse KO phenotype string from IMPC for the given gene symbol."""
@@ -55,7 +66,7 @@ def annotate_genes_impc(gene_ids: list[str]) -> int:
             gene = session.get(Gene, gid)
             if not gene:
                 continue
-            pheno = fetch_impc_phenotype(gene.gene_symbol)
+            pheno = fetch_impc_phenotype(_hgnc_symbol(gene.gene_symbol))
             if pheno is None:
                 continue
             ann = session.get(DiseaseAnnotation, gid)

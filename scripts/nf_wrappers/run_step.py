@@ -375,33 +375,6 @@ def _find_result_jsons(results_dir: Path) -> list[Path]:
     return found
 
 
-def _ensure_codon_fna_for_fel_relax(og_dir: Path) -> Path | None:
-    """Return path to codon_aln.fna, materialising it from PAML PHYLIP when missing.
-
-    step6_batch (PAML) historically wrote only paml_work/codon_aln.phy; step6b/6c
-    expect FASTA at og_dir/codon_aln.fna (same layout as the legacy MEME path).
-    """
-    fna = og_dir / "codon_aln.fna"
-    if fna.exists():
-        return fna
-    phy = og_dir / "paml_work" / "codon_aln.phy"
-    if not phy.exists():
-        return None
-    from Bio import SeqIO
-
-    recs = None
-    for fmt in ("phylip-relaxed", "phylip-sequential", "phylip"):
-        try:
-            recs = list(SeqIO.parse(str(phy), fmt))
-        except Exception:
-            recs = None
-        if recs:
-            break
-    if not recs:
-        return None
-    SeqIO.write(recs, str(fna), "fasta")
-    return fna
-
 
 def run_step6_collect(args):
     """Collect per-OG MEME results and write to DB. Supports both flat and batch-nested dirs."""
@@ -426,78 +399,23 @@ def run_step6_collect(args):
         log.warning("No valid MEME results found to load")
 
 
-def _apply_fdr_correction(
-    meme_batch: dict[str, dict],
-    fb_batch: dict[str, dict],
-) -> None:
-    """Apply Benjamini-Hochberg FDR correction to MEME and BUSTED p-values.
-
-    Corrects across all tested OGs (not per-batch) to properly control
-    the false discovery rate.
-    """
-    try:
-        import numpy as np
-
-        meme_pvals = [(og, r.get("dnds_pvalue")) for og, r in meme_batch.items()
-                      if r.get("selection_model") == "meme" and r.get("dnds_pvalue") is not None]
-        if meme_pvals:
-            ogs, pvals = zip(*meme_pvals)
-            pvals_arr = np.array(pvals, dtype=float)
-            n = len(pvals_arr)
-            sorted_idx = np.argsort(pvals_arr)
-            sorted_pvals = pvals_arr[sorted_idx]
-            ranks = np.arange(1, n + 1)
-            adjusted = np.minimum(1.0, sorted_pvals * n / ranks)
-            for i in range(n - 2, -1, -1):
-                adjusted[i] = min(adjusted[i], adjusted[i + 1])
-            fdr = np.empty(n)
-            fdr[sorted_idx] = adjusted
-            for og, adj_p in zip(ogs, fdr):
-                meme_batch[og]["meme_pvalue_fdr"] = round(float(adj_p), 6)
-            log.info("BH-FDR corrected %d MEME p-values", n)
-
-        busted_pvals = [(og, r.get("busted_pvalue")) for og, r in fb_batch.items()
-                        if r.get("busted_pvalue") is not None]
-        if busted_pvals:
-            ogs, pvals = zip(*busted_pvals)
-            pvals_arr = np.array(pvals, dtype=float)
-            n = len(pvals_arr)
-            sorted_idx = np.argsort(pvals_arr)
-            sorted_pvals = pvals_arr[sorted_idx]
-            ranks = np.arange(1, n + 1)
-            adjusted = np.minimum(1.0, sorted_pvals * n / ranks)
-            for i in range(n - 2, -1, -1):
-                adjusted[i] = min(adjusted[i], adjusted[i + 1])
-            fdr = np.empty(n)
-            fdr[sorted_idx] = adjusted
-            for og, adj_p in zip(ogs, fdr):
-                fb_batch[og]["busted_pvalue_fdr"] = round(float(adj_p), 6)
-            log.info("BH-FDR corrected %d BUSTED p-values", n)
-
-    except Exception as exc:
-        log.warning("FDR correction failed: %s", exc)
-
 
 def run_step6_all_collect(args):
-    """Collect all PAML / HyPhy results from merged output and write to DB.
+    """Collect all PAML results from merged output and write to DB.
 
-    Handles both new PAML results (selection_model="paml_branch_site") and
-    legacy HyPhy results (selection_model="busted_ph") for backward compatibility.
+    Handles PAML branch-site results (selection_model="paml_branch_site") and
+    absrel proxy results (selection_model="proxy") for OGs without codon alignments.
     """
-    from pipeline.layer2_evolution.selection import (
-        load_selection_scores, load_fel_busted_scores, load_relax_scores, build_gene_og_map,
-    )
+    from pipeline.layer2_evolution.selection import load_selection_scores, build_gene_og_map
 
     results_dir = Path(args.input_dir)
     gene_by_og = build_gene_og_map()
     all_results = _find_result_jsons(results_dir)
 
-    meme_batch: dict[str, dict] = {}
-    fb_batch: dict[str, dict] = {}
-    relax_batch: dict[str, dict] = {}
+    batch: dict[str, dict] = {}
 
     # Model priority: real PAML > no-signal PAML > proxy (fallback)
-    _MODEL_RANK = {"paml_branch_site": 3, "busted_ph": 2, "paml_no_signal": 1, "proxy": 0}
+    _MODEL_RANK = {"paml_branch_site": 3, "paml_no_signal": 1, "proxy": 0}
 
     for rfile in all_results:
         try:
@@ -512,51 +430,23 @@ def run_step6_all_collect(args):
         if r.get("status") in ("no_codon_alignment", "meme_failed", "skipped", "not_in_aligned"):
             continue
 
-        # Legacy HyPhy: map busted_ph_pvalue → dnds_pvalue
-        if "busted_ph_pvalue" in r and "dnds_pvalue" not in r:
-            r["dnds_pvalue"] = r["busted_ph_pvalue"]
-            r["dnds_ratio"] = 0.0
-
         # Keep the highest-priority result when duplicates exist for the same OG
-        existing = meme_batch.get(og_id)
+        existing = batch.get(og_id)
         if existing is not None:
             existing_rank = _MODEL_RANK.get(existing.get("selection_model", ""), 0)
             new_rank = _MODEL_RANK.get(r.get("selection_model", ""), 0)
             if new_rank <= existing_rank:
-                continue  # existing result is better or equal — keep it
+                continue
 
-        meme_batch[og_id] = r
+        batch[og_id] = r
 
-        if "fel_sites" in r or "busted_pvalue" in r:
-            fb_batch[og_id] = {
-                "og_id": og_id,
-                "fel_sites": r.get("fel_sites"),
-                "busted_pvalue": r.get("busted_pvalue"),
-            }
-        if "relax_k" in r or "relax_pvalue" in r:
-            relax_batch[og_id] = {
-                "og_id": og_id,
-                "relax_k": r.get("relax_k"),
-                "relax_pvalue": r.get("relax_pvalue"),
-            }
+    paml_count = sum(1 for r in batch.values() if r.get("selection_model") == "paml_branch_site")
+    proxy_count = sum(1 for r in batch.values() if r.get("selection_model") == "proxy")
+    log.info("Step6 collect: %d total (%d PAML branch-site, %d proxy)", len(batch), paml_count, proxy_count)
 
-    paml_count = sum(1 for r in meme_batch.values() if r.get("selection_model") == "paml_branch_site")
-    proxy_count = sum(1 for r in meme_batch.values() if r.get("selection_model") == "proxy")
-    log.info("Step6 collect: %d total (%d PAML, %d proxy, %d FEL+BUSTED, %d RELAX)",
-             len(meme_batch), paml_count, proxy_count, len(fb_batch), len(relax_batch))
-
-    # BH-FDR correction across all OGs before loading to DB
-    _apply_fdr_correction(meme_batch, fb_batch)
-
-    if meme_batch:
-        load_selection_scores(meme_batch, gene_by_og)
-        log.info("Loaded %d selection results to DB", len(meme_batch))
-    if fb_batch:
-        load_fel_busted_scores(fb_batch, gene_by_og)
-        log.info("Loaded %d FEL+BUSTED results to DB", len(fb_batch))
-    if relax_batch:
-        load_relax_scores(relax_batch, gene_by_og)
-        log.info("Loaded %d RELAX results to DB", len(relax_batch))
+    if batch:
+        load_selection_scores(batch, gene_by_og)
+        log.info("Loaded %d selection results to DB", len(batch))
 
 
 def run_step6_batch(args):
@@ -670,7 +560,6 @@ def run_step6_batch(args):
             codon_species = list(codon_aln.keys())
             pruned_tree = prune_tree_to_species(treefile, codon_species)
 
-            # FASTA for step6b / step6c batch (expects codon_aln.fna per OG dir, same as MEME path).
             fna_path = og_out / "codon_aln.fna"
             SeqIO.write(
                 [SeqRecord(Seq(seq), id=sp, description="") for sp, seq in codon_aln.items()],
@@ -712,421 +601,6 @@ def run_step6_batch(args):
 
     log.info("PAML batch complete: %d OGs processed", len(og_ids))
 
-
-def _build_codon_aln_for_og(og_id: str, aligned: dict, treefile: Path, fetch_cds_fn) -> tuple:
-    """Build a deduplicated codon alignment for one OG.
-
-    Returns (codon_aln_dict, pruned_tree_newick) or (None, None) if alignment
-    cannot be built (low CDS coverage, too few species, QC failures).
-
-    Shared between step6b_batch and step6c_batch so the alignment logic is DRY.
-    """
-    from pipeline.layer2_evolution.meme_selection import protein_to_codon_alignment
-    from pipeline.layer2_evolution.phylo_tree import prune_tree_to_species
-
-    if og_id not in aligned:
-        return None, None
-
-    seqs = dict(aligned[og_id])
-    cds_seqs: dict[str, str] = {}
-    for label in seqs:
-        parts = label.split("|")
-        accession = parts[-1] if parts else label
-        cds = fetch_cds_fn(accession)
-        if cds:
-            cds_seqs[label] = cds
-
-    cds_coverage = len(cds_seqs) / len(seqs) if seqs else 0.0
-    if cds_coverage < 0.60 or len(cds_seqs) < 3:
-        log.info("OG %s: CDS coverage %.0f%% (%d/%d) — skipping HyPhy",
-                 og_id, cds_coverage * 100, len(cds_seqs), len(seqs))
-        return None, None
-
-    seqs_with_cds = {lbl: seq for lbl, seq in seqs.items() if lbl in cds_seqs}
-    raw_aln = protein_to_codon_alignment(seqs_with_cds, cds_seqs)
-    if not raw_aln:
-        return None, None
-
-    seen_sp: set = set()
-    codon_aln: dict[str, str] = {}
-    for label, seq in raw_aln.items():
-        sp = label.split("|")[0]
-        if sp not in seen_sp:
-            seen_sp.add(sp)
-            codon_aln[sp] = seq
-
-    if len(codon_aln) < 4:
-        log.info("OG %s: only %d species after dedup — skipping HyPhy", og_id, len(codon_aln))
-        return None, None
-
-    pruned_tree = prune_tree_to_species(treefile, list(codon_aln.keys()))
-    return codon_aln, pruned_tree
-
-
-def run_step6b_batch(args):
-    """Batch FEL+BUSTED — self-sufficient codon alignment reconstruction.
-
-    Primary path (--og-id-file + --input-pkl + --cds-cache):
-        Builds codon alignments directly from raw inputs — no dependency on
-        intermediate codon_aln.fna files from step6_batch. This makes FEL/BUSTED
-        robust to Nextflow cache hits on the PAML step and eliminates the need for
-        PAML to write any intermediate files.
-
-    Legacy path (--input-dir only):
-        Reads codon_aln.fna from PAML output subdirs. Kept for backward compat.
-    """
-    import gc
-    import json
-    import os
-    from concurrent.futures import ThreadPoolExecutor, as_completed
-    from pipeline.layer2_evolution.meme_selection import (
-        run_fel, run_busted,
-        parse_fel_results, parse_busted_results,
-        load_cds_cache_pkl, fetch_cds_for_protein,
-    )
-
-    treefile = Path(args.treefile)
-    out_dir = Path(args.output_dir or ".")
-    out_dir.mkdir(parents=True, exist_ok=True)
-
-    og_id_file = getattr(args, 'og_id_file', None)
-    input_pkl = getattr(args, 'input_pkl', None)
-
-    if og_id_file and input_pkl:
-        # ─── Primary path: rebuild codon alignments from raw inputs ───────────
-        with open(og_id_file) as f:
-            og_ids = [line.strip() for line in f if line.strip()]
-        if not og_ids:
-            log.info("FEL+BUSTED batch: empty OG list, nothing to do")
-            return
-        log.info("FEL+BUSTED batch: %d OGs from %s", len(og_ids), og_id_file)
-
-        cds_cache_file = getattr(args, 'cds_cache', None)
-        if cds_cache_file:
-            load_cds_cache_pkl(cds_cache_file)
-
-        data = _load_aligned(input_pkl)
-        aligned = data.get("aligned", data)
-
-        allocated_cpus = int(os.environ.get('NF_TASK_CPUS', os.cpu_count() or 4))
-
-        def _process_og_fb(og_id: str) -> None:
-            og_out = out_dir / og_id
-            og_out.mkdir(parents=True, exist_ok=True)
-            result_file = og_out / "result.json"
-            if result_file.exists() and result_file.stat().st_size > 0:
-                log.info("OG %s: result.json exists, skipping", og_id)
-                return
-
-            codon_aln, pruned_tree = _build_codon_aln_for_og(
-                og_id, aligned, treefile, fetch_cds_for_protein
-            )
-            if not codon_aln:
-                with open(result_file, "w") as f:
-                    json.dump({"og_id": og_id, "status": "skipped", "reason": "no_codon_alignment"}, f)
-                gc.collect()
-                return
-
-            fel_json = run_fel(codon_aln, pruned_tree, og_id)
-            busted_json = run_busted(codon_aln, pruned_tree, og_id)
-            fel_result = parse_fel_results(fel_json) if fel_json else {"fel_sites": 0}
-            busted_result = parse_busted_results(busted_json) if busted_json else {"busted_pvalue": 1.0}
-
-            with open(result_file, "w") as f:
-                json.dump({"og_id": og_id, **fel_result, **busted_result}, f)
-            log.info("OG %s: FEL sites=%s, BUSTED p=%.4f",
-                     og_id, fel_result.get("fel_sites"), busted_result.get("busted_pvalue", 1.0))
-            gc.collect()
-
-        if allocated_cpus <= 1:
-            for og_id in og_ids:
-                _process_og_fb(og_id)
-        else:
-            with ThreadPoolExecutor(max_workers=allocated_cpus) as ex:
-                futs = {ex.submit(_process_og_fb, og_id): og_id for og_id in og_ids}
-                for fut in as_completed(futs):
-                    try:
-                        fut.result()
-                    except Exception as exc:
-                        log.warning("OG %s FEL+BUSTED error: %s", futs[fut], exc)
-
-        log.info("FEL+BUSTED batch complete: %d OGs", len(og_ids))
-
-    else:
-        # ─── Legacy path: read codon_aln.fna from PAML output dirs ───────────
-        from Bio import SeqIO
-        from pipeline.layer2_evolution.meme_selection import (
-            run_fel, run_busted,
-            parse_fel_results, parse_busted_results,
-        )
-        from pipeline.layer2_evolution.phylo_tree import prune_tree_to_species
-
-        if not getattr(args, 'input_dir', None):
-            raise ValueError("Either --og-id-file + --input-pkl or --input-dir required for step6b_batch")
-        meme_dir = Path(args.input_dir)
-        og_dirs = [d for d in meme_dir.iterdir() if d.is_dir()]
-        log.info("FEL+BUSTED batch (legacy): %d OG dirs in %s", len(og_dirs), meme_dir)
-        for og_dir in og_dirs:
-            og_id = og_dir.name
-            og_out = out_dir / og_id
-            og_out.mkdir(parents=True, exist_ok=True)
-            codon_aln_path = _ensure_codon_fna_for_fel_relax(og_dir)
-            if not codon_aln_path:
-                with open(og_out / "result.json", "w") as f:
-                    json.dump({"og_id": og_id, "status": "skipped"}, f)
-                continue
-            codon_aln = {r.id: str(r.seq) for r in SeqIO.parse(str(codon_aln_path), "fasta")}
-            gene_treefile = og_dir / "gene.treefile"
-            if gene_treefile.exists():
-                tree = gene_treefile.read_text().strip()
-            else:
-                species_ids = [label.split("|")[0] for label in codon_aln]
-                tree = prune_tree_to_species(treefile, species_ids)
-            fel_json = run_fel(codon_aln, tree, og_id)
-            busted_json = run_busted(codon_aln, tree, og_id)
-            fel_result = parse_fel_results(fel_json) if fel_json else {"fel_sites": 0}
-            busted_result = parse_busted_results(busted_json) if busted_json else {"busted_pvalue": 1.0}
-            with open(og_out / "result.json", "w") as f:
-                json.dump({"og_id": og_id, **fel_result, **busted_result}, f)
-        log.info("FEL+BUSTED batch complete (legacy): %d OGs", len(og_dirs))
-
-
-def run_step6c_batch(args):
-    """Batch RELAX — self-sufficient codon alignment reconstruction.
-
-    Primary path (--og-id-file + --input-pkl + --cds-cache):
-        Builds codon alignments directly from raw inputs — no dependency on
-        codon_aln.fna from the PAML step. Mirrors the architecture of step6b_batch.
-
-    Legacy path (--input-dir only):
-        Reads codon_aln.fna from PAML output subdirs. Kept for backward compat.
-    """
-    import gc
-    import json
-    import os
-    from concurrent.futures import ThreadPoolExecutor, as_completed
-    from pipeline.layer2_evolution.meme_selection import (
-        run_relax, parse_relax_results,
-        load_cds_cache_pkl, fetch_cds_for_protein,
-    )
-
-    treefile = Path(args.treefile)
-    out_dir = Path(args.output_dir or ".")
-    out_dir.mkdir(parents=True, exist_ok=True)
-
-    og_id_file = getattr(args, 'og_id_file', None)
-    input_pkl = getattr(args, 'input_pkl', None)
-
-    if og_id_file and input_pkl:
-        # ─── Primary path: rebuild codon alignments from raw inputs ───────────
-        with open(og_id_file) as f:
-            og_ids = [line.strip() for line in f if line.strip()]
-        if not og_ids:
-            log.info("RELAX batch: empty OG list, nothing to do")
-            return
-        log.info("RELAX batch: %d OGs from %s", len(og_ids), og_id_file)
-
-        cds_cache_file = getattr(args, 'cds_cache', None)
-        if cds_cache_file:
-            load_cds_cache_pkl(cds_cache_file)
-
-        data = _load_aligned(input_pkl)
-        aligned = data.get("aligned", data)
-
-        allocated_cpus = int(os.environ.get('NF_TASK_CPUS', os.cpu_count() or 4))
-
-        def _process_og_relax(og_id: str) -> None:
-            og_out = out_dir / og_id
-            og_out.mkdir(parents=True, exist_ok=True)
-            result_file = og_out / "result.json"
-            if result_file.exists() and result_file.stat().st_size > 0:
-                log.info("OG %s: result.json exists, skipping", og_id)
-                return
-
-            codon_aln, pruned_tree = _build_codon_aln_for_og(
-                og_id, aligned, treefile, fetch_cds_for_protein
-            )
-            if not codon_aln:
-                with open(result_file, "w") as f:
-                    json.dump({"og_id": og_id, "status": "skipped", "reason": "no_codon_alignment"}, f)
-                gc.collect()
-                return
-
-            relax_json = run_relax(codon_aln, pruned_tree, og_id)
-            relax_result = (
-                parse_relax_results(relax_json)
-                if relax_json
-                else {"relax_k": None, "relax_pvalue": 1.0}
-            )
-            with open(result_file, "w") as f:
-                json.dump({"og_id": og_id, **relax_result}, f)
-            log.info("OG %s: RELAX k=%.3f p=%.4f",
-                     og_id, relax_result.get("relax_k") or 0, relax_result.get("relax_pvalue", 1.0))
-            gc.collect()
-
-        if allocated_cpus <= 1:
-            for og_id in og_ids:
-                _process_og_relax(og_id)
-        else:
-            with ThreadPoolExecutor(max_workers=allocated_cpus) as ex:
-                futs = {ex.submit(_process_og_relax, og_id): og_id for og_id in og_ids}
-                for fut in as_completed(futs):
-                    try:
-                        fut.result()
-                    except Exception as exc:
-                        log.warning("OG %s RELAX error: %s", futs[fut], exc)
-
-        log.info("RELAX batch complete: %d OGs", len(og_ids))
-
-    else:
-        # ─── Legacy path: read codon_aln.fna from PAML output dirs ───────────
-        from Bio import SeqIO
-        from pipeline.layer2_evolution.meme_selection import run_relax, parse_relax_results
-        from pipeline.layer2_evolution.phylo_tree import prune_tree_to_species
-
-        if not getattr(args, 'input_dir', None):
-            raise ValueError("Either --og-id-file + --input-pkl or --input-dir required for step6c_batch")
-        meme_dir = Path(args.input_dir)
-        og_dirs = [d for d in meme_dir.iterdir() if d.is_dir()]
-        log.info("RELAX batch (legacy): %d OG dirs in %s", len(og_dirs), meme_dir)
-        for og_dir in og_dirs:
-            og_id = og_dir.name
-            og_out = out_dir / og_id
-            og_out.mkdir(parents=True, exist_ok=True)
-            codon_aln_path = _ensure_codon_fna_for_fel_relax(og_dir)
-            if not codon_aln_path:
-                with open(og_out / "result.json", "w") as f:
-                    json.dump({"og_id": og_id, "status": "skipped"}, f)
-                continue
-            codon_aln = {r.id: str(r.seq) for r in SeqIO.parse(str(codon_aln_path), "fasta")}
-            gene_treefile = og_dir / "gene.treefile"
-            if gene_treefile.exists():
-                tree = gene_treefile.read_text().strip()
-            else:
-                species_ids = [label.split("|")[0] for label in codon_aln]
-                tree = prune_tree_to_species(treefile, species_ids)
-            relax_json = run_relax(codon_aln, tree, og_id)
-            relax_result = parse_relax_results(relax_json) if relax_json else {"relax_k": None, "relax_pvalue": 1.0}
-            with open(og_out / "result.json", "w") as f:
-                json.dump({"og_id": og_id, **relax_result}, f)
-        log.info("RELAX batch complete (legacy): %d OGs", len(og_dirs))
-
-
-def run_step6b_single_og(args):
-    """Per-OG FEL+BUSTED — called by Nextflow scatter."""
-    from Bio import SeqIO
-    from pipeline.layer2_evolution.meme_selection import (
-        run_fel, run_busted,
-        parse_fel_results, parse_busted_results,
-    )
-    from pipeline.layer2_evolution.phylo_tree import prune_tree_to_species
-
-    og_id = args.og_id
-    out_dir = Path(args.output_dir or ".")
-    out_dir.mkdir(parents=True, exist_ok=True)
-    codon_aln_path = Path(args.codon_aln)
-    treefile = Path(args.treefile)
-
-    if not codon_aln_path.exists():
-        log.warning("No codon alignment for %s", og_id)
-        with open(out_dir / "result.json", "w") as f:
-            json.dump({"og_id": og_id, "status": "skipped"}, f)
-        return
-
-    codon_aln = {r.id: str(r.seq) for r in SeqIO.parse(str(codon_aln_path), "fasta")}
-
-    gene_treefile = codon_aln_path.parent / "gene.treefile"
-    if gene_treefile.exists():
-        tree = gene_treefile.read_text().strip()
-    else:
-        species_ids = [label.split("|")[0] for label in codon_aln]
-        tree = prune_tree_to_species(treefile, species_ids)
-
-    fel_json = run_fel(codon_aln, tree, og_id)
-    busted_json = run_busted(codon_aln, tree, og_id)
-    fel_result = parse_fel_results(fel_json) if fel_json else {"fel_sites": 0}
-    busted_result = parse_busted_results(busted_json) if busted_json else {"busted_pvalue": 1.0}
-
-    with open(out_dir / "result.json", "w") as f:
-        json.dump({"og_id": og_id, **fel_result, **busted_result}, f)
-
-
-def run_step6c_single_og(args):
-    """Per-OG RELAX — called by Nextflow scatter."""
-    from Bio import SeqIO
-    from pipeline.layer2_evolution.meme_selection import run_relax, parse_relax_results
-    from pipeline.layer2_evolution.phylo_tree import prune_tree_to_species
-
-    og_id = args.og_id
-    out_dir = Path(args.output_dir or ".")
-    out_dir.mkdir(parents=True, exist_ok=True)
-    codon_aln_path = Path(args.codon_aln)
-    treefile = Path(args.treefile)
-
-    if not codon_aln_path.exists():
-        log.warning("No codon alignment for %s", og_id)
-        with open(out_dir / "result.json", "w") as f:
-            json.dump({"og_id": og_id, "status": "skipped"}, f)
-        return
-
-    codon_aln = {r.id: str(r.seq) for r in SeqIO.parse(str(codon_aln_path), "fasta")}
-
-    gene_treefile = codon_aln_path.parent / "gene.treefile"
-    if gene_treefile.exists():
-        tree = gene_treefile.read_text().strip()
-    else:
-        species_ids = [label.split("|")[0] for label in codon_aln]
-        tree = prune_tree_to_species(treefile, species_ids)
-
-    relax_json = run_relax(codon_aln, tree, og_id)
-    relax_result = parse_relax_results(relax_json) if relax_json else {"relax_k": None, "relax_pvalue": 1.0}
-
-    with open(out_dir / "result.json", "w") as f:
-        json.dump({"og_id": og_id, **relax_result}, f)
-
-
-def run_step6b_collect(args):
-    """Collect per-OG FEL+BUSTED results and write to DB. Supports both flat and batch-nested dirs."""
-    from pipeline.layer2_evolution.selection import load_fel_busted_scores, build_gene_og_map
-
-    results_dir = Path(args.input_dir)
-    gene_by_og = build_gene_og_map()
-    batch: dict[str, dict] = {}
-    for rfile in _find_result_jsons(results_dir):
-        with open(rfile) as f:
-            r = json.load(f)
-        og_id = r.get("og_id") or rfile.parent.name
-        if r and r.get("status") != "skipped":
-            batch[og_id] = r
-
-    log.info("FEL+BUSTED collect: %d valid results", len(batch))
-    if batch:
-        load_fel_busted_scores(batch, gene_by_og)
-        log.info("Loaded %d FEL+BUSTED results to DB", len(batch))
-    else:
-        log.warning("No valid FEL+BUSTED results found to load")
-
-
-def run_step6c_collect(args):
-    """Collect per-OG RELAX results and write to DB. Supports both flat and batch-nested dirs."""
-    from pipeline.layer2_evolution.selection import load_relax_scores, build_gene_og_map
-
-    results_dir = Path(args.input_dir)
-    gene_by_og = build_gene_og_map()
-    batch: dict[str, dict] = {}
-    for rfile in _find_result_jsons(results_dir):
-        with open(rfile) as f:
-            r = json.load(f)
-        og_id = r.get("og_id") or rfile.parent.name
-        if r and r.get("status") != "skipped":
-            batch[og_id] = r
-
-    log.info("RELAX collect: %d valid results", len(batch))
-    if batch:
-        load_relax_scores(batch, gene_by_og)
-        log.info("Loaded %d RELAX results to DB", len(batch))
-    else:
-        log.warning("No valid RELAX results found to load")
 
 
 def run_step7(args):
@@ -1404,12 +878,6 @@ STEP_MAP = {
     "step6_batch": run_step6_batch,
     "step6_collect": run_step6_collect,
     "step6_all_collect": run_step6_all_collect,
-    "step6b_single_og": run_step6b_single_og,
-    "step6b_batch": run_step6b_batch,
-    "step6b_collect": run_step6b_collect,
-    "step6c_single_og": run_step6c_single_og,
-    "step6c_batch": run_step6c_batch,
-    "step6c_collect": run_step6c_collect,
     "step7": run_step7,
     "step7b": run_step7b,
     "step8": run_step8,

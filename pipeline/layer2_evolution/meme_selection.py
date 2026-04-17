@@ -1571,19 +1571,38 @@ def parse_relax_results(relax_json: dict) -> dict:
 
 
 def _relax_worker(args: tuple) -> tuple[str, Optional[dict]]:
-    """Top-level worker: run RELAX for one orthogroup."""
+    """Top-level worker: run RELAX for one orthogroup.
+
+    Tries the pre-built codon alignment at meme/<og_id>/codon_aln.fna first.
+    Falls back to rebuilding from the CDS disk cache (same approach used by
+    _fel_busted_worker) so RELAX produces scores when running after PAML (which
+    does not write to the meme/ directory).
+    """
     og_id, aligned_seqs, species_treefile_str, storage_root = args
     from pipeline.layer2_evolution.phylo_tree import prune_tree_to_species
     from pathlib import Path as _Path
     from Bio import SeqIO as _SeqIO
 
     codon_aln_path = _Path(storage_root) / "meme" / og_id / "codon_aln.fna"
-    if not codon_aln_path.exists():
-        return og_id, None
-    try:
-        codon_aln = {rec.id: str(rec.seq) for rec in _SeqIO.parse(str(codon_aln_path), "fasta")}
-    except Exception:
-        return og_id, None
+    codon_aln = None
+    if codon_aln_path.exists():
+        try:
+            codon_aln = {rec.id: str(rec.seq) for rec in _SeqIO.parse(str(codon_aln_path), "fasta")}
+        except Exception:
+            codon_aln = None
+
+    # CDS rebuild fallback — mirrors _fel_busted_worker so RELAX works with PAML
+    if not codon_aln:
+        cds_seqs: dict[str, str] = {}
+        for label in aligned_seqs:
+            parts = label.split("|")
+            accession = parts[-1] if parts else label
+            cds = fetch_cds_for_protein(accession)
+            if cds:
+                cds_seqs[label] = cds
+        if len(cds_seqs) == len(aligned_seqs):
+            codon_aln = protein_to_codon_alignment(aligned_seqs, cds_seqs)
+
     if not codon_aln:
         return og_id, None
 

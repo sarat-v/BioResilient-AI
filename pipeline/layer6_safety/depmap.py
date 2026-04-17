@@ -17,13 +17,14 @@ Data source:
   File: CRISPRGeneDependency.csv (gene-level mean scores)
   Cached at {storage_root}/depmap/CRISPRGeneDependency.csv
 
-Score interpretation:
-  < -0.5: broadly essential — high safety risk
-  -0.5 to -0.2: context-dependent essentiality — moderate risk
-  > -0.2: not broadly essential — safer target
+Score interpretation (probability of dependency, 0–1):
+  > 0.7: very broadly essential — high safety risk
+  0.5–0.7: broadly essential — moderate safety concern
+  < 0.3: not broadly essential — safer target
 """
 
 import csv
+import io
 import logging
 import time
 from pathlib import Path
@@ -37,8 +38,15 @@ from pipeline.config import get_local_storage_root
 
 log = logging.getLogger(__name__)
 
-DEPMAP_SUMMARY_URL = "https://depmap.org/portal/api/download/file?file_name=CRISPRGeneDependency.csv&release=DepMap+Public+24Q2"
-REQUEST_TIMEOUT = 30
+DEPMAP_FILES_API = "https://depmap.org/portal/api/download/files"
+DEPMAP_TARGET_FILE = "CRISPRGeneDependency.csv"
+REQUEST_TIMEOUT = 60
+DEPMAP_FALLBACK_URLS = [
+    # Known working direct file URLs
+    "https://storage.googleapis.com/depmap-external-downloads/downloads-by-canonical-id/26q1-public-3b44.1/CRISPRGeneDependency.csv",
+    "https://ndownloader.figshare.com/files/51064631",  # 24Q4
+    "https://ndownloader.figshare.com/files/46489021",  # 24Q2
+]
 
 
 def _depmap_cache_path() -> Path:
@@ -87,37 +95,89 @@ def _try_s3_upload(s3_key: str, local_path: Path) -> None:
         log.debug("DepMap S3 cache upload failed (non-fatal): %s", exc)
 
 
+def _resolve_depmap_url() -> Optional[str]:
+    """Resolve the current download URL for CRISPRGeneDependency.csv from DepMap.
+
+    DepMap's /api/download/files returns a CSV manifest with columns:
+      release, release_date, filename, url, md5_hash
+    We prefer the latest release with a GCS URL; fall back to Figshare.
+    """
+    try:
+        r = requests.get(
+            DEPMAP_FILES_API,
+            timeout=30,
+            headers={"User-Agent": "BioResilient/1.0"},
+        )
+        if r.status_code != 200:
+            log.warning("DepMap files API: HTTP %d", r.status_code)
+            return DEPMAP_FALLBACK_URLS[0]
+        reader = csv.DictReader(io.StringIO(r.text))
+        candidates = []
+        for row in reader:
+            fname = row.get("filename", "") or row.get("name", "")
+            url = row.get("url", "") or row.get("downloadUrl", "")
+            release = row.get("release", "")
+            if fname == DEPMAP_TARGET_FILE and url:
+                candidates.append((release, url))
+        if not candidates:
+            log.warning("DepMap files API: %s not found in manifest.", DEPMAP_TARGET_FILE)
+            return DEPMAP_FALLBACK_URLS[0]
+        # Sort by release name descending (latest first) — prefer GCS over Figshare
+        candidates.sort(key=lambda x: x[0], reverse=True)
+        gcs = [(r, u) for r, u in candidates if "storage.googleapis.com" in u]
+        chosen = (gcs or candidates)[0]
+        log.info("DepMap: resolved %s → %s (%s)", DEPMAP_TARGET_FILE, chosen[0], chosen[1][:80])
+        return chosen[1]
+    except Exception as exc:
+        log.warning("DepMap URL resolution failed: %s", exc)
+        return DEPMAP_FALLBACK_URLS[0]
+
+
 def download_depmap_scores(force: bool = False) -> Path:
     """Download DepMap CRISPR gene dependency scores.
 
     Lookup order (fastest first):
       1. Local disk (/tmp/bioresilient/depmap/) — present after first run in same container
       2. S3 bucket (cache/depmap/) — present after any previous successful run
-      3. DepMap portal (~150 MB) — original source; result is uploaded to S3 for caching
+      3. DepMap files API (dynamic URL from CSV manifest) → GCS or Figshare
     """
     path = _depmap_cache_path()
     if path.exists() and not force:
         log.info("DepMap scores already cached locally at %s", path)
         return path
 
-    # S3 cache check — avoids 150 MB portal download on Spot retries
+    # S3 cache check — avoids large download on Spot retries
     if not force and _try_s3_download(_DEPMAP_S3_KEY, path):
         return path
 
-    log.info("Downloading DepMap CRISPR scores from portal (~150 MB)...")
-    try:
-        with requests.get(DEPMAP_SUMMARY_URL, stream=True, timeout=60) as r:
-            r.raise_for_status()
-            with open(path, "wb") as f:
-                for chunk in r.iter_content(chunk_size=1024 * 1024):
-                    f.write(chunk)
-        log.info("DepMap download complete: %s", path)
-        # Cache to S3 so spot retries skip the portal download
-        _try_s3_upload(_DEPMAP_S3_KEY, path)
-    except Exception as exc:
-        log.warning("DepMap download failed: %s — skipping essentiality scoring.", exc)
-        if path.exists():
-            path.unlink()
+    url = _resolve_depmap_url()
+    if not url:
+        log.warning("DepMap: cannot resolve download URL — skipping essentiality scoring.")
+        return path
+
+    log.info("Downloading DepMap CRISPR scores from %s ...", url[:80])
+    tried = [url] + [u for u in DEPMAP_FALLBACK_URLS if u != url]
+    for candidate in tried:
+        try:
+            with requests.get(
+                candidate,
+                stream=True,
+                timeout=REQUEST_TIMEOUT,
+                headers={"User-Agent": "BioResilient/1.0"},
+            ) as r:
+                r.raise_for_status()
+                with open(path, "wb") as f:
+                    for chunk in r.iter_content(chunk_size=1024 * 1024):
+                        f.write(chunk)
+            log.info("DepMap download complete: %s", path)
+            _try_s3_upload(_DEPMAP_S3_KEY, path)
+            return path
+        except Exception as exc:
+            log.warning("DepMap download failed from %s: %s", candidate[:80], exc)
+            if path.exists():
+                path.unlink()
+            continue
+    log.warning("DepMap: all download sources failed — skipping essentiality scoring.")
     return path
 
 
@@ -172,6 +232,13 @@ def load_depmap_index(csv_path: Path) -> dict[str, float]:
     return result
 
 
+def _hgnc_symbol(raw: str) -> str:
+    """Convert OMA entry name (AKT1_HUMAN) to bare HGNC symbol (AKT1)."""
+    if raw and "_" in raw:
+        return raw.split("_")[0]
+    return raw or ""
+
+
 def annotate_depmap(
     depmap_index: dict[str, float],
     gene_ids: Optional[list[str]] = None,
@@ -182,15 +249,17 @@ def annotate_depmap(
     """
     with get_session() as session:
         if gene_ids is None:
-            from db.models import Gene
             gene_ids = [g.id for g in session.query(Gene).all()]
         genes = session.query(Gene).filter(Gene.id.in_(gene_ids)).all()
 
     annotated = 0
     with get_session() as session:
         for gene in genes:
-            symbol = gene.gene_symbol
-            if not symbol or symbol not in depmap_index:
+            symbol = _hgnc_symbol(gene.gene_symbol)
+            if not symbol:
+                continue
+            if symbol not in depmap_index:
+                log.info("DepMap: no score for %s (raw: %s)", symbol, gene.gene_symbol)
                 continue
 
             score = depmap_index[symbol]
@@ -200,6 +269,7 @@ def annotate_depmap(
                 session.add(sf)
 
             sf.depmap_score = score
+            log.info("DepMap %s: chronos=%.4f", symbol, score)
             annotated += 1
 
         session.commit()

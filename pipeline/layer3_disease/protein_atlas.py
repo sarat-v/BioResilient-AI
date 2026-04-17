@@ -12,6 +12,17 @@ log = logging.getLogger(__name__)
 
 HPA_SEARCH = "https://www.proteinatlas.org/search_download.php"
 
+_SPECIES_SUFFIXES = ("_HUMAN", "_MOUSE", "_RAT", "_BOVIN", "_DANRE", "_YEAST", "_CAEEL", "_DROME")
+
+
+def _hgnc_symbol(gene_symbol: str) -> str:
+    """Strip UniProt species suffix to get an HGNC-style gene symbol (AKT1_HUMAN → AKT1)."""
+    upper = gene_symbol.upper()
+    for suffix in _SPECIES_SUFFIXES:
+        if upper.endswith(suffix):
+            return gene_symbol[: -len(suffix)]
+    return gene_symbol
+
 
 def fetch_tissue_expression(gene_symbol: str) -> Optional[dict]:
     """Fetch tissue TPM expression map from Human Protein Atlas. Returns {tissue: tpm_value}."""
@@ -55,7 +66,7 @@ def annotate_genes_protein_atlas(gene_ids: list[str]) -> int:
             gene = session.get(Gene, gid)
             if not gene:
                 continue
-            expr = fetch_tissue_expression(gene.gene_symbol)
+            expr = fetch_tissue_expression(_hgnc_symbol(gene.gene_symbol))
             if expr is None:
                 continue
             ann = session.get(DiseaseAnnotation, gid)

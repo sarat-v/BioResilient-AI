@@ -13,45 +13,82 @@ log = logging.getLogger(__name__)
 
 GWAS_API = "https://www.ebi.ac.uk/gwas/rest/api"
 
+_SPECIES_SUFFIXES = ("_HUMAN", "_MOUSE", "_RAT", "_BOVIN", "_DANRE", "_YEAST", "_CAEEL", "_DROME")
+
+
+def _hgnc_symbol(gene_symbol: str) -> str:
+    """Strip UniProt species suffix to get an HGNC-style gene symbol (AKT1_HUMAN → AKT1)."""
+    upper = gene_symbol.upper()
+    for suffix in _SPECIES_SUFFIXES:
+        if upper.endswith(suffix):
+            return gene_symbol[: -len(suffix)]
+    return gene_symbol
+
 # EBI asks for "reasonable use". 0.25 s between calls = ~4 req/s per IP.
 # At 60 genes × 2 calls each that's 120 requests in ~30 s — well within limits.
 _RATE_SLEEP = 0.25
 
 
 def fetch_gwas_pvalue(gene_symbol: str) -> Optional[float]:
-    """Fetch the strongest (minimum) p-value from GWAS Catalog for the given gene symbol."""
+    """Fetch the strongest (minimum) p-value from GWAS Catalog for the given gene symbol.
+
+    Uses SNP-based lookup since the /genes endpoint was removed from the GWAS Catalog REST API.
+    Steps:
+      1. Get up to 20 SNPs mapped to the gene via findByGene.
+      2. For each SNP (up to 5), fetch associations and extract p-values from
+         pvalueMantissa × 10^pvalueExponent.
+      3. Return the minimum p-value across all associations found.
+    """
     try:
         r = requests.get(
-            f"{GWAS_API}/genes",
-            params={"geneName": gene_symbol, "size": 100},
+            f"{GWAS_API}/singleNucleotidePolymorphisms/search/findByGene",
+            params={"geneName": gene_symbol, "size": 20},
             timeout=15,
         )
         if r.status_code != 200:
             return None
         data = r.json()
-        embeds = data.get("_embedded", {}).get("genes", [])
-        if not embeds:
+        snps = data.get("_embedded", {}).get("singleNucleotidePolymorphisms", [])
+        if not snps:
             return None
-        gene_uri = embeds[0].get("_links", {}).get("self", {}).get("href")
-        if not gene_uri:
-            return None
-        r2 = requests.get(f"https://www.ebi.ac.uk{gene_uri}/associations", params={"size": 200}, timeout=15)
-        if r2.status_code != 200:
-            return None
-        assoc = r2.json()
-        assoc_list = assoc.get("_embedded", {}).get("associations", [])
-        pvalues = []
-        for a in assoc_list:
-            pval = a.get("pvalue")
-            if pval is not None:
-                try:
-                    pvalues.append(float(pval))
-                except (TypeError, ValueError):
-                    pass
-        return min(pvalues) if pvalues else None
     except Exception as exc:
-        log.debug("GWAS for %s: %s", gene_symbol, exc)
+        log.debug("GWAS SNP lookup for %s: %s", gene_symbol, exc)
         return None
+
+    pvalues: list[float] = []
+    for snp in snps[:5]:
+        rs_id = snp.get("rsId")
+        if not rs_id:
+            continue
+        try:
+            r2 = requests.get(
+                f"{GWAS_API}/singleNucleotidePolymorphisms/{rs_id}/associations",
+                params={"size": 20},
+                timeout=15,
+            )
+            if r2.status_code != 200:
+                continue
+            assoc_data = r2.json()
+            for a in assoc_data.get("_embedded", {}).get("associations", []):
+                mantissa = a.get("pvalueMantissa")
+                exponent = a.get("pvalueExponent")
+                if mantissa is not None and exponent is not None:
+                    try:
+                        m = float(mantissa)
+                        # Skip zero-mantissa entries — these are GWAS Catalog data-quality
+                        # artifacts (mantissa stored as 0 instead of a true p-value).
+                        # min(pvalues) would otherwise pick up 0.0 as the "best" hit.
+                        if m <= 0:
+                            continue
+                        pvalues.append(m * (10 ** int(exponent)))
+                    except (TypeError, ValueError):
+                        pass
+            time.sleep(_RATE_SLEEP)
+        except Exception as exc:
+            log.debug("GWAS assoc for %s/%s: %s", gene_symbol, rs_id, exc)
+            continue
+
+    return min(pvalues) if pvalues else None
 
 
 def annotate_genes_gwas(gene_ids: list[str]) -> int:
@@ -80,7 +117,7 @@ def annotate_genes_gwas(gene_ids: list[str]) -> int:
     # Fetch all p-values outside DB session (rate-limited to avoid EBI 429)
     fetch_results: dict[str, float] = {}
     for i, gid in enumerate(todo):
-        pval = fetch_gwas_pvalue(gene_map[gid].gene_symbol)
+        pval = fetch_gwas_pvalue(_hgnc_symbol(gene_map[gid].gene_symbol))
         if pval is not None:
             fetch_results[gid] = pval
         if i < len(todo) - 1:

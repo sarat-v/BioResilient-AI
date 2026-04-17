@@ -1,5 +1,2 @@
 task_id	hash	native_id	name	status	exit	submit	duration	realtime	%cpu	peak_rss	peak_vmem	rchar	wchar
-1	e8/86ad7f	dd8f0dd8-b64e-4a8a-aa71-2bd3227b31ac	PHASE1_EXPRESSION:functional_evidence	COMPLETED	0	2026-04-07 13:20:10.033	15m 17s	11m 50s	30.4%	134.9 MB	1.6 GB	5.7 GB	443.9 MB
-2	ba/83f304	c429e3f0-f22e-4d94-b152-5e4867744552	PHASE1_EXPRESSION:bgee_expression	COMPLETED	0	2026-04-07 13:35:27.500	18.8s	616ms	84.1%	3.1 MB	4.4 MB	11.3 MB	562.5 KB
-3	80/1d62cb	3f11b060-93a5-48b5-bac2-bce59b96883b	PHASE1_EXPRESSION:composite_score_phase1	COMPLETED	0	2026-04-07 13:35:47.325	29s	14.3s	23.3%	137.1 MB	165.4 MB	19.4 MB	608.4 KB
-4	ed/eac08b	da17a88b-40af-4e22-a734-dddb1f167d58	PHASE1_EXPRESSION:generate_phase1_reports	COMPLETED	0	2026-04-07 13:36:17.214	1m 9s	47.4s	15.8%	60.5 MB	87.4 MB	178.2 MB	673.4 KB
+1	2b/be4f53	d2e335f9-3f5a-46a8-b732-f1be07c9d6fe	PHASE1_SEQUENCE:variant_direction	COMPLETED	0	2026-04-17 02:44:56.213	6m 5s	2m 55s	2.1%	1 GB	1 GB	21.9 MB	1.2 MB

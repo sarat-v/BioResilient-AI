@@ -4,7 +4,7 @@
 
 ---
 
-## Step Reports
+## Phase 1 Step Reports (Evolutionary Genomics)
 
 | Step | Title | Status | Key Output |
 |---|---|---|---|
@@ -20,15 +20,50 @@
 
 ---
 
-## Top-Line Results
+## Phase 2 Step Reports (Clinical Translation)
 
-- **36 Tier 1 candidates** (FDR < 5%): highest confidence genes for experimental follow-up
-- **96 Tier 2 candidates** (FDR 5–20%): secondary priority list
-- **Best-in-class benchmark validated:** CDK4 (known cancer driver) appears Tier 1 rank 12 ✅
+| Step | Title | Status | Key Output |
+|---|---|---|---|
+| [Step 9b](step9b_structural_annotation.md) | Structural Context Annotation | ✅ PASS | 2,092 motifs; 69 pocket-adjacent; AlphaMissense + fpocket |
+| [Step 10b](step10b_regulatory_divergence.md) | Regulatory Divergence (AlphaGenome) | ✅ PASS | 202 records; 45 genes with regulatory signal |
+| [Step 11](step11_disease_annotation.md) | Disease Annotation (OpenTargets + GWAS + gnomAD) | ✅ PASS | 119 genes with OT scores; 140 with GWAS; 22 with known drugs |
+| [Step 12](step12_druggability.md) | Druggability Assessment (fpocket + P2Rank) | ✅ PASS | 279/280 genes with pockets; 76 PROTAC-tractable |
+| [Step 13](step13_gene_therapy.md) | Gene Therapy Feasibility | ✅ PASS (informational) | 15 genes evaluated; all AAV-compatible |
+| [Step 14](step14_safety_screen.md) | Safety Screen (DepMap + GTEx + PheWAS) | ✅ PASS | 2 essential genes; safety floor enforced |
+| [Step 15](step15_final_scoring.md) | Phase 2 Final Scoring & Tier Assignment | ✅ PASS | **74 Validated, 81 Tier 2 — 155 total candidates** |
 
 ---
 
-## Comprehensive Report
+## Phase 3 Step Reports (Translational Readiness)
 
-For the full integrated analysis with cross-step interpretation:  
-→ [BioResilient_Pipeline_Report_Steps1_9.md](../BioResilient_Pipeline_Report_Steps1_9.md)
+| Step | Title | Status | Key Output |
+|---|---|---|---|
+| Step 16 | Translational Status (ClinicalTrials.gov + ChEMBL) | ⏳ PENDING run | Known drug phases; clinical trial mapping |
+| Step 17 | Preclinical Readiness Scoring | ⏳ PENDING run | Synthesis score, model score, assay score, readiness tier |
+| Step 18 | Target Dossier Generation (Markdown) | ⏳ PENDING run | Per-gene dossier: all evidence + recommended first experiments |
+
+> **Pipeline boundary:** Step 18 (target dossier) is the **final computational output**. The pipeline delivers a ranked, annotated list of therapeutic targets with supporting evidence from 18 integrated computational steps. Wet-lab validation (binding assays, cellular phenotype, in-vivo studies) is the responsibility of the downstream experimental programme.
+
+> **Out of scope:** Steps 19–25 (virtual screening, ADMET, lead optimisation) require wet-lab binding data as input and constitute a separate product. Contact the BioResilient team to initiate the Lead Discovery programme.
+
+---
+
+## Phase 2 Top-Line Results
+
+- **1 Tier 1 gene:** G6PD (composite 0.709) — only gene clearing the 0.70 threshold
+- **74 Validated genes:** Tier1/Tier2 with corroborating human genetic evidence (GWAS / OT / protective variants)
+- **81 Tier 2 genes:** Strong evolutionary signal, awaiting human genetic corroboration
+- **G6PD independently rediscovered** — validates the cross-species evolutionary approach
+- **3 genes with Phase 3 drugs at convergent sites:** CD80 (Galiximab), KCNS1 (Guanidine), XDH (Allopurinol)
+
+---
+
+## Comprehensive Reports
+
+**Phase 1:**  
+→ [BioResilient_Pipeline_Report_Steps1_9.md](../BioResilient_Pipeline_Report_Steps1_9.md)  
+→ [BioResilient_Pipeline_Report_Steps1_9.docx](../BioResilient_Pipeline_Report_Steps1_9.docx)
+
+**Phase 2:**  
+→ [Phase2_Pipeline_Report.md](../Phase2_Pipeline_Report.md)  
+→ [Phase2_Pipeline_Report.docx](../Phase2_Pipeline_Report.docx)

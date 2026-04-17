@@ -167,7 +167,7 @@ The three data sources (Open Targets, GTEx, DepMap) are combined into a single `
 expression_score = max(ot_score, gtex_score, depmap_score)
 ```
 
-Taking the maximum rather than average means: a gene is scored by whichever evidence source provides the strongest signal for that specific gene.
+Taking the maximum rather than average means: a gene is scored by whichever evidence source provides the strongest signal for that specific gene. This is a **ceiling-union** approach — it rewards genes with any strong functional evidence without requiring all three databases to agree. The trade-off is that a broadly pan-essential gene (high DepMap score) will receive a high expression_score even if it has no cancer-specific OT association. Pan-essential genes are handled downstream by the Step 14 safety screen (DepMap Chronos floor), which zeroes the composite score for genes with `depmap_score > 0.7` across cell lines. The two mechanisms are therefore complementary rather than redundant.
 
 ### Final expression_score distribution
 
@@ -202,15 +202,15 @@ expression_result table:    16,479 rows
   OT:disease_association:    5,376 rows
 
 candidate_score.expression_score:
-  5,775 genes with expression_score > 0
-  7,020 genes with expression_score = 0 (no functional evidence found)
+  5,731 genes with expression_score > 0  (DB confirmed April 2026)
+  7,064 genes with expression_score = 0 (no functional evidence found)
 ```
 
 ---
 
 ## Interpretation Notes
 
-**Why do only 5,775/12,795 genes have expression evidence?**
+**Why do only 5,731/12,795 genes have expression evidence?**
 
 The 7,020 genes without expression scores either:
 1. Have no Open Targets cancer association (novel candidates not yet linked to cancer in the literature)

@@ -695,7 +695,12 @@ def _persist_results(
     nonzero = sum(1 for v in combined_scores.values() if v > 0)
 
     with get_session() as session:
-        session.execute(delete(ExpressionResult))
+        # Scoped delete — only remove rows for the current gene set so re-running
+        # a second phenotype doesn't destroy the first phenotype's expression data.
+        if gene_ids:
+            session.execute(
+                delete(ExpressionResult).where(ExpressionResult.gene_id.in_(gene_ids))
+            )
         if rows:
             session.add_all(rows)
 

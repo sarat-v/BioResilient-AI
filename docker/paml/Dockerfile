@@ -1,20 +1,23 @@
 ARG BASE_IMAGE=bioresilient/base:latest
 
-# Build stage: install PAML via bioconda (includes codeml, baseml, evolver, etc.)
-FROM --platform=linux/amd64 mambaorg/micromamba:1.5.8 AS paml-builder
+# PAML codeml image for step6 (branch-site model A positive selection).
+# HyPhy is retained as fallback for aBSREL proxy path only; FEL/BUSTED/RELAX
+# are no longer part of the pipeline.
+# 2026-04-17: rebuilt with df=1 LRT, NULL HyPhy fields, fix load_selection_scores.
+FROM --platform=linux/amd64 mambaorg/micromamba:1.5.8 AS tools
 
 USER root
 RUN micromamba install -y -n base \
         -c bioconda -c conda-forge \
         paml \
+        hyphy \
     && micromamba clean -afy
 
-# Final stage: copy codeml binary into the base image
 FROM ${BASE_IMAGE}
 
-COPY --from=paml-builder /opt/conda/bin/codeml  /usr/local/bin/codeml
-COPY --from=paml-builder /opt/conda/bin/baseml   /usr/local/bin/baseml
-COPY --from=paml-builder /opt/conda/bin/evolver  /usr/local/bin/evolver
+COPY --from=tools /opt/conda /opt/conda
 
-# Verify installation (scipy + ete3 already in base image)
-RUN codeml 2>&1 | head -3 || echo "codeml installed"
+ENV PATH="/opt/conda/bin:$PATH"
+
+RUN command -v codeml && command -v hyphy
+RUN hyphy --version 2>&1 | head -1

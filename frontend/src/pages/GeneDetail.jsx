@@ -23,9 +23,9 @@ function Tooltip2({ text, children }) {
   return (
     <span className="group relative inline-flex items-center gap-1">
       {children}
-      <Info className="w-3 h-3 text-text-muted/40 cursor-help" />
-      <span className="absolute z-20 bottom-full left-1/2 -translate-x-1/2 mb-2 px-2.5 py-1.5 bg-elevated
-                       border border-white/10 rounded-lg text-xs text-text-primary whitespace-nowrap
+      <Info className="w-3 h-3 text-ink-3/40 cursor-help" />
+      <span className="absolute z-20 bottom-full left-1/2 -translate-x-1/2 mb-2 px-2.5 py-1.5 bg-surface-2
+                       border border-border rounded-lg text-xs text-ink whitespace-nowrap
                        opacity-0 group-hover:opacity-100 pointer-events-none transition-opacity shadow-lg">
         {text}
       </span>
@@ -57,9 +57,9 @@ function ScoreRadar({ sub }) {
 function Section({ title, icon: Icon, children }) {
   return (
     <div className="card space-y-4">
-      <div className="flex items-center gap-2 pb-2 border-b border-white/5">
+      <div className="flex items-center gap-2 pb-2 border-b border-border">
         {Icon && <Icon className="w-4 h-4 text-accent" />}
-        <p className="font-semibold text-text-primary">{title}</p>
+        <p className="font-semibold text-ink">{title}</p>
       </div>
       {children}
     </div>
@@ -73,12 +73,12 @@ function MotifAlignment({ humanSeq, animalSeq }) {
   return (
     <div className="space-y-2">
       <div>
-        <p className="text-[10px] text-text-muted mb-0.5">Human</p>
+        <p className="text-[10px] text-ink-3 mb-0.5">Human</p>
         <div className="font-mono text-xs tracking-widest flex flex-wrap gap-0.5">
           {h.split('').map((ch, i) => (
             <span
               key={`h-${i}`}
-              className={ch !== a[i] && a[i] !== ' ' ? 'text-amber-400 bg-amber-500/20 rounded px-0.5' : 'text-text-primary'}
+              className={ch !== a[i] && a[i] !== ' ' ? 'text-amber-400 bg-amber-500/20 rounded px-0.5' : 'text-ink'}
             >
               {ch}
             </span>
@@ -91,7 +91,7 @@ function MotifAlignment({ humanSeq, animalSeq }) {
           {a.split('').map((ch, i) => (
             <span
               key={`a-${i}`}
-              className={ch !== h[i] && ch !== ' ' ? 'text-amber-400 bg-amber-500/20 rounded px-0.5' : 'text-text-muted'}
+              className={ch !== h[i] && ch !== ' ' ? 'text-amber-400 bg-amber-500/20 rounded px-0.5' : 'text-ink-3'}
             >
               {ch}
             </span>
@@ -104,10 +104,10 @@ function MotifAlignment({ humanSeq, animalSeq }) {
 
 function KV({ label, value, mono, tooltip }) {
   const val = value ?? '—'
-  const content = <span className={cn('text-sm text-text-primary', mono && 'font-mono text-accent')}>{val}</span>
+  const content = <span className={cn('text-sm text-ink', mono && 'font-mono text-accent')}>{val}</span>
   return (
     <div className="flex items-start justify-between gap-4 py-1.5 border-b border-white/3 last:border-0">
-      <p className="text-xs text-text-muted shrink-0">
+      <p className="text-xs text-ink-3 shrink-0">
         {tooltip ? <Tooltip2 text={tooltip}>{label}</Tooltip2> : label}
       </p>
       {content}
@@ -163,14 +163,14 @@ export default function GeneDetail() {
     <div className="px-8 py-8 space-y-6">
       {/* Header */}
       <div>
-        <Link to="/candidates" className="inline-flex items-center gap-1.5 text-xs text-text-muted hover:text-text-primary mb-4 group">
+        <Link to="/candidates" className="inline-flex items-center gap-1.5 text-xs text-ink-3 hover:text-ink mb-4 group">
           <ArrowLeft className="w-3.5 h-3.5 group-hover:-translate-x-0.5 transition-transform" /> All candidates
         </Link>
         <div className="flex items-start justify-between">
           <div className="flex items-center gap-4">
             <div>
               <h1 className="text-3xl font-bold font-mono text-accent">{gene.gene_symbol}</h1>
-              <p className="text-sm text-text-muted mt-0.5">{gene.human_protein
+              <p className="text-sm text-ink-3 mt-0.5">{gene.human_protein
                 ? <a href={`https://www.uniprot.org/uniprot/${gene.human_protein}`} target="_blank" rel="noreferrer"
                      className="hover:text-accent flex items-center gap-1">{gene.human_protein} <ExternalLink className="w-3 h-3" /></a>
                 : 'No UniProt accession'
@@ -179,25 +179,25 @@ export default function GeneDetail() {
             <TierBadge tier={gene.tier} />
           </div>
           <div className="text-right">
-            <p className="label-muted">Composite Score</p>
-            <p className="text-4xl font-bold text-text-primary">{(gene.composite_score * 100).toFixed(1)}</p>
+            <p className="label">Composite Score</p>
+            <p className="text-4xl font-bold text-ink">{(gene.composite_score * 100).toFixed(1)}</p>
           </div>
         </div>
       </div>
 
       {/* Research Summary */}
       <div className="card">
-          <div className="flex items-center gap-2 pb-2 border-b border-white/5">
+          <div className="flex items-center gap-2 pb-2 border-b border-border">
             <FileText className="w-4 h-4 text-accent" />
-            <p className="font-semibold text-text-primary">Research Summary</p>
+            <p className="font-semibold text-ink">Research Summary</p>
           </div>
           {narrativeLoading ? (
-            <div className="flex items-center gap-2 py-4 text-text-muted">
+            <div className="flex items-center gap-2 py-4 text-ink-3">
               <Loader2 className="w-4 h-4 animate-spin" />
               <span className="text-sm">Generating summary…</span>
             </div>
           ) : narrative ? (
-            <div className="prose prose-invert prose-sm max-w-none text-text-primary whitespace-pre-wrap pt-2">
+            <div className="prose prose-invert prose-sm max-w-none text-ink whitespace-pre-wrap pt-2">
               {narrative}
             </div>
           ) : (
@@ -214,12 +214,12 @@ export default function GeneDetail() {
       <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
         {/* Score radar */}
         <div className="card lg:col-span-1">
-          <p className="font-semibold text-text-primary mb-2">Score Breakdown</p>
+          <p className="font-semibold text-ink mb-2">Score Breakdown</p>
           <ScoreRadar sub={sub} />
           <div className="space-y-2 mt-2">
             {Object.entries(SCORE_META).map(([k, m]) => (
               <div key={k} className="flex items-center justify-between gap-2">
-                <p className="text-xs text-text-muted shrink-0 w-28">
+                <p className="text-xs text-ink-3 shrink-0 w-28">
                   <Tooltip2 text={m.tooltip}>{m.label}</Tooltip2>
                 </p>
                 <ScoreBar value={sub[k] ?? 0} className="flex-1" />
@@ -267,31 +267,31 @@ export default function GeneDetail() {
               <div className="overflow-x-auto">
                 <table className="w-full text-sm">
                   <thead>
-                    <tr className="border-b border-white/5">
-                      <th className="label-muted text-left py-2 pr-4">Species</th>
-                      <th className="label-muted text-left py-2 pr-4">Protein ID</th>
-                      <th className="label-muted text-left py-2 pr-4">Identity</th>
-                      <th className="label-muted text-left py-2">Divergent motifs</th>
+                    <tr className="border-b border-border">
+                      <th className="label text-left py-2 pr-4">Species</th>
+                      <th className="label text-left py-2 pr-4">Protein ID</th>
+                      <th className="label text-left py-2 pr-4">Identity</th>
+                      <th className="label text-left py-2">Divergent motifs</th>
                     </tr>
                   </thead>
                   <tbody>
                     {gene.orthologs.map(o => (
-                      <tr key={o.id} className="border-b border-white/3 hover:bg-elevated">
-                        <td className="py-2 pr-4 text-text-primary font-medium capitalize">
+                      <tr key={o.id} className="border-b border-white/3 hover:bg-surface-2">
+                        <td className="py-2 pr-4 text-ink font-medium capitalize">
                           {o.species_id?.replace(/_/g, ' ')}
                         </td>
-                        <td className="py-2 pr-4 font-mono text-xs text-text-muted">{o.protein_id ?? '—'}</td>
+                        <td className="py-2 pr-4 font-mono text-xs text-ink-3">{o.protein_id ?? '—'}</td>
                         <td className="py-2 pr-4">
                           {o.sequence_identity_pct != null ? (
                             <span className={cn('font-mono text-xs',
-                              o.sequence_identity_pct < 85 ? 'text-accent' : 'text-text-muted',
+                              o.sequence_identity_pct < 85 ? 'text-accent' : 'text-ink-3',
                             )}>
                               {o.sequence_identity_pct.toFixed(1)}%
                             </span>
                           ) : '—'}
                         </td>
                         <td className="py-2">
-                          <span className={cn('text-xs', o.motifs?.length ? 'text-warning' : 'text-text-muted/40')}>
+                          <span className={cn('text-xs', o.motifs?.length ? 'text-warning' : 'text-ink-3/40')}>
                             {o.motifs?.length ?? 0}
                           </span>
                         </td>
@@ -304,13 +304,13 @@ export default function GeneDetail() {
               {/* Motif details */}
               {gene.orthologs.some(o => o.motifs?.length) && (
                 <div className="mt-4 space-y-3">
-                  <p className="label-muted">Divergent Motifs</p>
+                  <p className="label">Divergent Motifs</p>
                   {gene.orthologs.flatMap(o =>
                     (o.motifs ?? []).map(m => (
-                      <div key={m.id} className="bg-base rounded-lg px-4 py-3 space-y-2 border border-white/5">
+                      <div key={m.id} className="bg-base rounded-lg px-4 py-3 space-y-2 border border-border">
                         <div className="flex items-center gap-3 flex-wrap">
-                          <span className="text-xs text-text-muted">Position {m.start_pos}–{m.end_pos}</span>
-                          <span className="text-xs text-text-muted capitalize">{o.species_id?.replace(/_/g, ' ')}</span>
+                          <span className="text-xs text-ink-3">Position {m.start_pos}–{m.end_pos}</span>
+                          <span className="text-xs text-ink-3 capitalize">{o.species_id?.replace(/_/g, ' ')}</span>
                           {m.in_functional_domain && (
                             <span className="px-1.5 py-0.5 rounded text-[10px] font-medium bg-emerald-500/15 text-emerald-400 border border-emerald-500/25"
                               title={`Pfam/InterPro domain: ${m.domain_name || 'domain'}`}>
@@ -331,7 +331,7 @@ export default function GeneDetail() {
                                   ? 'bg-red-500/15 text-red-400 border-red-500/25'
                                   : m.consequence_score >= 0.4
                                   ? 'bg-amber-500/15 text-amber-400 border-amber-500/25'
-                                  : 'bg-white/5 text-text-muted border-white/10',
+                                  : 'bg-canvas text-ink-3 border-border',
                               )}
                               title="AlphaMissense pathogenicity score for this divergence position"
                             >
@@ -344,7 +344,7 @@ export default function GeneDetail() {
                                 'px-1.5 py-0.5 rounded text-[10px] font-mono border',
                                 m.esm1v_score < -1.0
                                   ? 'bg-blue-500/15 text-blue-400 border-blue-500/25'
-                                  : 'bg-white/5 text-text-muted border-white/10',
+                                  : 'bg-canvas text-ink-3 border-border',
                               )}
                               title="ESM-1v log-likelihood ratio — negative values indicate unusual/adaptive substitution"
                             >
@@ -378,8 +378,8 @@ export default function GeneDetail() {
                           )}
                         </div>
                         <div>
-                          <p className="text-[10px] text-text-muted mb-1.5">Alignment (divergent positions in amber)</p>
-                          <div className="bg-elevated rounded px-3 py-2">
+                          <p className="text-[10px] text-ink-3 mb-1.5">Alignment (divergent positions in amber)</p>
+                          <div className="bg-surface-2 rounded px-3 py-2">
                             <MotifAlignment humanSeq={m.human_seq} animalSeq={m.animal_seq} />
                           </div>
                         </div>
@@ -472,7 +472,7 @@ export default function GeneDetail() {
                   tooltip="Large families increase off-target risk from cross-reactivity." />
                 {gene.safety.depmap_score != null && (
                   <KV label="DepMap essentiality" value={gene.safety.depmap_score.toFixed(3)} mono
-                    tooltip="DepMap CRISPR chronos score. More negative = more essential across cancer cell lines. <-0.5 = broadly essential." />
+                    tooltip="DepMap CRISPRGeneDependency probability (0–1). Higher = more essential across cancer cell lines. >0.7 = broadly essential (high safety risk)." />
                 )}
                 {gene.safety.gtex_tissue_count != null && (
                   <KV label="GTEx tissues expressed" value={gene.safety.gtex_tissue_count} mono
@@ -484,10 +484,10 @@ export default function GeneDetail() {
                 )}
                 {gene.safety.phewas_hits && Object.keys(gene.safety.phewas_hits).length > 0 && (
                   <div className="col-span-2 mt-2">
-                    <p className="text-xs text-text-muted mb-1">PheWAS associations</p>
+                    <p className="text-xs text-ink-3 mb-1">PheWAS associations</p>
                     <div className="flex flex-wrap gap-1.5">
                       {Object.entries(gene.safety.phewas_hits).slice(0, 10).map(([trait, pval]) => (
-                        <span key={trait} className="px-2 py-0.5 rounded text-[10px] bg-white/5 text-text-muted border border-white/8">
+                        <span key={trait} className="px-2 py-0.5 rounded text-[10px] bg-canvas text-ink-3 border border-border">
                           {trait}: {Number(pval).toExponential(1)}
                         </span>
                       ))}
@@ -500,25 +500,25 @@ export default function GeneDetail() {
 
           {gene.regulatory?.length > 0 && (
             <Section title="Regulatory Divergence (AlphaGenome)" icon={Layers}>
-              <p className="text-xs text-text-muted mb-3">Non-coding sequence changes near promoter regions predicted by AlphaGenome.</p>
+              <p className="text-xs text-ink-3 mb-3">Non-coding sequence changes near promoter regions predicted by AlphaGenome.</p>
               <div className="overflow-x-auto">
                 <table className="w-full text-sm">
                   <thead>
-                    <tr className="border-b border-white/5">
-                      <th className="label-muted text-left py-2 pr-4">Species</th>
-                      <th className="label-muted text-left py-2 pr-4">Promoter Divergence</th>
-                      <th className="label-muted text-left py-2 pr-4">Expression log2FC</th>
-                      <th className="label-muted text-left py-2 pr-4">Lineages</th>
-                      <th className="label-muted text-left py-2">Score</th>
+                    <tr className="border-b border-border">
+                      <th className="label text-left py-2 pr-4">Species</th>
+                      <th className="label text-left py-2 pr-4">Promoter Divergence</th>
+                      <th className="label text-left py-2 pr-4">Expression log2FC</th>
+                      <th className="label text-left py-2 pr-4">Lineages</th>
+                      <th className="label text-left py-2">Score</th>
                     </tr>
                   </thead>
                   <tbody>
                     {gene.regulatory.map((r, i) => (
-                      <tr key={i} className="border-b border-white/3 hover:bg-elevated">
-                        <td className="py-2 pr-4 text-text-primary capitalize">{r.species_id?.replace(/_/g, ' ')}</td>
-                        <td className="py-2 pr-4 font-mono text-xs text-text-muted">{formatFloat(r.promoter_divergence)}</td>
-                        <td className="py-2 pr-4 font-mono text-xs text-text-muted">{formatFloat(r.expression_log2fc)}</td>
-                        <td className="py-2 pr-4 font-mono text-xs text-text-muted">{r.lineage_count ?? '—'}</td>
+                      <tr key={i} className="border-b border-white/3 hover:bg-surface-2">
+                        <td className="py-2 pr-4 text-ink capitalize">{r.species_id?.replace(/_/g, ' ')}</td>
+                        <td className="py-2 pr-4 font-mono text-xs text-ink-3">{formatFloat(r.promoter_divergence)}</td>
+                        <td className="py-2 pr-4 font-mono text-xs text-ink-3">{formatFloat(r.expression_log2fc)}</td>
+                        <td className="py-2 pr-4 font-mono text-xs text-ink-3">{r.lineage_count ?? '—'}</td>
                         <td className="py-2 font-mono text-xs text-accent">{formatFloat(r.regulatory_score)}</td>
                       </tr>
                     ))}
@@ -531,7 +531,7 @@ export default function GeneDetail() {
           {/* DNA Conservation panel — populated by steps 3c / 3d */}
           {scores?.nucleotide_cds_conservation != null && (
             <Section title="DNA Conservation" icon={Dna}>
-              <p className="text-xs text-text-muted mb-3">
+              <p className="text-xs text-ink-3 mb-3">
                 Nucleotide-level conservation of coding and regulatory regions across species,
                 computed via minimap2 alignment and phyloP/PhastCons evolutionary scoring.
               </p>
@@ -575,7 +575,7 @@ export default function GeneDetail() {
               )}
               {(scores.cds_phylo_score != null || scores.promoter_phylo_score != null) && (
                 <div className="mt-3 space-y-1">
-                  <p className="text-xs text-text-muted font-medium mb-1">Phylogenetic conservation (phyloP/PhastCons)</p>
+                  <p className="text-xs text-ink-3 font-medium mb-1">Phylogenetic conservation (phyloP/PhastCons)</p>
                   {scores.cds_phylo_score != null && (
                     <KV
                       label="CDS phylo score"

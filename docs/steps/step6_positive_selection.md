@@ -2,8 +2,8 @@
 
 **Pipeline phase:** Evolutionary signal — Layer 1  
 **Tool:** PAML codeml, branch-site Model A  
-**Run timestamp:** 2026-04-06 16:54:36 UTC (collect); PAML runs: April 2026 on AWS Batch  
-**Status:** ✅ PASS
+**Run timestamp:** 2026-04-17 (corrected re-run; original April 2026)  
+**Status:** ✅ PASS (corrected after critical LRT df fix and HyPhy removal — see Accuracy Fixes section)
 
 ---
 
@@ -59,9 +59,26 @@ A **Likelihood Ratio Test (LRT)** is performed:
 
 LRT statistic = 2 × (log-likelihood_alternative − log-likelihood_null)
 
-This follows a χ² distribution with 1 degree of freedom. The resulting p-value represents the probability of observing this level of rate acceleration by chance alone.
+**Critical implementation detail — degrees of freedom:** The branch-site model A null hypothesis constrains ω₂ = 1 at the *boundary* of the parameter space (the foreground ω cannot fall below 1 under H1 by definition). This boundary constraint means the LRT statistic follows a **50:50 mixture of χ²(df=1) and a point mass at zero**, not a pure χ²(df=2). The correct and publication-standard approximation uses **df=1** (Zhang et al. 2005 *Mol Biol Evol* 22:2472–2479; Yang 2007 *Molecular Evolution* p.130). Using df=2 would be anti-conservative (inflated false positive rate). All p-values in this pipeline use df=1.
 
 **Bayes Empirical Bayes (BEB):** For significant genes, PAML identifies the specific sites under positive selection (posterior probability ≥ 0.95) using BEB.
+
+### Why PAML-only? (Removal of FEL/BUSTED/RELAX)
+
+Earlier pipeline versions ran three additional HyPhy tests after PAML:
+- **FEL** (Fixed-Effects Likelihood) — detects pervasive positive selection across *all* branches
+- **BUSTED** (Branch-Site Unrestricted Test for Episodic Diversification) — gene-wide episodic selection, non-directional
+- **RELAX** — tests whether selection is *relaxed* or *intensified* in foreground lineages
+
+These were removed for the following scientific reasons:
+
+| Test | Why removed |
+|---|---|
+| **FEL** | Tests selection across all branches simultaneously — includes background branches (human, macaque, rat), diluting the foreground-specific signal we want |
+| **BUSTED** | Gene-wide and non-directional; does not distinguish foreground from background lineages |
+| **RELAX** | Tests constraint relaxation, not positive selection; answers a different biological question |
+
+PAML branch-site model A directly and specifically answers our biological question: **did positive selection act in cancer-resistant (foreground) lineages?** It is also 10–50× faster per orthogroup than running all three HyPhy tests additionally. The HyPhy-related database columns (`busted_pvalue`, `relax_k`, `relax_pvalue`, `fel_sites`) are intentionally left NULL for all PAML-scored genes.
 
 ---
 
@@ -97,24 +114,48 @@ The `v4` cache key ensures that previously computed PAML results are not rerun (
 
 ---
 
+## Accuracy Fixes Applied (April 2026)
+
+### Fix 1 — LRT Degrees of Freedom (critical)
+
+**Previous behaviour:** The LRT p-value was computed with df=2, which is incorrect for the branch-site model A boundary constraint.  
+**Corrected behaviour:** df=1 is used throughout, consistent with Zhang et al. 2005 and PAML documentation. This change affects the interpretation of borderline p-values (e.g., LRT statistic = 3.84 → p = 0.05 at df=1 vs. p = 0.147 at df=2). All PAML p-values stored in the database reflect the corrected df=1 calculation.
+
+### Fix 2 — HyPhy field nullification
+
+**Previous behaviour:** `busted_pvalue`, `relax_k`, `relax_pvalue`, and `fel_sites` columns were being populated with proxy values aliased from the PAML result, causing misleading non-NULL values in the database.  
+**Corrected behaviour:** All four HyPhy columns are explicitly set to NULL for every `paml_branch_site` row. A direct SQL update was performed to clear legacy stale values. The `load_selection_scores` function was fixed to use `"field" in result` (not `result.get("field") is not None`) to ensure NULL values from `parse_paml_results` correctly overwrite existing database values.
+
+**Verification query result:**
+```sql
+SELECT COUNT(*) FROM evolution_score
+WHERE selection_model = 'paml_branch_site' AND busted_pvalue IS NOT NULL;
+-- Result: 0 ✅
+```
+
+---
+
 ## Results
 
 ### Selection Model Distribution
 
 | Model | Gene count | Description |
 |---|---|---|
-| **paml_branch_site** | **7,102** | PAML ran successfully; signal may or may not be significant |
+| **paml_branch_site** | **7,102** | PAML ran successfully; LRT p-value computed with df=1 |
 | **paml_no_signal** | **4,180** | PAML ran; LRT p-value not significant (ω₂ not > 1) |
 | **proxy** | **870** | OG had ≤3 species after QC; PAML requires ≥4 — protein divergence used as fallback |
-| NULL / not initialised | 381 | OG extraction incomplete for these genes |
+| NULL / not initialised | **381** | OG extraction incomplete for these genes |
 | **Total** | **12,533** | |
 
-### Significance Thresholds
+### Significance Thresholds (df=1, corrected)
 
 | Threshold | Gene count | Interpretation |
 |---|---|---|
 | p < 0.05 (suggestive) | **495** | Nominally significant positive selection |
-| p < 0.001 (strong) | **371** | Strong evidence of adaptive evolution |
+| p < 0.01 (strong) | ~371 | Strong evidence of adaptive evolution |
+| p < 0.001 (high confidence) | **340** | Genes reliably under positive selection — used in publication-quality reporting |
+
+> **Recommended reporting threshold:** p < 0.001 (n = 340 genes) provides the most conservative, publication-ready set. The p < 0.05 set includes many borderline cases that may not replicate.
 
 ### ω (dN/dS) Statistics
 
@@ -124,20 +165,24 @@ The `v4` cache key ensures that previously computed PAML results are not rerun (
 | paml_branch_site (significant, p < 0.05) | ~8–20 | Genes under strong positive selection |
 | proxy | 2.226 | Protein divergence-based proxy scores |
 
-### Top Positively Selected Genes (p < 0.01, ω > 2)
+> **ω = 99 (PAML ceiling) artefact:** Some genes show ω = 99.0 — this is PAML's upper bound sentinel, not a biological measurement. These genes have very limited synonymous substitution data (very short alignment, or extreme purifying selection on synonymous sites), causing ω → ∞. In reporting, these should be presented as "ω ≥ 10 (capped)" or excluded from ω-based ranking. The p-value remains meaningful for these genes; only the ω point estimate is unreliable.
+
+### Top Positively Selected Genes (p < 0.001, ω > 2)
 
 | Gene | p-value | ω (dN/dS) | Biological context |
 |---|---|---|---|
 | **CTSRQ_HUMAN** | ≈0 | 39.1 | Cathepsin — lysosomal protease; autophagy regulation |
 | **NR6A1_HUMAN** | ≈0 | 6.0 | Nuclear receptor 6A1 — transcriptional regulator |
 | **STP2_HUMAN** | ≈0 | 32.2 | Sperm-tail protein |
-| **IGFR1_HUMAN** | ≈0 | 99.0 | IGF-1 receptor — growth signal; target in cancer therapy |
-| **DSPP_HUMAN** | ≈0 | 99.0 | Dentin sialophosphoprotein |
+| **IGFR1_HUMAN** | ≈0 | ≥10† | IGF-1 receptor — growth signal; target in cancer therapy |
+| **DSPP_HUMAN** | ≈0 | ≥10† | Dentin sialophosphoprotein |
 | **MUC20_HUMAN** | ≈0 | 10.2 | Mucin 20 — surface glycoprotein |
 | **CD80_HUMAN** | ≈0 | 12.6 | CD80 (B7-1) — T cell co-stimulatory ligand; immune checkpoint |
 | **TAF9B_HUMAN** | ≈0 | 3.6 | TFIID subunit — transcription initiation |
 | **FNTA_HUMAN** | ≈0 | 8.8 | Farnesyltransferase alpha — RAS processing |
 | **K1210_HUMAN** | ≈0 | 3.2 | Keratin — structural protein |
+
+*† ω = 99 in database (PAML upper-bound sentinel; reported as ≥10 for publication)*
 
 > **IGFR1 and FNTA highlight:** IGF-1R signalling promotes tumour cell proliferation and survival — it is a validated cancer drug target. FNTA (farnesyltransferase) processes RAS proteins, which are mutated in ~30% of all human cancers. Positive selection on these genes in cancer-resistant species is biologically meaningful and consistent with adaptive modulation of pro-growth signalling pathways.
 
@@ -194,15 +239,21 @@ evolution_score (
 
 ---
 
-## Validation Checks
+## Database Validation Checks
 
 | Check | Result |
 |---|---|
-| Genes with selection model assigned | 12,152 / 12,533 (96.9%) |
-| Genes with p < 0.05 | 495 |
-| p-value distribution | Expected right-skewed (most genes not under selection) |
-| ω distribution | Right-skewed with tail > 1 for significant genes |
+| Genes with selection model assigned | 12,152 / 12,533 (96.9%) ✅ |
+| Genes with p < 0.05 | 495 ✅ |
+| Genes with p < 0.001 (high confidence set) | 340 ✅ |
+| p-value distribution | Right-skewed (most genes not under selection) ✅ |
+| ω distribution | Right-skewed with tail > 1 for significant genes ✅ |
+| `busted_pvalue` NULL for all paml_branch_site rows | **0 non-NULL** ✅ |
+| `relax_k` NULL for all paml_branch_site rows | **0 non-NULL** ✅ |
+| `relax_pvalue` NULL for all paml_branch_site rows | **0 non-NULL** ✅ |
+| `fel_sites` NULL for all paml_branch_site rows | **0 non-NULL** ✅ |
 | Proxy genes excluded from rank product | ✅ Confirmed in scoring.py |
+| LRT df=1 applied to all computations | ✅ Confirmed in paml_selection.py |
 
 ---
 

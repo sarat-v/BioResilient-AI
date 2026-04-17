@@ -50,6 +50,21 @@ Requirements:
 
 Reference: Meier et al., 2021 "Language models enable zero-shot prediction
 of the effects of mutations on protein function" NeurIPS 2021.
+
+Publication semantics (divergent_motif.esm1v_score)
+----------------------------------------------------
+  * NULL  = no LLR was produced (ESM unavailable, unscorable motif, out of model
+            window, or identical residues). Do **not** treat NULL as “neutral”;
+            it means “no ESM evidence for this motif.”
+  * Any finite number (including 0.0) = model returned a mean LLR for the
+            scored substitutions. Near-zero means “model sees the change as
+            roughly neutral in human protein context,” not “missing data.”
+
+Historical note: older pipeline builds occasionally wrote 0.0 where scoring
+did not really complete. For strict publication claims, restrict ESM-based
+statements to motifs with non-NULL scores produced under the current code, or
+footnote that a small fraction of legacy 0.0 rows may be ambiguous until a
+planned refresh.
 """
 
 import logging
@@ -226,8 +241,8 @@ def annotate_esm1v_scores(
         from the single cached log-probability tensor.
       - Results are written back to DB in a single bulk UPDATE per batch.
 
-    Resume-safe: genes where ALL motifs already have esm1v_score set are
-    skipped automatically. Use force_rerun=True to override.
+    Resume-safe: genes where every motif has a non-NULL esm1v_score are skipped.
+    Use force_rerun=True to re-score from scratch.
 
     Returns number of motifs scored.
     """
@@ -244,22 +259,24 @@ def annotate_esm1v_scores(
         if gene_ids is None:
             gene_ids = [g.id for g in session.query(Gene).all()]
 
-        # Resume: find genes where every motif already has an esm1v_score.
-        # We skip those entirely — if even one motif is unscored the gene is included.
-        # Single aggregation query replaces a per-gene loop (2×N queries → 1 query).
+        # Resume: skip genes where every motif already has a stored score.
+        # Non-NULL = scored under this convention (including 0.0 = neutral LLR).
+        # NULL = not scored — only those motifs are selected below.
         if not force_rerun:
             from sqlalchemy import text as _text
             rows = session.execute(_text("""
                 SELECT o.gene_id::text,
                        COUNT(dm.id)          AS total,
-                       COUNT(dm.esm1v_score) AS scored
+                       COUNT(dm.esm1v_score) AS scored_non_null
                 FROM   divergent_motif dm
                 JOIN   ortholog o ON o.id = dm.ortholog_id
                 WHERE  o.gene_id = ANY(:gids)
                 GROUP  BY o.gene_id
             """), {"gids": list(gene_ids)}).fetchall()
 
-            already_done: set[str] = {r[0] for r in rows if r[1] > 0 and r[1] == r[2]}
+            already_done: set[str] = {
+                r[0] for r in rows if (r[1] or 0) > 0 and (r[1] or 0) == (r[2] or 0)
+            }
 
             if already_done:
                 gene_ids = [gid for gid in gene_ids if gid not in already_done]
@@ -282,13 +299,15 @@ def annotate_esm1v_scores(
             if not human_seq:
                 continue
 
-            # Only fetch motifs that still need scoring for this run.
-            # Motifs already scored (including sentinel 0.0) are skipped by
-            # filtering esm1v_score IS NULL — avoids loading millions of rows.
+            # Only motifs without a stored score (NULL). Any numeric value —
+            # including 0.0 — is treated as a completed score for resume purposes.
             motifs = (
                 session.query(DivergentMotif)
                 .join(Ortholog, DivergentMotif.ortholog_id == Ortholog.id)
-                .filter(Ortholog.gene_id == gid, DivergentMotif.esm1v_score.is_(None))
+                .filter(
+                    Ortholog.gene_id == gid,
+                    DivergentMotif.esm1v_score.is_(None),
+                )
                 .all()
             )
             if motifs:
@@ -297,12 +316,12 @@ def annotate_esm1v_scores(
     log.info("Computing ESM-1v scores for %d genes (1 GPU pass per protein)...", len(gene_data))
     scored = 0
     total = len(gene_data)
-    pending_updates: list[tuple[str, float]] = []
+    pending_updates: list[tuple[str, Optional[float]]] = []
     BATCH_SIZE = 200
 
     from sqlalchemy import text
 
-    def _flush_updates(batch: list[tuple[str, float]], max_retries: int = 5) -> int:
+    def _flush_updates(batch: list[tuple[str, Optional[float]]], max_retries: int = 5) -> int:
         if not batch:
             return 0
         import time as _time
@@ -338,9 +357,7 @@ def annotate_esm1v_scores(
             continue
 
         for motif in motifs:
-            if motif.esm1v_score is not None:
-                continue  # already scored in a previous run
-
+            # Motifs are loaded with esm1v_score IS NULL only.
             h_seq_stripped = motif.human_seq or ""
 
             # ── Find the true raw-protein position ──────────────────────────
@@ -371,8 +388,9 @@ def annotate_esm1v_scores(
             if not substitutions:
                 # Motif has no scorable substitutions (identical sequences,
                 # motif not found in protein, or all positions beyond ESM window).
-                # Write sentinel 0.0 so the scatter stops re-including this gene.
-                pending_updates.append((motif.id, 0.0))
+                # Write NULL so downstream code can distinguish "no data" from
+                # a genuine neutral substitution (score ≈ 0.0).
+                pending_updates.append((motif.id, None))
                 continue
 
             llr = _score_substitutions_from_logprobs(
@@ -392,7 +410,9 @@ def annotate_esm1v_scores(
                         "(max_pos=%d, esm_chunk_size likely too small — set to 1022).",
                         motif.id, len(beyond), len(substitutions), max_pos,
                     )
-                pending_updates.append((motif.id, 0.0))
+                # All substitution positions fall beyond ESM window — write NULL, not 0.0,
+                # to distinguish from genuinely neutral substitutions.
+                pending_updates.append((motif.id, None))
 
         if len(pending_updates) >= BATCH_SIZE:
             scored += _flush_updates(pending_updates)

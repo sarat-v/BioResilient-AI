@@ -12,8 +12,15 @@ Algorithm:
   For each pathway P:
     observed = set of candidate genes mapped to P
     background = total genes in P (Reactome API)
-    pathway_score = hypergeometric(observed, background, n_candidates, n_genes)
-                  + evolutionary_weight (sum of convergence_scores for observed genes)
+    log_pvalue   = log10 hypergeometric right-tail p-value
+    adjusted_pvalue = Benjamini-Hochberg FDR correction across all tested pathways
+                      (Benjamini & Hochberg 1995, J Royal Stat Soc B 57:289-300)
+    pathway_score = combined ranking: -log_pvalue * 0.5 + evo_weight * 0.5
+
+Note on multiple-testing: the number of pathways tested is small (O(10-100)
+for Tier1/Tier2 candidates), so the BH correction has moderate impact.
+Pathways with adjusted_pvalue < 0.05 should be treated as statistically enriched.
+Pathways with adjusted_pvalue < 0.20 are reportable as trends.
 
 Stores results in PathwayConvergence table (gene_id FK removed; pathway-level).
 Exposed via GET /research/pathway-convergence.
@@ -27,6 +34,7 @@ from typing import Optional
 import requests
 
 from db.session import get_session
+from pipeline.stats import apply_bh_correction
 
 log = logging.getLogger(__name__)
 
@@ -105,6 +113,24 @@ def _fetch_reactome_pathway_gene_count(pathway_id: str, timeout: int = 10) -> in
     return 50   # conservative fallback
 
 
+def _fetch_reactome_pathway_name(pathway_id: str, timeout: int = 10) -> str:
+    """Return the human-readable displayName for a Reactome pathway ID."""
+    url = f"https://reactome.org/ContentService/data/query/{pathway_id}"
+    try:
+        r = requests.get(url, timeout=timeout)
+        if r.status_code == 200:
+            data = r.json()
+            # ContentService returns either an object or a list
+            if isinstance(data, list) and data:
+                data = data[0]
+            name = data.get("displayName") or data.get("name") or ""
+            if name:
+                return name
+    except Exception:
+        pass
+    return pathway_id   # fallback to raw ID
+
+
 # ---------------------------------------------------------------------------
 # Core computation
 # ---------------------------------------------------------------------------
@@ -115,62 +141,63 @@ def compute_pathway_convergence(
 ) -> list[dict]:
     """Compute enrichment of convergent candidates in biological pathways.
 
+    Scoped to Tier1/Tier2 candidates only (typically 40-60 genes).
+    Uses pre-stored pathway_ids from the Gene table (populated by step 11)
+    to avoid O(N) Reactome API calls per gene.
+
     Args:
         min_genes: Minimum candidate genes in a pathway to report it.
         total_background_genes: Approximate human protein-coding gene count.
 
     Returns:
-        List of pathway dicts sorted by enrichment score descending:
-        [{"pathway_id", "pathway_name", "gene_count", "candidate_count",
-          "log_pvalue", "evolutionary_weight", "pathway_score", "gene_symbols"}, ...]
+        List of pathway dicts sorted by enrichment score descending.
     """
     from db.models import CandidateScore, Gene
 
     with get_session() as session:
-        # Fetch all scored candidates
+        # Scope to Tier1/Tier2 only — avoids processing all 12k scored genes
         rows = (
             session.query(CandidateScore, Gene)
             .join(Gene, CandidateScore.gene_id == Gene.id)
-            .filter(CandidateScore.composite_score > 0)
+            .filter(CandidateScore.tier.in_(["Tier1", "Tier2"]))
             .all()
         )
         if not rows:
-            log.info("No candidate scores found; pathway convergence skipped.")
+            log.info("No Tier1/Tier2 candidates found; pathway convergence skipped.")
             return []
 
         n_candidates = len(rows)
-        log.info("Computing pathway convergence over %d candidates...", n_candidates)
+        log.info("Computing pathway convergence over %d Tier1/Tier2 candidates...", n_candidates)
 
-        # Build gene → pathways map (using stored pathway_ids on Gene)
-        # Also use Reactome API for genes with human_gene_id
+        # Build gene → pathways map using pre-stored pathway_ids only.
+        # The live Reactome gene lookup is skipped here because:
+        #  (a) pathway_ids are already populated by step 11 (UniProt/Reactome),
+        #  (b) gene.human_gene_id uses OMA format (human|AKT1_HUMAN) which Reactome
+        #      API doesn't accept directly.
         pathway_genes: dict[str, list[tuple[str, str, float]]] = defaultdict(list)
         pathway_names: dict[str, str] = {}
 
         for cs, gene in rows:
             conv_score = cs.convergence_score or 0.0
 
-            # Use pre-stored pathway IDs (from step 11 Reactome annotation)
-            pathway_ids_str = getattr(gene, "pathway_ids", None)
-            if pathway_ids_str:
-                pathway_id_list = pathway_ids_str if isinstance(pathway_ids_str, list) else [pathway_ids_str]
-                for pid in pathway_id_list:
-                    pathway_genes[pid].append((gene.id, gene.gene_symbol or gene.id, conv_score))
+            pathway_ids_raw = getattr(gene, "pathway_ids", None)
+            if not pathway_ids_raw:
+                continue
+            pid_list = pathway_ids_raw if isinstance(pathway_ids_raw, list) else [pathway_ids_raw]
+            clean_symbol = gene.gene_symbol or gene.id
+            # Strip _HUMAN suffix for display
+            if clean_symbol.endswith("_HUMAN"):
+                clean_symbol = clean_symbol[:-6]
+            for pid in pid_list:
+                if pid:
+                    pathway_genes[pid].append((gene.id, clean_symbol, conv_score))
 
-            # Supplement with live Reactome lookup
-            if gene.human_gene_id:
-                pathways = _fetch_reactome_pathways_for_gene(gene.human_gene_id)
-                for p in pathways[:10]:  # cap to avoid overwhelming memory
-                    pid = p.get("stId") or p.get("dbId", "")
-                    pname = p.get("displayName", pid)
-                    if pid:
-                        pathway_genes[pid].append((gene.id, gene.gene_symbol or gene.id, conv_score))
-                        pathway_names[pid] = pname
-
-    # Score each pathway
+    # Score each pathway with in-memory cache for Reactome gene-count lookups
+    _gene_count_cache: dict[str, int] = {}
     results = []
     for pid, gene_entries in pathway_genes.items():
-        # Deduplicate
-        seen = {}
+        # Deduplicate by gene_id, keeping highest convergence score
+        seen: dict[str, tuple[str, float]] = {}
         for gid, gsym, cscore in gene_entries:
             if gid not in seen or cscore > seen[gid][1]:
                 seen[gid] = (gsym, cscore)
@@ -180,7 +207,14 @@ def compute_pathway_convergence(
         if k < min_genes:
             continue
 
-        K = _fetch_reactome_pathway_gene_count(pid)
+        if pid not in _gene_count_cache:
+            import time as _time
+            _time.sleep(0.05)  # gentle rate limit (~20 req/s)
+            _gene_count_cache[pid] = _fetch_reactome_pathway_gene_count(pid)
+            # Populate human-readable name on first encounter
+            if pid not in pathway_names:
+                pathway_names[pid] = _fetch_reactome_pathway_name(pid)
+        K = _gene_count_cache[pid]
         log_p = _log_hypergeometric(k, K, n_candidates, total_background_genes)
         evo_weight = sum(c for _, (_, c) in unique_genes)
         pathway_score = round(-log_p * 0.5 + evo_weight * 0.5, 4)
@@ -191,10 +225,25 @@ def compute_pathway_convergence(
             "gene_count": K,
             "candidate_count": k,
             "log_pvalue": round(log_p, 4),
+            "adjusted_pvalue": None,   # filled in by BH step below
             "evolutionary_weight": round(evo_weight, 4),
             "pathway_score": pathway_score,
             "gene_symbols": sorted({gsym for _, (gsym, _) in unique_genes}),
         })
+
+    # Benjamini-Hochberg FDR correction across all tested pathways.
+    # Convert log10 p-values back to linear scale for BH; clamp to [0, 1].
+    # BH reference: Benjamini & Hochberg (1995) J Royal Stat Soc B 57:289-300.
+    if results:
+        raw_pvalues = [
+            min(1.0, max(0.0, 10 ** r["log_pvalue"])) for r in results
+        ]
+        adjusted = apply_bh_correction(raw_pvalues)
+        for r, adj in zip(results, adjusted):
+            r["adjusted_pvalue"] = round(adj, 6) if adj is not None else None
+
+        n_sig = sum(1 for r in results if r["adjusted_pvalue"] is not None and r["adjusted_pvalue"] < 0.05)
+        log.info("  Pathway BH-FDR: %d / %d pathways at adjusted p < 0.05.", n_sig, len(results))
 
     results.sort(key=lambda x: x["pathway_score"], reverse=True)
     log.info("Pathway convergence: %d pathways scored (≥%d candidates).", len(results), min_genes)
@@ -218,6 +267,7 @@ def persist_pathway_convergence(results: list[dict]) -> int:
                 gene_count=r["gene_count"],
                 candidate_count=r["candidate_count"],
                 log_pvalue=r["log_pvalue"],
+                adjusted_pvalue=r.get("adjusted_pvalue"),
                 evolutionary_weight=r["evolutionary_weight"],
                 pathway_score=r["pathway_score"],
                 gene_symbols=r["gene_symbols"],

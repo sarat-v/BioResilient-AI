@@ -80,9 +80,23 @@ _GNOMAD_GENE_QUERY = """
 """
 
 # Classification thresholds — named constants so they can be found and changed together.
-_AM_PATHOGENIC_THRESHOLD = 0.6     # AlphaMissense: scores above this indicate high pathogenicity in human
-_ESM_DESTAB_THRESHOLD = -2.0       # ESM-1v LLR: scores below this indicate protein destabilisation
-_LOEUF_INTOLERANT_THRESHOLD = 0.5  # gnomAD LOEUF: scores at or below this indicate LoF intolerance
+
+# AlphaMissense pathogenicity (Cheng et al. 2023 Science 381:eadg7492).
+# 0.6 is slightly above the "likely pathogenic" cut-off (0.564) — conservative.
+_AM_PATHOGENIC_THRESHOLD = 0.6
+
+# ESM-1v log-likelihood ratio (Meier et al. 2021 Science 374:eabc7288).
+# -2.0 corresponds to roughly 2 standard deviations below neutral on the
+# empirical LLR distribution from the ESM-1v paper's variant effect benchmark.
+# Note: ESM-1v was trained on human sequences; cross-species application is
+# an approximation — all direction labels are experimental hypotheses only.
+_ESM_DESTAB_THRESHOLD = -2.0
+
+# gnomAD v4.1 LOEUF (loss-of-function observed/expected upper bound fraction).
+# 0.35 is the published gnomAD threshold for high LoF intolerance
+# (Karczewski et al. 2020 Nature 581:434-443, Extended Data Fig. 3).
+# The previous value of 0.5 was too permissive and over-called LoF-intolerant genes.
+_LOEUF_INTOLERANT_THRESHOLD = 0.35
 
 # ---------------------------------------------------------------------------
 # gnomAD constraint TSV — download once, parse into memory, cache to disk
@@ -440,6 +454,52 @@ def _get_direction_distribution(conn) -> dict[str, int]:
 # Pipeline entry point
 # ---------------------------------------------------------------------------
 
+def _load_loeuf_from_db(gene_ids: Optional[list[str]] = None) -> dict[str, Optional[float]]:
+    """Load LOEUF values from gene.loeuf (populated by the backfill script).
+
+    Falls back to _fetch_loeuf_bulk() when the gene table has no LOEUF data yet
+    (i.e. migration 0030 applied but backfill not run). This ensures step4d
+    remains runnable in both old and new environments.
+
+    Returns:
+        {gene_symbol: loeuf_value}  — missing symbols map to None (= unknown).
+    """
+    conn = psycopg2.connect(get_db_url())
+    try:
+        with conn.cursor() as cur:
+            if gene_ids:
+                cur.execute(
+                    "SELECT gene_symbol, loeuf FROM gene WHERE id = ANY(%s) AND gene_symbol IS NOT NULL",
+                    (gene_ids,),
+                )
+            else:
+                cur.execute("SELECT gene_symbol, loeuf FROM gene WHERE gene_symbol IS NOT NULL")
+            rows = cur.fetchall()
+    finally:
+        conn.close()
+
+    loeuf_map: dict[str, Optional[float]] = {row[0]: row[1] for row in rows}
+    populated = sum(1 for v in loeuf_map.values() if v is not None)
+    log.info(
+        "Step 4d: loaded LOEUF from gene table — %d / %d symbols have values.",
+        populated,
+        len(loeuf_map),
+    )
+
+    if populated == 0:
+        # gene.loeuf column exists but backfill hasn't run yet — fall back to
+        # network fetch so step4d still produces correct results.
+        log.warning(
+            "gene.loeuf column is all NULL — backfill not yet run. "
+            "Falling back to gnomAD TSV/API fetch (slower, requires network). "
+            "Run scripts/backfill_loeuf.py once to populate gene.loeuf and avoid this."
+        )
+        needed_symbols: set[str] = {row[0] for row in rows if row[0]}
+        loeuf_map = _fetch_loeuf_bulk(needed_symbols)
+
+    return loeuf_map
+
+
 def annotate_variant_directions(gene_ids: Optional[list[str]] = None) -> int:
     """Classify each DivergentMotif and store motif_direction.
 
@@ -453,27 +513,13 @@ def annotate_variant_directions(gene_ids: Optional[list[str]] = None) -> int:
         Number of motifs annotated.
     """
     # ------------------------------------------------------------------
-    # 1. Determine which gene symbols we need LOEUF for.
-    #    Use a direct psycopg2 query on the gene table only — avoids a
-    #    slow 3-way ORM join across divergent_motif (1.69M rows) that
-    #    hits statement_timeout when 25 chunks query concurrently.
+    # 1. Load LOEUF from the gene table (populated by backfill_loeuf.py).
+    #    Previously this fetched from gnomAD at runtime into /tmp on a
+    #    throwaway Batch container, which silently failed and left
+    #    loeuf_map empty — causing loss_of_function = 0 for all genes.
     # ------------------------------------------------------------------
-    conn_sym = psycopg2.connect(get_db_url())
-    try:
-        with conn_sym.cursor() as cur:
-            if gene_ids:
-                cur.execute(
-                    "SELECT DISTINCT gene_symbol FROM gene WHERE id = ANY(%s) AND gene_symbol IS NOT NULL",
-                    (gene_ids,),
-                )
-            else:
-                cur.execute("SELECT DISTINCT gene_symbol FROM gene WHERE gene_symbol IS NOT NULL")
-            gene_symbols_needed: set[str] = {row[0] for row in cur.fetchall()}
-    finally:
-        conn_sym.close()
-
-    log.info("Step 4d: fetching LOEUF for %d gene symbols...", len(gene_symbols_needed))
-    loeuf_map: dict[str, Optional[float]] = _fetch_loeuf_bulk(gene_symbols_needed)
+    log.info("Step 4d: reading LOEUF from gene table...")
+    loeuf_map: dict[str, Optional[float]] = _load_loeuf_from_db(gene_ids)
 
     # ------------------------------------------------------------------
     # 2. Run fast SQL-based bulk classification.

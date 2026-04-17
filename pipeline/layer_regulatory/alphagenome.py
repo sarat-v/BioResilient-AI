@@ -29,7 +29,7 @@ from typing import Optional
 import numpy as np
 import requests
 
-from db.models import EvolutionScore, Gene, RegulatoryDivergence, Species
+from db.models import CandidateScore, EvolutionScore, Gene, RegulatoryDivergence, Species
 from db.session import get_session
 from pipeline.config import get_ncbi_api_key, get_ncbi_email
 
@@ -98,6 +98,24 @@ def _get_api_key() -> str:
 
 
 # ---------------------------------------------------------------------------
+# Symbol helpers
+# ---------------------------------------------------------------------------
+
+_SPECIES_SUFFIXES = ("_HUMAN", "_MOUSE", "_RAT", "_DOG", "_CAT", "_WHALE", "_BAT", "_SHARK")
+
+
+def _hgnc_symbol(full_symbol: str) -> str:
+    """Strip UniProt species suffix to get clean HGNC gene symbol.
+
+    E.g. 'AKT1_HUMAN' → 'AKT1', 'AKT1' → 'AKT1'
+    """
+    for suffix in _SPECIES_SUFFIXES:
+        if full_symbol.upper().endswith(suffix):
+            return full_symbol[: -len(suffix)]
+    return full_symbol
+
+
+# ---------------------------------------------------------------------------
 # NCBI helpers
 # ---------------------------------------------------------------------------
 
@@ -109,14 +127,18 @@ def _ncbi_base_params() -> dict:
 
 
 def _get_ncbi_gene_id(gene_symbol: str, taxid: int = 9606) -> Optional[str]:
-    """Return NCBI Gene ID for a gene symbol + taxonomy ID."""
+    """Return NCBI Gene ID for a gene symbol + taxonomy ID.
+
+    Accepts both clean symbols (AKT1) and UniProt entries (AKT1_HUMAN).
+    """
+    clean_symbol = _hgnc_symbol(gene_symbol)
     try:
         r = requests.get(
             NCBI_ESEARCH,
             params={
                 **_ncbi_base_params(),
                 "db": "gene",
-                "term": f"{gene_symbol}[Gene Name] AND {taxid}[Taxonomy ID]",
+                "term": f"{clean_symbol}[Gene Name] AND {taxid}[Taxonomy ID]",
                 "retmax": 1,
                 "retmode": "json",
             },
@@ -127,7 +149,7 @@ def _get_ncbi_gene_id(gene_symbol: str, taxid: int = 9606) -> Optional[str]:
         ids = r.json().get("esearchresult", {}).get("idlist", [])
         return ids[0] if ids else None
     except Exception as exc:
-        log.debug("NCBI esearch %s (taxid=%d): %s", gene_symbol, taxid, exc)
+        log.debug("NCBI esearch %s (taxid=%d): %s", clean_symbol, taxid, exc)
         return None
 
 
@@ -319,11 +341,11 @@ def run_alphagenome_track() -> int:
     dna_model = _dna_client.create(api_key)
 
     with get_session() as session:
-        # Only process Tier1 + Tier2 genes — not 818 expression candidates
+        # Only process Tier1 + Tier2 genes — tier lives on CandidateScore, not EvolutionScore
         tier_gene_ids = {
             r.gene_id
-            for r in session.query(EvolutionScore.gene_id)
-            .filter(EvolutionScore.tier.in_(["Tier1", "Tier2"]))
+            for r in session.query(CandidateScore.gene_id)
+            .filter(CandidateScore.tier.in_(["Tier1", "Tier2"]))
             .all()
         }
         all_species = session.query(Species).filter(Species.id != "human").all()
@@ -401,6 +423,7 @@ def run_alphagenome_track() -> int:
             gene_score = _gene_regulatory_score(gid, session)
             for row in session.query(RegulatoryDivergence).filter_by(gene_id=gid).all():
                 row.lineage_count = lc
+                row.regulatory_score = gene_score  # persist per-gene aggregate score
         log.debug("Lineage count pass complete for %d genes.", len(gene_ids_done))
 
     log.info("AlphaGenome Track B complete: %d regulatory divergence rows written.", written)

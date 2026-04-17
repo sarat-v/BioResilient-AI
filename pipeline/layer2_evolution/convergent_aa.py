@@ -320,6 +320,33 @@ def annotate_convergent_aa(gene_ids: Optional[list[str]] = None) -> int:
         if gene_ids is None:
             gene_ids = [g.id for g in session.query(Gene).all()]
 
+        # Resume / skip logic: find genes that already have convergent_aa_count set
+        # (i.e. all their motifs have been scored). Skip them on re-runs.
+        from sqlalchemy import text as _text
+        already_done_result = session.execute(
+            _text("""
+                SELECT DISTINCT o.gene_id
+                FROM divergent_motif dm
+                JOIN ortholog o ON o.id = dm.ortholog_id
+                WHERE o.gene_id = ANY(:gene_ids)
+                  AND dm.convergent_aa_count IS NOT NULL
+                GROUP BY o.gene_id
+                HAVING COUNT(*) = (
+                    SELECT COUNT(*) FROM divergent_motif dm2
+                    JOIN ortholog o2 ON o2.id = dm2.ortholog_id
+                    WHERE o2.gene_id = o.gene_id
+                )
+            """),
+            {"gene_ids": gene_ids},
+        )
+        already_done = {r[0] for r in already_done_result}
+        if already_done:
+            log.info("Skipping %d genes with fully-scored convergent_aa_count (resume).", len(already_done))
+            gene_ids = [g for g in gene_ids if g not in already_done]
+        if not gene_ids:
+            log.info("All genes already have convergent_aa_count — nothing to do.")
+            return 0
+
         species_lineage_map: dict[str, str] = {
             s.id: (s.lineage_group or "Other")
             for s in session.query(Species).all()
@@ -348,6 +375,10 @@ def annotate_convergent_aa(gene_ids: Optional[list[str]] = None) -> int:
 
     log.info("Computing convergent AA counts for %d genes...", len(gene_motifs))
 
+    if not gene_motifs:
+        log.warning("No motifs found for any gene — step7b has nothing to process. Exiting.")
+        return 0
+
     tree_newick = _load_species_tree_newick()
     if tree_newick:
         log.info("Loaded species tree for ancestral state reconstruction.")
@@ -358,7 +389,7 @@ def annotate_convergent_aa(gene_ids: Optional[list[str]] = None) -> int:
     # ProcessPoolExecutor gives true parallelism (no GIL) for the CPU-bound
     # Fitch ASR loop. Each worker builds its own pruned-tree cache from the
     # tree_newick string — ete3 objects stay within each worker process.
-    n_workers = min(multiprocessing.cpu_count(), len(gene_motifs))
+    n_workers = max(1, min(multiprocessing.cpu_count(), len(gene_motifs)))
     gene_items = list(gene_motifs.items())
     chunk_size = max(1, (len(gene_items) + n_workers - 1) // n_workers)
     chunks = [

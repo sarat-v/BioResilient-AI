@@ -40,3 +40,7 @@ COPY config/ /app/config/
 # Force rebuild: 2026-04-10 fix-safety-score-always-computed-fix-protac-modality-pr-code
 ENV PYTHONPATH=/app
 # Force rebuild: 2026-04-16 hyphy-self-sufficient-architecture
+# Force rebuild: 2026-04-17 loeuf-db-fix-esm1v-sentinel-fix
+# Force rebuild: 2026-04-17 paml-df1-null-hyphy-fields-selection-load-fix
+# Force rebuild: 2026-04-17 step7-1000iter-force-rerun-convergent-aa-zero-guard
+# Force rebuild: 2026-04-17 config-convergence-1000iter

@@ -666,7 +666,7 @@ def compute_control_divergence_fractions() -> dict[str, float]:
 
 
 def run_convergence_permutation_test(
-    n_iterations: int = 200,
+    n_iterations: int = 1000,
     seed: int = 42,
 ) -> None:
     """Assign empirical p-values to convergence scores via lineage-label permutation.
@@ -691,7 +691,10 @@ def run_convergence_permutation_test(
     Notes
     -----
     * Primates remain fixed (they are excluded from the convergence count anyway).
-    * Runtime: ~10–30 s for 200 iterations on 12 000 genes (pure Python).
+    * 1000 iterations give p-value resolution of 0.001, adequate for FDR < 0.05
+      thresholding. Prior default of 200 gave resolution of only 0.005, which
+      was coarse for genes near the significance boundary.
+    * Runtime: ~50–150 s for 1000 iterations on 12 000 genes (pure Python).
     """
     rng = random.Random(seed)
 
